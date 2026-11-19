@@ -486,7 +486,7 @@ function updateTrayMenu(): void {
   const visible = Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible() && !isBossHidden);
   const menu = Menu.buildFromTemplate([
     {
-      label: visible ? '隐藏到托盘' : '显示聚合直播主窗口',
+      label: visible ? '隐藏到托盘' : '显示 YourOwn Live 主窗口',
       click: () => {
         if (visible) {
           mainWindow?.hide();
@@ -521,7 +521,7 @@ function updateTrayMenu(): void {
     },
     { type: 'separator' },
     {
-      label: '退出聚合直播',
+      label: '退出 YourOwn Live',
       click: () => {
         void shutdownAndExit();
       },
@@ -534,7 +534,7 @@ function createTray(): void {
   if (tray) return;
   try {
     tray = new Tray(createTrayIconImage());
-    tray.setToolTip('聚合直播 — 纯净无广告的跨平台看播台');
+    tray.setToolTip('YourOwn Live — 打造你的纯净无广告直播看播台');
     tray.on('click', () => {
       if (!mainWindow || mainWindow.isDestroyed()) return;
       if (isBossHidden || !mainWindow.isVisible() || mainWindow.isMinimized()) {
@@ -765,7 +765,7 @@ function createMainWindow(initialState: PersistedState): void {
     height: bounds.height,
     minWidth: 980,
     minHeight: 620,
-    title: '聚合直播 — 纯净无广告的跨平台看播台',
+    title: 'YourOwn Live — 打造你的纯净无广告直播看播台',
     backgroundColor: startDark ? '#0e1116' : '#f5f5f7',
     titleBarStyle: 'hidden',
     titleBarOverlay: {
@@ -1253,7 +1253,7 @@ async function resolveShortLiveInput(
   recordDiagnostic(
     'info',
     'system',
-    `聚合直播已启动 (Electron ${process.versions.electron}, Chromium ${process.versions.chrome})`
+    `YourOwn Live 已启动 (Electron ${process.versions.electron}, Chromium ${process.versions.chrome})`
   );
 
   app.on('activate', () => {

@@ -1,8 +1,8 @@
 {
-  "name": "juhe-live",
+  "name": "yourown-live",
   "version": "0.1.0",
   "private": true,
-  "description": "聚合直播 — 打造属于自己的跨平台直播观看平台，自由选择爱看的主播，纯净直连无广告（虎牙 / 斗鱼 / B站 / 抖音）",
+  "description": "YourOwn Live — 打造属于你自己的跨平台直播观看平台，自由选择爱看的主播，纯净直连无广告（虎牙 / 斗鱼 / B站 / 抖音）",
   "main": "dist-electron/main/main.js",
   "scripts": {
     "dev": "node scripts/dev.mjs",

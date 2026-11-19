@@ -791,7 +791,7 @@ export function App() {
         >
           <div className="boot-emblem">
             <div className="boot-prism" />
-            <div className="boot-title">聚合直播</div>
+            <div className="boot-title">YourOwn Live</div>
             <div className="boot-sub">自由选择爱看的主播 · 纯净流无广告看播台</div>
           </div>
         </div>

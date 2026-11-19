@@ -126,7 +126,7 @@ export function TopBar({
           <span className="brand-prism" aria-hidden="true">
             <span className="brand-prism-core" />
           </span>
-          <span className="brand-name">聚合直播</span>
+          <span className="brand-name">YourOwn Live</span>
           <span className="brand-chip">PURE</span>
         </div>
 

@@ -120,7 +120,7 @@ export function LoginModal({
 
   const handleExportJson = () => {
     const payload = {
-      schema: 'juhelive-backup-v1',
+      schema: 'yourown-live-backup-v1',
       exportedAt: new Date().toISOString(),
       customGroups,
       channels,
@@ -130,7 +130,7 @@ export function LoginModal({
     const a = document.createElement('a');
     const dateTag = new Date().toISOString().slice(0, 10);
     a.href = url;
-    a.download = `juhe-live-channels-${dateTag}.json`;
+    a.download = `yourown-live-channels-${dateTag}.json`;
     a.click();
     URL.revokeObjectURL(url);
     setStatusMsg(`已导出 ${channels.length} 个收藏直播间与 ${customGroups.length} 个自定义分组`);
