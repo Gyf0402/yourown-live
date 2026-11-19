@@ -9,7 +9,7 @@
     "dev": "node scripts/dev.mjs",
     "build": "tsc --noEmit && vite build && tsc -p tsconfig.electron.json",
     "start": "pnpm build && electron .",
-    "dist:win": "pnpm build && electron-builder --win --x64"
+    "dist:win": "pnpm build && electron-builder --win --x64 --publish never"
   },
   "build": {
     "appId": "com.gyf0402.yourown-live",
