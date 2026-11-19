@@ -22,6 +22,19 @@
 
 ---
 
+## 📸 实机预览
+
+**浅色毛玻璃 · 虎牙 / 斗鱼 / 抖音三屏同看**
+![浅色三屏同看](./docs/screenshots/light-split.png)
+
+**暗色观影模式 · 原生 Canvas 弹幕与自定义控制**
+![暗色观影模式](./docs/screenshots/dark-cinema.png)
+
+**设置中心 · 编解码硬解检测与实时连接诊断**
+![连接诊断面板](./docs/screenshots/settings-diagnostics.png)
+
+---
+
 ## 🚀 核心亮点
 
 ### 1. 纯净流直连 · 真正无广告
@@ -101,6 +114,14 @@ pnpm start
 - **前端界面**：React 19 + TypeScript + Vite 6 + Lucide Icons
 - **流媒体解码**：`mpegts.js`（低延迟 HTTP-FLV）+ `hls.js`（HLS 容灾回退）
 - **原生弹幕协议**：`ws`（斗鱼 STT / B站 WBI+Brotli / 虎牙 Tars / 抖音 Protobuf）+ 高 DPI Canvas 渲染
+
+---
+
+## 🤝 友情链接与社区支持
+
+感谢开源社区与各位开发者的交流与反馈：
+
+- **[LINUX DO](https://linux.do)** — 新的理想型社区（真诚、友善、团结、专业，感谢各位佬友的支持与建议）
 
 ---
 
