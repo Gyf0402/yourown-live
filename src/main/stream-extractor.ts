@@ -148,34 +148,6 @@ async function fetchWithTimeout(
   }
 }
 
-async function getCookieHeaderForDomain(
-  liveSession: Session,
-  domain: string,
-  allowNames?: Set<string>
-): Promise<string> {
-  try {
-    const cookies = await liveSession.cookies.get({ domain });
-    const filtered = allowNames ? cookies.filter((c) => allowNames.has(c.name)) : cookies;
-    if (!filtered.length) return '';
-    // Deduplicate by cookie name (prefer root domain cookies like .bilibili.com with non-empty values)
-    const map = new Map<string, string>();
-    for (const c of filtered) {
-      if (!c.value) continue;
-      const existing = map.get(c.name);
-      const isRootDot = (c.domain || '').startsWith('.');
-      if (!existing || isRootDot) {
-        map.set(c.name, c.value);
-      }
-    }
-    if (map.size === 0) return '';
-    return Array.from(map.entries())
-      .map(([k, v]) => `${k}=${v}`)
-      .join('; ');
-  } catch {
-    return '';
-  }
-}
-
 async function fetchFreshAnonymousDouyinTtwid(): Promise<string> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 4500);
@@ -498,29 +470,128 @@ async function raceFastestBilibiliUrl(
 }
 
 const bilibiliAnchorCache = new Map<number, string>();
-let cachedBiliBuvid3: { value: string; expiresAt: number } | null = null;
+const bilibiliRealRidCache = new Map<string, { realRid: string; uid?: number }>();
+const BILI_WBI_MIXIN = [
+  46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42, 19, 29,
+  28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25,
+  54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
+];
+let cachedBiliWbiKeys: { imgKey: string; subKey: string; expiresAt: number } | null = null;
+let lastBiliWarmAt = 0;
 
-async function getBilibiliBuvid3(): Promise<string> {
+async function sessionFetchWithTimeout(
+  liveSession: Session,
+  url: string,
+  timeoutMs = 5500
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await liveSession.fetch(url, {
+      credentials: 'include',
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function getBilibiliWbiKeys(
+  liveSession: Session
+): Promise<{ imgKey: string; subKey: string } | null> {
   const now = Date.now();
-  if (cachedBiliBuvid3 && now < cachedBiliBuvid3.expiresAt) {
-    return cachedBiliBuvid3.value;
+  if (cachedBiliWbiKeys && now < cachedBiliWbiKeys.expiresAt) {
+    return { imgKey: cachedBiliWbiKeys.imgKey, subKey: cachedBiliWbiKeys.subKey };
   }
   try {
-    const resp = await fetchWithTimeout(
-      'https://api.bilibili.com/x/frontend/finger/spi',
-      { headers: { 'User-Agent': DESKTOP_UA, Referer: 'https://live.bilibili.com/' } },
-      1500
+    const resp = await sessionFetchWithTimeout(
+      liveSession,
+      'https://api.bilibili.com/x/web-interface/nav',
+      2200
     );
-    const json = (await resp.json()) as { data?: { b_3?: string } };
-    const b3 = json?.data?.b_3?.trim() || '';
-    if (b3) {
-      cachedBiliBuvid3 = { value: b3, expiresAt: now + 6 * 60 * 60 * 1000 };
-      return b3;
+    const json = (await resp.json()) as {
+      data?: { wbi_img?: { img_url?: string; sub_url?: string } };
+    };
+    const imgKey = (json?.data?.wbi_img?.img_url || '').split('/').pop()?.split('.')[0] || '';
+    const subKey = (json?.data?.wbi_img?.sub_url || '').split('/').pop()?.split('.')[0] || '';
+    if (imgKey && subKey) {
+      cachedBiliWbiKeys = { imgKey, subKey, expiresAt: now + 30 * 60 * 1000 };
+      return { imgKey, subKey };
     }
   } catch {
     // Non-fatal
   }
-  return '';
+  return null;
+}
+
+function buildBilibiliWbiQuery(
+  params: Record<string, string | number>,
+  wbi: { imgKey: string; subKey: string } | null
+): string {
+  if (!wbi) {
+    return Object.entries(params)
+      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
+      .join('&');
+  }
+  const raw = wbi.imgKey + wbi.subKey;
+  const mixinKey = BILI_WBI_MIXIN.map((i) => raw[i] || '')
+    .join('')
+    .slice(0, 32);
+  const wts = Math.floor(Date.now() / 1000);
+  const all: Record<string, string | number> = { ...params, wts };
+  const query = Object.keys(all)
+    .sort()
+    .map(
+      (k) =>
+        `${encodeURIComponent(k)}=${encodeURIComponent(String(all[k]).replace(/[!'()*]/g, ''))}`
+    )
+    .join('&');
+  return `${query}&w_rid=${md5(query + mixinKey)}`;
+}
+
+async function ensureBilibiliLiveCookies(liveSession: Session): Promise<boolean> {
+  try {
+    const cookies = await liveSession.cookies.get({ domain: 'bilibili.com' });
+    const hasSessdata = cookies.some((c) => c.name === 'SESSDATA' && Boolean(c.value));
+    const hasBuvid3 = cookies.some((c) => c.name === 'buvid3' && Boolean(c.value));
+    const hasLiveBuvid = cookies.some((c) => c.name === 'LIVE_BUVID' && Boolean(c.value));
+
+    // After QR login on passport.bilibili.com, LIVE_BUVID / buvid3 may not exist yet;
+    // warming live.bilibili.com once lets Bilibili mint full live session cookies natively.
+    if (hasSessdata && (!hasBuvid3 || !hasLiveBuvid) && Date.now() - lastBiliWarmAt > 30_000) {
+      lastBiliWarmAt = Date.now();
+      await Promise.allSettled([
+        sessionFetchWithTimeout(liveSession, 'https://api.bilibili.com/x/frontend/finger/spi', 1400)
+          .then((r) => r.json())
+          .then(async (j: { data?: { b_3?: string; b_4?: string } }) => {
+            if (!hasBuvid3 && j?.data?.b_3) {
+              await liveSession.cookies.set({
+                url: 'https://www.bilibili.com',
+                name: 'buvid3',
+                value: j.data.b_3,
+                domain: '.bilibili.com',
+                path: '/',
+              });
+            }
+            if (j?.data?.b_4) {
+              await liveSession.cookies.set({
+                url: 'https://www.bilibili.com',
+                name: 'buvid4',
+                value: j.data.b_4,
+                domain: '.bilibili.com',
+                path: '/',
+              });
+            }
+          }),
+        sessionFetchWithTimeout(liveSession, 'https://live.bilibili.com/', 1500).then((r) =>
+          r.body?.cancel().catch(() => {})
+        ),
+      ]);
+    }
+    return hasSessdata;
+  } catch {
+    return false;
+  }
 }
 
 async function getBilibiliAnchorName(uid: number | undefined): Promise<string | undefined> {
@@ -555,59 +626,57 @@ async function extractBilibili(
   liveSession: Session
 ): Promise<DirectStreamResult> {
   const referer = `https://live.bilibili.com/${req.roomId}`;
-  let cookie = await getCookieHeaderForDomain(
-    liveSession,
-    'bilibili.com',
-    new Set([
-      'SESSDATA',
-      'bili_jct',
-      'DedeUserID',
-      'DedeUserID__ckMd5',
-      'sid',
-      'buvid3',
-      'buvid4',
-      'b_nut',
-      'LIVE_BUVID',
-    ])
-  );
-  const hasSessdata = /\bSESSDATA=[^;\s]+/.test(cookie);
-  // After QR login via passport.bilibili.com, buvid3 may not be set yet; attach a valid buvid3 so
-  // Bilibili does not downgrade logged-in high-quality playurl requests under risk control.
-  if (hasSessdata && !/\bbuvid3=[^;\s]+/.test(cookie)) {
-    const b3 = await getBilibiliBuvid3();
-    if (b3) {
-      cookie = cookie ? `${cookie}; buvid3=${b3}` : `buvid3=${b3}`;
-    }
-  }
-  const commonHeaders: Record<string, string> = {
-    'User-Agent': DESKTOP_UA,
-    Referer: referer,
-    ...(cookie ? { Cookie: cookie } : {}),
-  };
-
   const targetQn = req.qualityId || (req.autoHighestQuality !== false ? '10000' : '400');
 
-  // Use room/v1/Room/get_info instead of xlive/web-room/v1/index/getInfoByRoom:
-  // getInfoByRoom frequently returns risk-control -352 for unauthenticated requests.
-  const [infoResp, playResp] = await Promise.all([
-    fetchWithTimeout(
+  // Step 1: Ensure live session cookies (SESSDATA/buvid3/LIVE_BUVID), resolve real long room_id, and fetch WBI keys in parallel.
+  // Using liveSession.fetch() uses real Chromium TLS + the full persist:livehub cookie jar (including bili_ticket/_uuid/LIVE_BUVID).
+  const [hasSessdata, wbiKeys, infoResp] = await Promise.all([
+    ensureBilibiliLiveCookies(liveSession),
+    getBilibiliWbiKeys(liveSession),
+    sessionFetchWithTimeout(
+      liveSession,
       `https://api.live.bilibili.com/room/v1/Room/get_info?room_id=${encodeURIComponent(req.roomId)}`,
-      { headers: commonHeaders },
-      1600
+      2000
     )
       .then((r) => r.json())
       .catch(() => null),
-    fetchWithTimeout(
-      `https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo?room_id=${encodeURIComponent(req.roomId)}&protocol=0,1&format=0,1,2&codec=0,1&qn=${encodeURIComponent(targetQn)}&platform=web&ptype=8&dolby=5&panorama=1`,
-      { headers: commonHeaders },
-      5500
-    ).then((r) => r.json()),
   ]);
 
   const infoData = (infoResp as {
     code?: number;
     data?: { title?: string; live_status?: number; uid?: number; room_id?: number };
   } | null)?.data;
+
+  const cachedRid = bilibiliRealRidCache.get(req.roomId);
+  const realRid = String(infoData?.room_id || cachedRid?.realRid || req.roomId);
+  if (infoData?.room_id) {
+    bilibiliRealRidCache.set(req.roomId, { realRid, uid: infoData.uid });
+  }
+
+  // Step 2: Request getRoomPlayInfo with real long room_id, codec=0,1,2 (AVC/HEVC/AV1), WBI signature, and full Chromium session cookies.
+  const playQuery = buildBilibiliWbiQuery(
+    {
+      room_id: realRid,
+      no_playurl: 0,
+      mask: 1,
+      qn: targetQn,
+      platform: 'web',
+      protocol: '0,1',
+      format: '0,1,2',
+      codec: '0,1,2',
+      dolby: 5,
+      panorama: 1,
+      ptype: 8,
+    },
+    wbiKeys
+  );
+
+  const playResp = await sessionFetchWithTimeout(
+    liveSession,
+    `https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo?${playQuery}`,
+    5500
+  ).then((r) => r.json());
+
   const playData = (playResp as {
     code?: number;
     data?: {
@@ -616,7 +685,7 @@ async function extractBilibili(
       live_status?: number;
       playurl_info?: {
         playurl?: {
-          g_qn_desc?: Array<{ qn: number; desc: string }>;
+          g_qn_desc?: Array<{ qn: number; desc: string; eotf?: number }>;
           stream?: Array<{
             protocol_name: string;
             format: Array<{
@@ -636,7 +705,7 @@ async function extractBilibili(
   })?.data;
 
   const title = infoData?.title;
-  const uid = playData?.uid ?? infoData?.uid;
+  const uid = playData?.uid ?? infoData?.uid ?? cachedRid?.uid;
   const liveStatus = playData?.live_status ?? infoData?.live_status;
 
   if (!playData || liveStatus !== 1) {
@@ -658,7 +727,10 @@ async function extractBilibili(
   const playurl = playData.playurl_info?.playurl;
   const descMap = new Map<number, string>();
   for (const item of playurl?.g_qn_desc || []) {
-    descMap.set(item.qn, item.desc);
+    // Prefer standard SDR label (eotf === 0, e.g. "原画") over HDR variants ("原画/HDR")
+    if (!descMap.has(item.qn) || item.eotf === 0) {
+      descMap.set(item.qn, item.desc);
+    }
   }
 
   type CodecEntry = {
@@ -693,6 +765,7 @@ async function extractBilibili(
 
   // Rank by highest achieved currentQn first (some Bilibili 原画/4K rooms only deliver high qn via fmp4 or hevc),
   // then prefer AVC (H.264) for lowest-CPU Chromium MSE decoding, and prefer fmp4 over ts for HLS.
+  const codecPriority = (c: string) => (c === 'avc' ? 0 : c === 'hevc' ? 1 : c === 'av1' ? 2 : 3);
   const sortBestEntry = (entries: CodecEntry[], preferFmp4: boolean) =>
     [...entries].sort((a, b) => {
       if (b.currentQn !== a.currentQn) return b.currentQn - a.currentQn;
@@ -701,9 +774,7 @@ async function extractBilibili(
         const fb = b.formatName === 'fmp4' ? 0 : 1;
         if (fa !== fb) return fa - fb;
       }
-      const ca = a.codecName === 'avc' ? 0 : 1;
-      const cb = b.codecName === 'avc' ? 0 : 1;
-      return ca - cb;
+      return codecPriority(a.codecName) - codecPriority(b.codecName);
     });
 
   const flvCodec = sortBestEntry(flvEntries, false)[0];
@@ -771,7 +842,12 @@ async function extractBilibili(
     ? fastestActiveUrl || hlsCodec?.urls[Math.min(lineIdx, hlsCodec.urls.length - 1)]
     : hlsCodec?.urls[Math.min(lineIdx, hlsCodec.urls.length - 1)];
 
-  const qualities: StreamOptionItem[] = primary.acceptQn.map((qn) => ({
+  const allAcceptQns = Array.from(
+    new Set([...flvEntries, ...hlsEntries].flatMap((e) => e.acceptQn))
+  ).sort((a, b) => b - a);
+  const displayQns = allAcceptQns.length > 0 ? allAcceptQns : primary.acceptQn;
+
+  const qualities: StreamOptionItem[] = displayQns.map((qn) => ({
     id: String(qn),
     label: descMap.get(qn) || `${qn}P`,
     active: qn === primary.currentQn,
@@ -787,6 +863,12 @@ async function extractBilibili(
       active: i === lineIdx,
     };
   });
+
+  recordDiagnostic(
+    'info',
+    'stream',
+    `[bilibili#${req.roomId}] realRid=${realRid} ${hasSessdata ? '已登录' : '未登录'} 请求qn=${targetQn} -> 实际qn=${primary.currentQn} (${primary.formatName}/${primary.codecName})`
+  );
 
   return {
     ok: true,

@@ -325,6 +325,19 @@ function configureLiveSession(): void {
     callback({});
   });
 
+  // Ensure liveSession.fetch() calls to Bilibili APIs carry matching Referer & Origin headers
+  liveSession.webRequest.onBeforeSendHeaders(
+    { urls: ['https://api.live.bilibili.com/*', 'https://api.bilibili.com/*'] },
+    (details, callback) => {
+      const headers = { ...details.requestHeaders };
+      const hasRef = Object.keys(headers).some((k) => k.toLowerCase() === 'referer');
+      const hasOrigin = Object.keys(headers).some((k) => k.toLowerCase() === 'origin');
+      if (!hasRef) headers['Referer'] = 'https://live.bilibili.com/';
+      if (!hasOrigin) headers['Origin'] = 'https://live.bilibili.com';
+      callback({ requestHeaders: headers });
+    }
+  );
+
   liveSession.cookies.on('changed', (_event, cookie) => {
     const domain = (cookie.domain || '').toLowerCase();
     let changedPlatform: PlatformId | undefined;

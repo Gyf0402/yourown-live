@@ -416,6 +416,7 @@ export function DirectPlayer({
       hlsPlayer = new Hls({
         enableWorker: false,
         lowLatencyMode: true,
+        startFragPrefetch: true,
         liveSyncDurationCount: 2,
         liveMaxLatencyDurationCount: 5,
         backBufferLength: 10,
@@ -468,7 +469,8 @@ export function DirectPlayer({
           jumpToLiveEdgeAndPlay(v);
         } else if (Number.isFinite(drift) && drift >= 0) {
           latencySec = Math.round(drift * 10) / 10;
-          if (drift > 3.2 && !v.paused && !userPausedRef.current) {
+          // Only manually chase drift on FLV; hls.js manages its own live sync window
+          if (activeProtocol === 'FLV' && drift > 3.2 && !v.paused && !userPausedRef.current) {
             try {
               v.currentTime = Math.max(v.currentTime, bufEnd - 0.65);
             } catch {

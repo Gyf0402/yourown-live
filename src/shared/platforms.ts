@@ -39,7 +39,7 @@ export const PLATFORMS: Record<PlatformId, PlatformMeta> = {
     color: '#0284c7',
     bgTint: 'rgba(2, 132, 199, 0.12)',
     homeUrl: 'https://live.bilibili.com',
-    loginUrl: 'https://passport.bilibili.com/login',
+    loginUrl: 'https://passport.bilibili.com/login?gourl=https%3A%2F%2Flive.bilibili.com%2F',
     domainPatterns: ['live.bilibili.com', 'bilibili.com'],
   },
   douyin: {
