@@ -183,6 +183,21 @@ export function Sidebar({
     setAddingGroup(false);
   };
 
+  const resolveAndCommitDouyu = async (raw: string, fallback?: PlatformId) => {
+    setResolving(true);
+    setHint('正在解析斗鱼真实房间号...');
+    try {
+      const resolved = await window.livehub.resolveLiveInput(raw, fallback);
+      if (resolved.ok && resolved.platform && resolved.roomId && resolved.url) {
+        commitAdd(resolved.platform, resolved.roomId, resolved.url, resolved.suggestedName);
+        return;
+      }
+      setHint(resolved.reason || '无法识别该斗鱼房间');
+    } finally {
+      setResolving(false);
+    }
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (resolving) return;
@@ -190,6 +205,11 @@ export function Sidebar({
     const syncRes = parseLiveInput(rawInput, fallback);
 
     if (syncRes.ok) {
+      // Resolve Douyu vanity short room IDs (e.g. 728 -> 12821) and fetch real nickname upfront
+      if (syncRes.platform === 'douyu' && typeof window.livehub?.resolveLiveInput === 'function') {
+        await resolveAndCommitDouyu(rawInput, fallback);
+        return;
+      }
       commitAdd(syncRes.platform, syncRes.roomId, syncRes.url, syncRes.suggestedName);
       return;
     }
@@ -232,6 +252,10 @@ export function Sidebar({
 
   const handlePickPlatform = (platform: PlatformId) => {
     if (!pendingRoomId) return;
+    if (platform === 'douyu' && typeof window.livehub?.resolveLiveInput === 'function') {
+      void resolveAndCommitDouyu(pendingRoomId, 'douyu');
+      return;
+    }
     const res = parseLiveInput(pendingRoomId, platform);
     if (res.ok) {
       commitAdd(res.platform, res.roomId, res.url, res.suggestedName);

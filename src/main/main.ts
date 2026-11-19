@@ -38,6 +38,7 @@ import {
   checkLiveStatuses,
   cleanupStreamExtractor,
   resolveDirectStream,
+  resolveDouyuRealRid,
 } from './stream-extractor';
 import { DanmakuManager } from './danmaku-manager';
 import {
@@ -843,12 +844,26 @@ app.on('web-contents-created', (_event, contents) => {
   if (contents.getType() === 'webview') {
     contents.setUserAgent(DEFAULT_UA);
 
-    // Block custom desktop client protocol launches (huya://, douyu://, bilibili://, bytedance://)
+    // Block custom desktop client protocol launches & prevent offline Douyin room from jumping to plaza
     contents.on('will-navigate', (navEvent, navigationUrl) => {
       try {
         const parsed = new URL(navigationUrl);
         if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
           navEvent.preventDefault();
+          return;
+        }
+        // Prevent Douyin offline room (live.douyin.com/{digits}) from redirecting to live plaza (live.douyin.com/)
+        const currentUrl = contents.getURL();
+        if (currentUrl) {
+          const cur = new URL(currentUrl);
+          const curIsDouyinRoom =
+            cur.hostname.includes('live.douyin.com') && /^\/\d+\/?$/.test(cur.pathname);
+          const nextIsDouyinPlaza =
+            parsed.hostname.includes('live.douyin.com') &&
+            (parsed.pathname === '/' || parsed.pathname === '' || parsed.pathname.startsWith('/category'));
+          if (curIsDouyinRoom && nextIsDouyinPlaza) {
+            navEvent.preventDefault();
+          }
         }
       } catch {
         navEvent.preventDefault();
@@ -887,14 +902,14 @@ const streamHostReferers = new Map<string, string>();
 const KNOWN_STREAM_REFERERS: Array<[RegExp, string]> = [
   [/bilivideo\.(com|cn)$/i, 'https://live.bilibili.com/'],
   [/(huya\.com|msstatic\.com|hycdn\.cn)$/i, 'https://www.huya.com/'],
-  [/(douyucdn\.cn|douyucdn2\.cn|akmcdn\.com|bytefcdn)/i, 'https://www.douyu.com/'],
-  [/(douyincdn\.com|douyinpic\.com|douyinliving\.com|amemv\.com|snssdk\.com|bytecdn\.cn)/i, 'https://live.douyin.com/'],
+  [/(douyucdn\.cn|douyucdn2\.cn|edgesrv\.com|akmcdn\.com|bytefcdn)/i, 'https://www.douyu.com/'],
+  [/(douyincdn\.com|douyinpic\.com|douyinliving\.com|amemv\.com|snssdk\.com|bytecdn\.cn|ibytedtos\.com)/i, 'https://live.douyin.com/'],
 ];
 
-function registerStreamHost(streamUrl: string | undefined, referer: string): void {
+function registerStreamHost(streamUrl: string | undefined, referer: string, baseUrl?: string): void {
   if (!streamUrl || !referer) return;
   try {
-    const u = new URL(streamUrl);
+    const u = baseUrl ? new URL(streamUrl, baseUrl) : new URL(streamUrl);
     if (u.hostname) {
       streamHostReferers.set(u.hostname.toLowerCase(), referer);
     }
@@ -957,7 +972,7 @@ function configureDirectStreamNetworking(): void {
       if (details.statusCode >= 300 && details.statusCode < 400) {
         for (const [k, v] of Object.entries(responseHeaders)) {
           if (k.toLowerCase() === 'location' && Array.isArray(v) && v[0]) {
-            registerStreamHost(v[0], ref);
+            registerStreamHost(v[0], ref, details.url);
           }
         }
       }
@@ -1064,7 +1079,24 @@ async function resolveShortLiveInput(
   fallbackPlatform?: PlatformId
 ): Promise<ResolvedLiveInput> {
   const initial = parseLiveInput(rawInput, fallbackPlatform);
-  if (initial.ok) return initial;
+  if (initial.ok) {
+    // For Douyu vanity/short numeric room IDs (e.g. 728 -> 12821), keep user's friendly URL/roomId
+    // or enrich suggestedName when available, while stream-extractor/danmaku resolve real rid automatically.
+    if (initial.platform === 'douyu') {
+      try {
+        const resolved = await resolveDouyuRealRid(initial.roomId);
+        return {
+          ...initial,
+          roomId: resolved.rid || initial.roomId,
+          url: buildCanonicalUrl('douyu', resolved.rid || initial.roomId),
+          suggestedName: initial.suggestedName || resolved.room?.nickname,
+        };
+      } catch {
+        return initial;
+      }
+    }
+    return initial;
+  }
   if (!initial.needsShortResolve || !initial.shortUrl) {
     return {
       ok: false,
@@ -1076,36 +1108,112 @@ async function resolveShortLiveInput(
   }
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 6500);
+  const timeout = setTimeout(() => controller.abort(), 7500);
   try {
-    const resp = await fetch(initial.shortUrl, {
-      redirect: 'follow',
-      signal: controller.signal,
-      headers: {
-        'User-Agent': MOBILE_UA,
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      },
-    });
-    const finalUrl = resp.url || initial.shortUrl;
-    const direct = parseLiveInput(finalUrl, initial.platformHint);
-    if (direct.ok) {
+    // Follow redirects step-by-step so offline Douyin rooms don't silently lose room_id/web_rid by redirecting to live.douyin.com/
+    const visitedUrls: string[] = [initial.shortUrl];
+    let currentUrl = initial.shortUrl;
+    let lastResp: Response | null = null;
+    for (let hop = 0; hop < 8; hop++) {
+      const resp = await fetch(currentUrl, {
+        redirect: 'manual',
+        signal: controller.signal,
+        headers: {
+          'User-Agent': MOBILE_UA,
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        },
+      });
+      lastResp = resp;
+      const loc = resp.headers.get('location');
+      if (resp.status >= 300 && resp.status < 400 && loc) {
+        try {
+          const nextUrl = new URL(loc, currentUrl).toString();
+          visitedUrls.push(nextUrl);
+          currentUrl = nextUrl;
+          continue;
+        } catch {
+          break;
+        }
+      }
+      break;
+    }
+
+    const finalUrl = currentUrl;
+    // Check visited URLs (preferring specific room URLs; NEVER accept Douyin plaza 'home' as a short-link match!)
+    for (let i = visitedUrls.length - 1; i >= 0; i--) {
+      const candidate = parseLiveInput(visitedUrls[i], initial.platformHint);
+      if (candidate.ok && !(candidate.platform === 'douyin' && candidate.roomId === 'home')) {
+        if (candidate.platform === 'douyu') {
+          const resolved = await resolveDouyuRealRid(candidate.roomId).catch(() => null);
+          const finalRid = resolved?.rid || candidate.roomId;
+          return {
+            ...candidate,
+            roomId: finalRid,
+            url: buildCanonicalUrl('douyu', finalRid),
+            suggestedName: candidate.suggestedName || initial.suggestedName || resolved?.room?.nickname,
+          };
+        }
+        return {
+          ...candidate,
+          suggestedName: candidate.suggestedName || initial.suggestedName,
+        };
+      }
+    }
+
+    const htmlText = lastResp ? await lastResp.text().catch(() => '') : '';
+
+    // Douyu short links / topic pages
+    if (
+      initial.platformHint === 'douyu' ||
+      visitedUrls.some((u) => /douyu\.com|douyucdn\.cn/i.test(u))
+    ) {
+      const ridFromUrl = visitedUrls
+        .map((u) => u.match(/[?&](?:rid|roomId|room_id)=(\d+)/)?.[1])
+        .find(Boolean);
+      const ridFromHtml =
+        htmlText.match(/"rid"\s*:\s*(\d+)/)?.[1] ||
+        htmlText.match(/room_id["']?\s*[:=]\s*["']?(\d+)/)?.[1] ||
+        htmlText.match(/\$ROOM\.room_id\s*=\s*(\d+)/)?.[1];
+      const rawRid = ridFromUrl || ridFromHtml;
+      if (rawRid) {
+        const resolved = await resolveDouyuRealRid(rawRid).catch(() => null);
+        const finalRid = resolved?.rid || rawRid;
+        return {
+          ok: true,
+          platform: 'douyu',
+          roomId: finalRid,
+          url: buildCanonicalUrl('douyu', finalRid),
+          suggestedName: initial.suggestedName || resolved?.room?.nickname,
+        };
+      }
       return {
-        ...direct,
-        suggestedName: direct.suggestedName || initial.suggestedName,
+        ok: false,
+        needsPlatform: false,
+        reason: '未能从该斗鱼链接解析出房间号，请直接粘贴直播间链接或输入斗鱼房间号',
       };
     }
 
-    const htmlText = await resp.text().catch(() => '');
-
-    if (initial.platformHint === 'douyin' || /douyin|iesdouyin|amemv/i.test(finalUrl)) {
-      const reflowMatch =
-        finalUrl.match(/\/reflow\/(\d+)/) ||
-        finalUrl.match(/\/share\/live\/(\d+)/) ||
-        finalUrl.match(/[?&]room_id=(\d+)/) ||
-        initial.shortUrl.match(/\/reflow\/(\d+)/);
-      const roomId = reflowMatch?.[1];
-
+    // Douyin short links & reflow links (works even when the streamer is currently offline!)
+    if (
+      initial.platformHint === 'douyin' ||
+      visitedUrls.some((u) => /douyin|iesdouyin|amemv/i.test(u))
+    ) {
+      let roomId: string | undefined;
       let webRid: string | undefined;
+      for (const u of visitedUrls) {
+        if (!webRid) {
+          webRid =
+            u.match(/[?&]web_rid=(\d+)/)?.[1] ||
+            u.match(/live\.douyin\.com\/(\d+)/)?.[1];
+        }
+        if (!roomId) {
+          roomId =
+            u.match(/\/reflow\/(\d+)/)?.[1] ||
+            u.match(/\/share\/live\/(\d+)/)?.[1] ||
+            u.match(/[?&]room_id=(\d+)/)?.[1];
+        }
+      }
+
       let nickname: string | undefined;
 
       if (roomId) {
@@ -1120,7 +1228,7 @@ async function resolveShortLiveInput(
           const infoJson = (await infoResp.json().catch(() => null)) as {
             data?: { room?: { owner?: { web_rid?: string; nickname?: string } } };
           } | null;
-          webRid = infoJson?.data?.room?.owner?.web_rid || undefined;
+          webRid = infoJson?.data?.room?.owner?.web_rid || webRid;
           nickname = infoJson?.data?.room?.owner?.nickname || undefined;
         } catch {
           // Ignore reflow API lookup failures and fallback below
@@ -1144,27 +1252,23 @@ async function resolveShortLiveInput(
         };
       }
 
-      if (roomId) {
-        return {
-          ok: true,
-          platform: 'douyin',
-          roomId,
-          url: finalUrl,
-          suggestedName: nickname || initial.suggestedName,
-        };
-      }
+      return {
+        ok: false,
+        needsPlatform: false,
+        reason: '该抖音分享链接已失效或主播已下播未返回房间号，请粘贴 live.douyin.com/房间号',
+      };
     }
 
     return {
       ok: false,
       needsPlatform: false,
-      reason: '短链接未能解析出有效直播间，请尝试粘贴 live.douyin.com/房间号',
+      reason: `短链接未能解析出有效直播间（落地点：${finalUrl.slice(0, 48)}），请直接粘贴直播间地址或房间号`,
     };
   } catch {
     return {
       ok: false,
       needsPlatform: false,
-      reason: '短链接解析超时或网络异常，可直接粘贴 live.douyin.com/房间号 或选择平台输入房间号',
+      reason: '短链接解析超时或网络异常，可直接粘贴直播间链接或选择平台输入房间号',
     };
   } finally {
     clearTimeout(timeout);

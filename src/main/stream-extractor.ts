@@ -47,6 +47,88 @@ const DOUYIN_QUALITY_ORDER = ['origin', 'ORIGIN', 'FULL_HD1', 'uhd', 'HD1', 'hd'
 
 let cachedDouyinTtwid: { value: string; expiresAt: number } | null = null;
 const huyaRidCache = new Map<string, string>();
+const douyuRidCache = new Map<string, string>();
+
+interface DouyuBetardRoom {
+  room_id?: number;
+  room_name?: string;
+  nickname?: string;
+  show_status?: number;
+  videoLoop?: number;
+}
+
+async function fetchDouyuBetard(
+  rid: string,
+  extraHeaders: Record<string, string> = {}
+): Promise<DouyuBetardRoom | null> {
+  try {
+    const resp = await fetchWithTimeout(
+      `https://www.douyu.com/betard/${encodeURIComponent(rid)}`,
+      {
+        headers: {
+          'User-Agent': DESKTOP_UA,
+          Referer: `https://www.douyu.com/${rid}`,
+          ...extraHeaders,
+        },
+      },
+      5500
+    );
+    const text = await resp.text();
+    if (!text.trim().startsWith('{')) return null;
+    const json = JSON.parse(text) as { room?: DouyuBetardRoom };
+    return json?.room?.room_id ? json.room : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function resolveDouyuRealRid(rawRoomId: string): Promise<{
+  rid: string;
+  room?: DouyuBetardRoom | null;
+}> {
+  const clean = rawRoomId.trim();
+  const cached = douyuRidCache.get(clean);
+  if (cached) {
+    const room = await fetchDouyuBetard(cached);
+    return { rid: cached, room };
+  }
+
+  // 1. Try betard directly (works for standard numeric room IDs like 9999, 288016)
+  const directRoom = await fetchDouyuBetard(clean);
+  if (directRoom?.room_id) {
+    const realRid = String(directRoom.room_id);
+    douyuRidCache.set(clean, realRid);
+    return { rid: realRid, room: directRoom };
+  }
+
+  // 2. Fallback to m.douyu.com/{id} — resolves vanity short IDs (e.g. 728 -> 12821, 2222 -> 4615502) & slugs
+  try {
+    const mResp = await fetchWithTimeout(
+      `https://m.douyu.com/${encodeURIComponent(clean)}`,
+      {
+        headers: {
+          'User-Agent': MOBILE_UA,
+          Referer: 'https://m.douyu.com/',
+        },
+      },
+      6500
+    );
+    const html = await mResp.text();
+    const match =
+      html.match(/"rid"\s*:\s*(\d+)/) ||
+      html.match(/room_id["']?\s*[:=]\s*["']?(\d+)/);
+    if (match?.[1]) {
+      const realRid = match[1];
+      douyuRidCache.set(clean, realRid);
+      const room = await fetchDouyuBetard(realRid);
+      return { rid: realRid, room };
+    }
+  } catch {
+    // Ignore mobile page lookup errors
+  }
+
+  return { rid: clean, room: null };
+}
 
 function md5(input: string): string {
   return crypto.createHash('md5').update(String(input)).digest('hex');
@@ -668,38 +750,26 @@ async function extractDouyu(
   req: DirectStreamRequest,
   liveSession: Session
 ): Promise<DirectStreamResult> {
-  const referer = `https://www.douyu.com/${req.roomId}`;
   const douyuCookies = await liveSession.cookies.get({ domain: 'douyu.com' }).catch(() => []);
   const allowSet = new Set(['acf_auth', 'acf_uid', 'acf_username', 'dy_did']);
   const filteredCookies = douyuCookies.filter((c) => allowSet.has(c.name));
   const cookie = filteredCookies.map((c) => `${c.name}=${c.value}`).join('; ');
   const cookieDid = douyuCookies.find((c) => c.name === 'dy_did' && c.value)?.value;
+
+  const resolved = await resolveDouyuRealRid(req.roomId);
+  const rid = resolved.rid;
+  const referer = `https://www.douyu.com/${rid}`;
   const commonHeaders: Record<string, string> = {
     'User-Agent': DESKTOP_UA,
     Referer: referer,
     ...(cookie ? { Cookie: cookie } : {}),
   };
 
-  const betard = (await fetchWithTimeout(
-    `https://www.douyu.com/betard/${encodeURIComponent(req.roomId)}`,
-    { headers: commonHeaders }
-  )
-    .then((r) => r.json())
-    .catch(() => null)) as {
-    room?: {
-      room_id?: number;
-      room_name?: string;
-      nickname?: string;
-      show_status?: number;
-      videoLoop?: number;
-    };
-  } | null;
+  const roomInfo = resolved.room ?? (await fetchDouyuBetard(rid, cookie ? { Cookie: cookie } : {}));
+  const title = roomInfo?.room_name;
+  const anchorName = roomInfo?.nickname;
 
-  const rid = String(betard?.room?.room_id || req.roomId);
-  const title = betard?.room?.room_name;
-  const anchorName = betard?.room?.nickname;
-
-  if (betard?.room && betard.room.show_status !== 1) {
+  if (roomInfo && roomInfo.show_status !== 1) {
     return {
       ok: false,
       platform: 'douyu',
@@ -1083,25 +1153,7 @@ async function checkSingleLiveStatus(item: LiveStatusCheckItem): Promise<LiveRoo
       }
 
       case 'douyu': {
-        const resp = await fetchWithTimeout(
-          `https://www.douyu.com/betard/${encodeURIComponent(item.roomId)}`,
-          {
-            headers: {
-              'User-Agent': DESKTOP_UA,
-              Referer: `https://www.douyu.com/${item.roomId}`,
-            },
-          },
-          5500
-        );
-        const json = (await resp.json()) as {
-          room?: {
-            show_status?: number;
-            videoLoop?: number;
-            room_name?: string;
-            nickname?: string;
-          };
-        };
-        const room = json?.room;
+        const { room } = await resolveDouyuRealRid(item.roomId);
         if (!room) return { status: 'unknown', checkedAt };
         const status =
           room.show_status === 1
@@ -1147,6 +1199,9 @@ async function checkSingleLiveStatus(item: LiveStatusCheckItem): Promise<LiveRoo
       }
 
       case 'douyin': {
+        if (!item.roomId || item.roomId === 'home' || !/^\d+$/.test(item.roomId)) {
+          return { status: 'unknown', checkedAt };
+        }
         const enterUrl =
           `https://live.douyin.com/webcast/room/web/enter/?aid=6383&app_name=douyin_web&live_id=1` +
           `&device_platform=web&language=zh-CN&enter_from=web_live&cookie_enabled=true` +

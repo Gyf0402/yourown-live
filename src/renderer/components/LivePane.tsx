@@ -171,6 +171,8 @@ export const LivePane = memo(function LivePane({
     pane.url &&
       pane.mode === 'pure' &&
       parsedTarget &&
+      parsedTarget.roomId !== 'home' &&
+      !pane.url.includes('/user/') &&
       typeof window !== 'undefined' &&
       typeof window.livehub?.resolveStream === 'function'
   );
@@ -401,8 +403,13 @@ export const LivePane = memo(function LivePane({
       const ipcEvent = event as CustomEvent & { channel?: string; args?: unknown[] };
       if (ipcEvent.channel === 'livehub:meta' && Array.isArray(ipcEvent.args) && ipcEvent.args[0]) {
         const meta = ipcEvent.args[0] as { title?: string; hasVideo?: boolean };
-        if (meta.title && meta.title.trim()) {
-          onUpdateTitle(pane.slotIndex, meta.title.trim());
+        const cleanMetaTitle = meta.title?.trim() || '';
+        const isDouyinPlazaFallback =
+          pane.platform === 'douyin' &&
+          parsedTarget?.roomId !== 'home' &&
+          /^(抖音直播广场|抖音直播|直播广场|抖音-记录美好生活)$/i.test(cleanMetaTitle);
+        if (cleanMetaTitle && !isDouyinPlazaFallback) {
+          onUpdateTitleRef.current(pane.slotIndex, cleanMetaTitle);
         }
         if (meta.hasVideo) {
           setIsLoading(false);
@@ -489,6 +496,27 @@ export const LivePane = memo(function LivePane({
     if (quickResolving) return;
     const syncRes = parseLiveInput(quickInput);
     if (syncRes.ok) {
+      if (syncRes.platform === 'douyu' && typeof window.livehub?.resolveLiveInput === 'function') {
+        setQuickResolving(true);
+        setQuickError('正在解析斗鱼真实房间号...');
+        try {
+          const resolved = await window.livehub.resolveLiveInput(quickInput);
+          if (resolved.ok && resolved.platform && resolved.roomId && resolved.url) {
+            setQuickError(null);
+            setQuickPendingRoomId(null);
+            setQuickInput('');
+            onLoadUrlInPane(
+              pane.slotIndex,
+              resolved.url,
+              resolved.suggestedName || `${PLATFORMS[resolved.platform].shortName} ${resolved.roomId}`,
+              null
+            );
+            return;
+          }
+        } finally {
+          setQuickResolving(false);
+        }
+      }
       setQuickError(null);
       setQuickPendingRoomId(null);
       setQuickInput('');
@@ -1021,7 +1049,7 @@ export const LivePane = memo(function LivePane({
                 <div className="direct-status-card">
                   <div className="pane-empty-title">
                     {directStream?.status === 'offline'
-                      ? '主播暂未开播'
+                      ? `${directStream.anchorName ? `${directStream.anchorName} · ` : ''}暂未开播`
                       : '直连拉流暂未成功'}
                   </div>
                   <div className="pane-empty-sub">

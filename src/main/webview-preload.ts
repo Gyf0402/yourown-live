@@ -1064,14 +1064,61 @@ async function tryAutoHighestQuality(): Promise<void> {
   lastQualityUrl = href;
 }
 
+const INITIAL_DOUYIN_ROOM_PATH =
+  window.location.hostname.toLowerCase().includes('live.douyin.com') &&
+  /^\/\d+\/?$/.test(window.location.pathname)
+    ? window.location.pathname.replace(/\/+$/, '')
+    : null;
+
+function installDouyinOfflinePlazaGuard(): void {
+  if (!INITIAL_DOUYIN_ROOM_PATH) return;
+  try {
+    void webFrame.executeJavaScript(`(() => {
+      if (window.__livehubDouyinGuard) return;
+      window.__livehubDouyinGuard = true;
+      const lockedPath = ${JSON.stringify(INITIAL_DOUYIN_ROOM_PATH)};
+      const isPlazaTarget = (u) => {
+        if (!u) return false;
+        try {
+          const parsed = new URL(String(u), window.location.origin);
+          if (!parsed.hostname.includes('live.douyin.com')) return false;
+          const p = parsed.pathname.replace(/\\/+$/, '') || '/';
+          return p === '/' || p.startsWith('/category');
+        } catch {
+          return false;
+        }
+      };
+      const origPush = history.pushState.bind(history);
+      const origReplace = history.replaceState.bind(history);
+      history.pushState = function(state, title, url) {
+        if (isPlazaTarget(url)) return;
+        return origPush(state, title, url);
+      };
+      history.replaceState = function(state, title, url) {
+        if (isPlazaTarget(url)) return;
+        return origReplace(state, title, url);
+      };
+      // If Douyin already swapped URL to plaza before script ran, stop auto-playing plaza feed
+      if (window.location.pathname.replace(/\\/+$/, '') !== lockedPath && isPlazaTarget(window.location.href)) {
+        document.querySelectorAll('video').forEach((v) => { try { v.pause(); v.muted = true; } catch {} });
+      }
+    })()`);
+  } catch {
+    // Ignore
+  }
+}
+
 function sendMetaToHost(): void {
   try {
     const rawTitle = (document.title || '')
       .replace(/[-_｜|]\s*(虎牙直播|斗鱼直播|哔哩哔哩直播|抖音直播).*$/i, '')
       .trim();
+    const isGenericDouyinPlazaTitle =
+      Boolean(INITIAL_DOUYIN_ROOM_PATH) &&
+      (!rawTitle || /^(抖音直播广场|抖音直播|抖音-记录美好生活|直播广场)$/i.test(rawTitle));
     const hasVideo = getPlayerDocuments().some((doc) => Boolean(doc.querySelector('video')));
     ipcRenderer.sendToHost('livehub:meta', {
-      title: rawTitle || document.title,
+      title: isGenericDouyinPlazaTitle ? '' : rawTitle || document.title,
       url: window.location.href,
       hasVideo,
     });
@@ -1115,6 +1162,7 @@ function startEarlyPurify(): void {
       window.setTimeout(attach, 16);
       return;
     }
+    installDouyinOfflinePlazaGuard();
     applyConfigAttributes(false);
     sendMetaToHost();
 

@@ -115,7 +115,7 @@ function extractEmbeddedUrl(input: string): string | null {
     return httpMatch[0].replace(/[),.;!?，。；！？]+$/, '');
   }
   const bareDomainMatch = input.match(
-    /(?:[a-z0-9-]+\.)?(?:huya\.com|douyu\.com|live\.bilibili\.com|bilibili\.com|b23\.tv|live\.douyin\.com|v\.douyin\.com|douyin\.com|iesdouyin\.com|webcast\.amemv\.com)[^\s"'<>，。；！]*/i
+    /(?:[a-z0-9-]+\.)?(?:huya\.com|douyu\.com|douyucdn\.cn|live\.bilibili\.com|bilibili\.com|b23\.tv|live\.douyin\.com|v\.douyin\.com|douyin\.com|iesdouyin\.com|webcast\.amemv\.com)[^\s"'<>，。；！]*/i
   );
   if (bareDomainMatch) {
     return `https://${bareDomainMatch[0].replace(/[),.;!?，。；！？]+$/, '')}`;
@@ -132,13 +132,13 @@ export function parseLiveInput(
     return { ok: false, needsPlatform: false, reason: '请输入直播间链接或房间号' };
   }
 
-  // Extract Douyin share title like 【主播名】 when available
+  // Extract share title like 【主播名】 when available
   const shareTitleMatch = trimmed.match(/【([^【】]{1,28})】/);
-  const suggestedName = shareTitleMatch ? shareTitleMatch[1].replace(/的直播间?$/, '').trim() : undefined;
+  const suggestedName = shareTitleMatch ? shareTitleMatch[1].replace(/的(?:斗鱼|虎牙|抖音|B站)?直播间?$/, '').trim() : undefined;
 
-  // 1. Check prefixed syntax like "hy:660000", "虎牙 660000", "抖音:123456", "抖音123456"
+  // 1. Check prefixed syntax like "hy:660000", "虎牙 660000", "斗鱼房间号：728", "抖音123456"
   const prefixMatch = trimmed.match(
-    /^(huya|hy|虎牙|douyu|dy|斗鱼|bilibili|bl|b站|bili|douyin|dyin|抖音)(?:[\s:：/]+|(?=\d))([a-zA-Z0-9_.-]+)$/i
+    /^(huya|hy|虎牙|douyu|dy|斗鱼|bilibili|bl|b站|bili|douyin|dyin|抖音)(?:直播间?|房间号?|房号)?(?:[\s:：/#]+|(?=\d))([a-zA-Z0-9_.-]+)$/i
   );
   if (prefixMatch) {
     const rawPrefix = prefixMatch[1].toLowerCase();
@@ -180,11 +180,63 @@ export function parseLiveInput(
         };
       }
 
-      if (host.includes('douyu.com')) {
-        const ridParam = parsed.searchParams.get('rid');
-        const roomId = ridParam || (segments[0] === 'topic' ? segments[1] : segments[0]);
+      // Douyu short links & share links (c.douyu.com, v.douyu.com, wxshare.douyucdn.cn)
+      if (
+        host === 'c.douyu.com' ||
+        host === 'v.douyu.com' ||
+        host.includes('wxshare.douyucdn.cn')
+      ) {
+        return {
+          ok: false,
+          needsPlatform: false,
+          needsShortResolve: true,
+          shortUrl: extractedUrl,
+          platformHint: 'douyu',
+          suggestedName,
+          reason: '正在解析斗鱼分享短链...',
+        };
+      }
+
+      if (host.includes('douyu.com') || host.includes('douyucdn.cn')) {
+        const ridParam =
+          parsed.searchParams.get('rid') ||
+          parsed.searchParams.get('roomId') ||
+          parsed.searchParams.get('room_id');
+
+        let roomId: string | undefined = ridParam || undefined;
         if (!roomId) {
-          return { ok: false, needsPlatform: false, reason: '未能从斗鱼链接提取房间号' };
+          const first = (segments[0] || '').toLowerCase();
+          if (first === 'beta' && segments[1]) {
+            roomId = segments[1];
+          } else if (first === 'room' && segments[1]?.toLowerCase() === 'share' && segments[2]) {
+            roomId = segments[2];
+          } else if (first === 'room' && segments[1]) {
+            roomId = segments[1];
+          } else if (first === 'topic') {
+            // Topic page without ?rid=... needs server-side HTML lookup to extract real rid
+            return {
+              ok: false,
+              needsPlatform: false,
+              needsShortResolve: true,
+              shortUrl: extractedUrl,
+              platformHint: 'douyu',
+              suggestedName,
+              reason: '正在解析斗鱼专题直播间...',
+            };
+          } else if (
+            first &&
+            !['directory', 'pages', 'cms', 'search', 'member', 'follow'].includes(first)
+          ) {
+            roomId = segments[0];
+          }
+        }
+
+        if (!roomId) {
+          return {
+            ok: false,
+            needsPlatform: false,
+            reason: '未能从斗鱼链接提取房间号，请粘贴具体直播间链接或直接输入房间号',
+          };
         }
         return {
           ok: true,

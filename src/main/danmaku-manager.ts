@@ -4,6 +4,7 @@ import { BrowserWindow, type Session } from 'electron';
 import WebSocket from 'ws';
 import type { DanmakuMessage, DanmakuStatusEvent, PlatformId } from '../shared/types';
 import { recordDiagnostic } from './diagnostics';
+import { resolveDouyuRealRid } from './stream-extractor';
 
 const DESKTOP_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0';
@@ -666,16 +667,8 @@ export class DanmakuManager {
 
   // ---------------- 1. Douyu STT ----------------
   private async connectDouyu(entry: ActiveSlotDanmaku): Promise<void> {
-    let rid = entry.roomId;
-    if (!/^\d+$/.test(rid)) {
-      const betard = (await fetchWithTimeout(
-        `https://www.douyu.com/betard/${encodeURIComponent(rid)}`,
-        { headers: { 'User-Agent': DESKTOP_UA } }
-      )
-        .then((r) => r.json())
-        .catch(() => null)) as { room?: { room_id?: number } } | null;
-      if (betard?.room?.room_id) rid = String(betard.room.room_id);
-    }
+    const resolved = await resolveDouyuRealRid(entry.roomId);
+    const rid = resolved.rid || entry.roomId;
     if (entry.stopped) return;
 
     const pack = (str: string) => {
