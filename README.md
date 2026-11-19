@@ -79,7 +79,16 @@
 
 ---
 
-## 🛠️ 快速开始
+## 📦 下载安装（Windows）
+
+前往 [Releases 页面](https://github.com/Gyf0402/yourown-live/releases) 直接下载最新打包版本，无需本地安装 Node / 编译：
+
+- **`YourOwn-Live-*-win-x64-Setup.exe`**：Windows 安装版（支持自定义目录与桌面快捷方式）
+- **`YourOwn-Live-*-win-x64-Portable.zip`**：Windows 绿色免安装版（解压后双击 `YourOwn Live.exe` 即可运行）
+
+---
+
+## 🛠️ 从源码运行与打包
 
 ### 环境要求
 - Node.js >= 20

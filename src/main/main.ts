@@ -13,6 +13,7 @@ import {
   webContents,
 } from 'electron';
 import fs from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import zlib from 'node:zlib';
@@ -780,6 +781,7 @@ function createMainWindow(initialState: PersistedState): void {
     minWidth: 980,
     minHeight: 620,
     title: 'YourOwn Live — 打造你的纯净无广告直播看播台',
+    icon: createTrayIconImage(),
     backgroundColor: startDark ? '#0e1116' : '#f5f5f7',
     titleBarStyle: 'hidden',
     titleBarOverlay: {
@@ -1062,7 +1064,10 @@ app.whenReady().then(async () => {
   });
 
   ipcMain.handle('livehub:get-webview-preload', () => {
-    return pathToFileURL(path.join(__dirname, 'webview-preload.js')).toString();
+    const rawPath = path.join(__dirname, 'webview-preload.js');
+    const unpackedPath = rawPath.replace(/app\.asar([\\/])/, 'app.asar.unpacked$1');
+    const resolved = unpackedPath !== rawPath && existsSync(unpackedPath) ? unpackedPath : rawPath;
+    return pathToFileURL(resolved).toString();
   });
 
   ipcMain.handle(

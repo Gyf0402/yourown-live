@@ -2,12 +2,57 @@
   "name": "yourown-live",
   "version": "0.1.0",
   "private": true,
+  "author": "Gyf0402",
   "description": "YourOwn Live — 打造属于你自己的跨平台直播观看平台，自由选择爱看的主播，纯净直连无广告（虎牙 / 斗鱼 / B站 / 抖音）",
   "main": "dist-electron/main/main.js",
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "build": "tsc --noEmit && vite build && tsc -p tsconfig.electron.json",
-    "start": "pnpm build && electron ."
+    "start": "pnpm build && electron .",
+    "dist:win": "pnpm build && electron-builder --win --x64"
+  },
+  "build": {
+    "appId": "com.gyf0402.yourown-live",
+    "productName": "YourOwn Live",
+    "asar": true,
+    "asarUnpack": [
+      "dist-electron/main/webview-preload.js"
+    ],
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "package.json"
+    ],
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "YourOwn-Live-${version}-win-${arch}-Portable.${ext}"
+    },
+    "nsis": {
+      "artifactName": "YourOwn-Live-${version}-win-${arch}-Setup.${ext}",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "YourOwn Live"
+    }
   },
   "dependencies": {
     "hls.js": "^1.7.4",
@@ -23,6 +68,7 @@
     "@types/ws": "^8.18.2",
     "@vitejs/plugin-react": "^4.4.1",
     "electron": "^45.3.4",
+    "electron-builder": "^26.18.0",
     "typescript": "^5.8.3",
     "vite": "^6.3.5"
   }
