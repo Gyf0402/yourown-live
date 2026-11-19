@@ -105,9 +105,12 @@ export const DanmakuOverlay = memo(function DanmakuOverlay({
     }
   }, [enabled, streamKey]);
 
-  // ResizeObserver for high-DPI canvas sizing
+  // ResizeObserver for high-DPI canvas sizing (always sync actual DOM canvas.width/height on remount!)
   useEffect(() => {
-    if (!enabled || mode !== 'scroll') return;
+    if (!enabled || mode !== 'scroll') {
+      sizeRef.current = { w: 0, h: 0, dpr: 1 };
+      return;
+    }
     const canvas = canvasRef.current;
     if (!canvas) return;
 
@@ -116,17 +119,31 @@ export const DanmakuOverlay = memo(function DanmakuOverlay({
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
       const w = Math.max(1, Math.floor(rect.width));
       const h = Math.max(1, Math.floor(rect.height));
-      if (sizeRef.current.w !== w || sizeRef.current.h !== h || sizeRef.current.dpr !== dpr) {
+      const targetW = Math.floor(w * dpr);
+      const targetH = Math.floor(h * dpr);
+      if (
+        sizeRef.current.w !== w ||
+        sizeRef.current.h !== h ||
+        sizeRef.current.dpr !== dpr ||
+        canvas.width !== targetW ||
+        canvas.height !== targetH
+      ) {
         sizeRef.current = { w, h, dpr };
-        canvas.width = Math.floor(w * dpr);
-        canvas.height = Math.floor(h * dpr);
+        canvas.width = targetW;
+        canvas.height = targetH;
+        if (bulletsRef.current.length > 0) {
+          ensureLoop.current();
+        }
       }
     };
 
     updateSize();
     const ro = new ResizeObserver(updateSize);
     ro.observe(canvas);
-    return () => ro.disconnect();
+    return () => {
+      ro.disconnect();
+      sizeRef.current = { w: 0, h: 0, dpr: 1 };
+    };
   }, [enabled, mode, area]);
 
   // Start / drive requestAnimationFrame rendering loop for Canvas mode
@@ -263,24 +280,33 @@ export const DanmakuOverlay = memo(function DanmakuOverlay({
     for (const msg of filtered) {
       if (added >= 10) break;
       const textWidth = Math.ceil(ctx.measureText(msg.text).width);
-      // Base speed scales slightly with viewport width & bullet length for natural feel
-      const baseSpeed = Math.max(92, w * 0.145) + Math.min(55, textWidth * 0.16);
+      // Base speed scales gently with viewport width & bullet length so bullets stay readable
+      const baseSpeed = Math.max(96, w * 0.14) + Math.min(42, textWidth * 0.12);
+      const spawnX = w + 12 + added * 16;
 
-      // Find the first lane where the rightmost bullet has cleared the right edge with comfortable gap
+      // Find the first lane where the rightmost bullet has cleared the right edge AND won't be caught up mid-screen
       let chosenLane = -1;
       for (let lane = 0; lane < maxLanes; lane++) {
+        let rightmost: CanvasBullet | null = null;
         let rightmostTail = -Infinity;
         for (let i = 0; i < existing.length; i++) {
           const b = existing[i];
           if (b.lane === lane) {
             const tail = b.x + b.width;
-            if (tail > rightmostTail) rightmostTail = tail;
+            if (tail > rightmostTail) {
+              rightmostTail = tail;
+              rightmost = b;
+            }
           }
         }
-        if (rightmostTail < w - 28) {
-          chosenLane = lane;
-          break;
+        if (rightmostTail >= w - 28) continue;
+        if (rightmost && baseSpeed > rightmost.speedPxPerSec) {
+          const prevExitSec = Math.max(0, rightmostTail / rightmost.speedPxPerSec);
+          const newHeadAtExit = spawnX - baseSpeed * prevExitSec;
+          if (newHeadAtExit < 24) continue;
         }
+        chosenLane = lane;
+        break;
       }
       if (chosenLane === -1) continue;
 
@@ -289,7 +315,7 @@ export const DanmakuOverlay = memo(function DanmakuOverlay({
         text: msg.text,
         color: msg.color || '#ffffff',
         lane: chosenLane,
-        x: w + 10 + added * 18,
+        x: spawnX,
         width: textWidth,
         speedPxPerSec: baseSpeed,
       });

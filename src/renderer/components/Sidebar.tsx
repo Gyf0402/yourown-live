@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import {
+  ArrowUpDown,
   Check,
   KeyRound,
   Pencil,
@@ -20,6 +21,7 @@ import {
 import type {
   AuthStatusMap,
   Channel,
+  ChannelSortMode,
   LiveRoomStatus,
   PlatformId,
 } from '../../shared/types';
@@ -27,6 +29,7 @@ import type {
 interface SidebarProps {
   channels: Channel[];
   customGroups: string[];
+  channelSortMode: ChannelSortMode;
   authStatus: AuthStatusMap;
   playingChannelIds: Set<string>;
   liveStatuses: Record<string, LiveRoomStatus>;
@@ -35,6 +38,13 @@ interface SidebarProps {
   onAddChannel: (channel: Channel, openImmediately?: boolean) => void;
   onRemoveChannel: (id: string) => void;
   onTogglePin: (id: string) => void;
+  onReorderChannels: (
+    fromId: string,
+    toId: string,
+    position: 'before' | 'after',
+    visibleOrderIds?: string[]
+  ) => void;
+  onChangeChannelSortMode: (mode: ChannelSortMode) => void;
   onRenameChannel: (id: string, name: string, group?: string) => void;
   onAddGroup: (name: string) => void;
   onRemoveGroup: (name: string) => void;
@@ -53,6 +63,7 @@ const STATUS_SORT_RANK: Record<string, number> = {
 export function Sidebar({
   channels,
   customGroups,
+  channelSortMode,
   authStatus,
   playingChannelIds,
   liveStatuses,
@@ -61,6 +72,8 @@ export function Sidebar({
   onAddChannel,
   onRemoveChannel,
   onTogglePin,
+  onReorderChannels,
+  onChangeChannelSortMode,
   onRenameChannel,
   onAddGroup,
   onRemoveGroup,
@@ -83,6 +96,8 @@ export function Sidebar({
   const [addingGroup, setAddingGroup] = useState(false);
   const [newGroupName, setNewGroupName] = useState('');
   const [onlyLiveFilter, setOnlyLiveFilter] = useState(false);
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [dropTarget, setDropTarget] = useState<{ id: string; pos: 'before' | 'after' } | null>(null);
 
   const liveCount = useMemo(
     () =>
@@ -109,29 +124,35 @@ export function Sidebar({
 
   const filteredChannels = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
-    return [...channels]
-      .sort((a, b) => {
-        if (Boolean(a.pinned) !== Boolean(b.pinned)) return a.pinned ? -1 : 1;
-        const rankA = STATUS_SORT_RANK[liveStatuses[a.id]?.status ?? 'unknown'] ?? 2;
-        const rankB = STATUS_SORT_RANK[liveStatuses[b.id]?.status ?? 'unknown'] ?? 2;
-        if (rankA !== rankB) return rankA - rankB;
-        return b.createdAt - a.createdAt;
-      })
-      .filter((ch) => {
-        if (activeGroupFilter !== '全部' && ch.group !== activeGroupFilter) return false;
-        if (onlyLiveFilter) {
-          const st = liveStatuses[ch.id]?.status;
-          if (st !== 'live' && st !== 'replay') return false;
-        }
-        if (!q) return true;
-        return (
-          ch.name.toLowerCase().includes(q) ||
-          ch.roomId.toLowerCase().includes(q) ||
-          PLATFORMS[ch.platform].name.includes(q) ||
-          (liveStatuses[ch.id]?.title || '').toLowerCase().includes(q)
-        );
-      });
-  }, [channels, activeGroupFilter, searchQuery, liveStatuses, onlyLiveFilter]);
+    const indexMap = new Map<string, number>();
+    channels.forEach((c, idx) => indexMap.set(c.id, idx));
+
+    const ordered =
+      channelSortMode === 'custom'
+        ? [...channels]
+        : [...channels].sort((a, b) => {
+            if (Boolean(a.pinned) !== Boolean(b.pinned)) return a.pinned ? -1 : 1;
+            const rankA = STATUS_SORT_RANK[liveStatuses[a.id]?.status ?? 'unknown'] ?? 2;
+            const rankB = STATUS_SORT_RANK[liveStatuses[b.id]?.status ?? 'unknown'] ?? 2;
+            if (rankA !== rankB) return rankA - rankB;
+            return (indexMap.get(a.id) ?? 0) - (indexMap.get(b.id) ?? 0);
+          });
+
+    return ordered.filter((ch) => {
+      if (activeGroupFilter !== '全部' && ch.group !== activeGroupFilter) return false;
+      if (onlyLiveFilter) {
+        const st = liveStatuses[ch.id]?.status;
+        if (st !== 'live' && st !== 'replay') return false;
+      }
+      if (!q) return true;
+      return (
+        ch.name.toLowerCase().includes(q) ||
+        ch.roomId.toLowerCase().includes(q) ||
+        PLATFORMS[ch.platform].name.includes(q) ||
+        (liveStatuses[ch.id]?.title || '').toLowerCase().includes(q)
+      );
+    });
+  }, [channels, channelSortMode, activeGroupFilter, searchQuery, liveStatuses, onlyLiveFilter]);
 
   const commitAdd = (
     platform: PlatformId,
@@ -456,16 +477,34 @@ export function Sidebar({
             {onlyLiveFilter && <span className="live-filter-tag">仅开播</span>}
           </button>
 
-          <button
-            type="button"
-            className={`status-refresh-btn ${checkingStatuses ? 'spinning' : ''}`}
-            onClick={onRefreshLiveStatuses}
-            disabled={checkingStatuses}
-            title="立即重新检测全部直播间开播状态"
-          >
-            <RefreshCw size={12} />
-            <span>{checkingStatuses ? '检测中' : '测开播'}</span>
-          </button>
+          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+            <button
+              type="button"
+              className={`sort-mode-btn ${channelSortMode === 'custom' ? 'active' : ''}`}
+              onClick={() =>
+                onChangeChannelSortMode(channelSortMode === 'custom' ? 'live' : 'custom')
+              }
+              title={
+                channelSortMode === 'custom'
+                  ? '当前：自定义顺序（拖拽卡片自由排序，点击切回开播优先）'
+                  : '当前：开播优先（点击切换自定义顺序，或直接上下拖拽卡片排序）'
+              }
+            >
+              <ArrowUpDown size={11} />
+              <span>{channelSortMode === 'custom' ? '自定义' : '开播序'}</span>
+            </button>
+
+            <button
+              type="button"
+              className={`status-refresh-btn ${checkingStatuses ? 'spinning' : ''}`}
+              onClick={onRefreshLiveStatuses}
+              disabled={checkingStatuses}
+              title="立即重新检测全部直播间开播状态"
+            >
+              <RefreshCw size={12} />
+              <span>{checkingStatuses ? '检测中' : '测开播'}</span>
+            </button>
+          </div>
         </div>
       </div>
 
@@ -508,6 +547,12 @@ export function Sidebar({
                 key={channel.id}
                 className={`channel-card ${isPlaying ? 'playing' : ''} ${
                   isOffline && !isPlaying ? 'is-offline' : ''
+                } ${draggingId === channel.id ? 'is-dragging' : ''} ${
+                  dropTarget?.id === channel.id
+                    ? dropTarget.pos === 'before'
+                      ? 'drag-insert-before'
+                      : 'drag-insert-after'
+                    : ''
                 }`}
                 style={{ '--stagger': `${Math.min(index, 10) * 32}ms` } as React.CSSProperties}
                 draggable={!isEditing}
@@ -524,7 +569,45 @@ export function Sidebar({
                     'application/x-livehub-channel',
                     JSON.stringify(channel)
                   );
-                  e.dataTransfer.effectAllowed = 'copy';
+                  e.dataTransfer.setData('text/plain', channel.id);
+                  e.dataTransfer.effectAllowed = 'copyMove';
+                  setDraggingId(channel.id);
+                }}
+                onDragOver={(e) => {
+                  if (!draggingId || draggingId === channel.id) return;
+                  e.preventDefault();
+                  e.dataTransfer.dropEffect = 'move';
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  const pos: 'before' | 'after' =
+                    e.clientY < rect.top + rect.height / 2 ? 'before' : 'after';
+                  setDropTarget((cur) =>
+                    cur && cur.id === channel.id && cur.pos === pos
+                      ? cur
+                      : { id: channel.id, pos }
+                  );
+                }}
+                onDragLeave={() => {
+                  setDropTarget((cur) => (cur?.id === channel.id ? null : cur));
+                }}
+                onDrop={(e) => {
+                  if (!draggingId || draggingId === channel.id) return;
+                  e.preventDefault();
+                  e.stopPropagation();
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  const pos: 'before' | 'after' =
+                    e.clientY < rect.top + rect.height / 2 ? 'before' : 'after';
+                  onReorderChannels(
+                    draggingId,
+                    channel.id,
+                    pos,
+                    filteredChannels.map((c) => c.id)
+                  );
+                  setDraggingId(null);
+                  setDropTarget(null);
+                }}
+                onDragEnd={() => {
+                  setDraggingId(null);
+                  setDropTarget(null);
                 }}
                 onClick={() => {
                   if (!isEditing) onOpenChannel(channel);
@@ -533,8 +616,8 @@ export function Sidebar({
                   isEditing
                     ? undefined
                     : liveInfo?.title && (liveState === 'live' || liveState === 'replay')
-                      ? `${channel.name} — ${liveInfo.title}（点击播放，双击备注可修改）`
-                      : '点击打开或拖拽到任意分屏，双击备注名可修改'
+                      ? `${channel.name} — ${liveInfo.title}（点击播放，上下拖拽排序或拖到右侧分屏，双击改备注）`
+                      : '点击播放，上下拖拽调整顺序或拖到右侧任意分屏，双击备注名可修改'
                 }
               >
                 <span

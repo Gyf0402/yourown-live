@@ -770,20 +770,38 @@ export class DanmakuManager {
       }
     }
 
+    const liveSession = this.getSession?.();
+    const biliFetchJson = async (url: string, headers: Record<string, string>) => {
+      if (liveSession) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 6500);
+        try {
+          const resp = await liveSession.fetch(url, {
+            credentials: 'include',
+            signal: controller.signal,
+          });
+          return await resp.json();
+        } catch {
+          // Fall back to direct fetch with explicit cookie header
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+      const resp = await fetchWithTimeout(url, { headers });
+      return resp.json();
+    };
+
     const [wbi, roomInfo] = await Promise.all([
       getBiliWbiInfo(),
-      fetchWithTimeout(
+      biliFetchJson(
         `https://api.live.bilibili.com/room/v1/Room/get_info?room_id=${encodeURIComponent(entry.roomId)}`,
         {
-          headers: {
-            'User-Agent': DESKTOP_UA,
-            Referer: `https://live.bilibili.com/${entry.roomId}`,
-            ...(authCookieHeader ? { Cookie: authCookieHeader } : {}),
-          },
+          'User-Agent': DESKTOP_UA,
+          Referer: `https://live.bilibili.com/${entry.roomId}`,
+          Origin: 'https://live.bilibili.com',
+          ...(authCookieHeader ? { Cookie: authCookieHeader } : {}),
         }
-      )
-        .then((r) => r.json())
-        .catch(() => null) as Promise<{ data?: { room_id?: number } } | null>,
+      ).catch(() => null) as Promise<{ data?: { room_id?: number } } | null>,
     ]);
     if (entry.stopped) return;
 
@@ -800,16 +818,15 @@ export class DanmakuManager {
 
     const realRid = Number(roomInfo?.data?.room_id || entry.roomId);
     const qs = wbiSignQuery({ id: realRid, type: 0 }, wbi.imgKey, wbi.subKey);
-    const dmInfo = (await fetchWithTimeout(
+    const dmInfo = (await biliFetchJson(
       `https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo?${qs}`,
       {
-        headers: {
-          'User-Agent': DESKTOP_UA,
-          Referer: `https://live.bilibili.com/${realRid}`,
-          ...(cookieForDanmu ? { Cookie: cookieForDanmu } : {}),
-        },
+        'User-Agent': DESKTOP_UA,
+        Referer: `https://live.bilibili.com/${realRid}`,
+        Origin: 'https://live.bilibili.com',
+        ...(cookieForDanmu ? { Cookie: cookieForDanmu } : {}),
       }
-    ).then((r) => r.json())) as {
+    )) as {
       data?: { token?: string; host_list?: Array<{ host: string; wss_port: number }> };
     };
     if (entry.stopped) return;

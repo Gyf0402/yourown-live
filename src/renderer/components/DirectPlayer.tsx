@@ -581,7 +581,7 @@ export function DirectPlayer({
       tabIndex={0}
       onWheel={(e) => {
         const target = e.target as HTMLElement | null;
-        if (target?.closest('.dm-popover, .danmaku-chat-panel')) return;
+        if (target?.closest('.dm-style-popover, .danmaku-chat-panel')) return;
         if (Math.abs(e.deltaY) < 4) return;
         e.preventDefault();
         applyVolumeDelta(e.deltaY < 0 ? 0.05 : -0.05);

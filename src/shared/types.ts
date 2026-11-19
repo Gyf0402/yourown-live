@@ -12,6 +12,8 @@ export type ThemeMode = 'light' | 'dark' | 'system';
 
 export type VideoFitMode = 'contain' | 'cover';
 
+export type ChannelSortMode = 'live' | 'custom';
+
 export interface SplitRatios {
   col: number; // 20..80 percentage
   row: number; // 20..80 percentage
@@ -83,6 +85,7 @@ export interface AppSettings {
   danmakuMode?: DanmakuMode;
   danmakuBlockKeywords?: string[];
   theme?: ThemeMode;
+  channelSortMode?: ChannelSortMode;
   customGroups?: string[];
   splitRatios?: SplitRatios;
   windowBounds?: WindowBounds;

@@ -258,7 +258,11 @@ export const LivePane = memo(function LivePane({
     const unsubBatch = window.livehub.onDanmakuBatch((batch) => {
       const mine = batch.filter((m) => m.slotIndex === pane.slotIndex);
       if (mine.length > 0) {
-        setDanmakuBatch(mine);
+        // Keep recent rolling window so rapid IPC bursts never overwrite unconsumed batches under React 19 batching
+        setDanmakuBatch((prev) => {
+          const merged = [...prev, ...mine];
+          return merged.length > 60 ? merged.slice(merged.length - 60) : merged;
+        });
       }
     });
 
