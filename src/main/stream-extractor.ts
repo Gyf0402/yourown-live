@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import vm from 'node:vm';
 import { BrowserWindow } from 'electron';
 import type { Session } from 'electron';
 import type {
@@ -990,14 +991,25 @@ async function getDouyuSignerWindow(): Promise<BrowserWindow> {
       height: 64,
       show: false,
       webPreferences: {
+        partition: 'douyu-signer',
         sandbox: true,
         contextIsolation: true,
         nodeIntegration: false,
         images: false,
       },
     });
-    await win.loadURL('data:text/html;charset=utf-8,<!doctype html><html><body></body></html>');
-    await win.webContents.executeJavaScript(PURE_JS_MD5_SOURCE);
+    try {
+      // Use about:blank instead of data:text/html to avoid Electron ERR_FAILED (-2) races
+      await win.loadURL('about:blank');
+      await win.webContents.executeJavaScript(PURE_JS_MD5_SOURCE);
+    } catch (err) {
+      try {
+        if (!win.isDestroyed()) win.destroy();
+      } catch {
+        // Ignore
+      }
+      throw err;
+    }
     win.on('closed', () => {
       if (douyuSignerWin === win) douyuSignerWin = null;
     });
@@ -1011,24 +1023,47 @@ async function getDouyuSignerWindow(): Promise<BrowserWindow> {
   return douyuSignerReady;
 }
 
+function runDouyuSignInVm(jsCode: string, rid: string, did: string, tt: number): string {
+  const sandbox: Record<string, unknown> = {
+    CryptoJS: {
+      MD5: (s: unknown) => ({ toString: () => md5(String(s)) }),
+    },
+  };
+  sandbox.window = sandbox;
+  sandbox.self = sandbox;
+  const script = `${jsCode};\nString(ub98484234(${JSON.stringify(rid)}, ${JSON.stringify(did)}, ${tt}));`;
+  const res = vm.runInNewContext(script, sandbox, { timeout: 1500 });
+  return String(res || '');
+}
+
 async function runDouyuSignInSandbox(
   jsCode: string,
   rid: string,
   did: string,
   tt: number
 ): Promise<string> {
-  const win = await getDouyuSignerWindow();
-  touchDouyuSignerIdle();
-  // Execute at global scope (not inside an IIFE) because Douyu's obfuscated script
-  // declares top-level globals (e.g. vdwdae325w_64we) referenced via eval/window.
-  const script = `${jsCode};\nString(ub98484234(${JSON.stringify(rid)}, ${JSON.stringify(did)}, ${tt}));`;
-  const result = await Promise.race<string>([
-    win.webContents.executeJavaScript(script) as Promise<string>,
-    new Promise<string>((_, reject) =>
-      setTimeout(() => reject(new Error('斗鱼签名执行超时')), 3000)
-    ),
-  ]);
-  return String(result || '');
+  try {
+    const win = await getDouyuSignerWindow();
+    touchDouyuSignerIdle();
+    // Execute at global scope (not inside an IIFE) because Douyu's obfuscated script
+    // declares top-level globals (e.g. vdwdae325w_64we) referenced via eval/window.
+    const script = `${jsCode};\nString(ub98484234(${JSON.stringify(rid)}, ${JSON.stringify(did)}, ${tt}));`;
+    const result = await Promise.race<string>([
+      win.webContents.executeJavaScript(script) as Promise<string>,
+      new Promise<string>((_, reject) =>
+        setTimeout(() => reject(new Error('斗鱼签名执行超时')), 3000)
+      ),
+    ]);
+    return String(result || '');
+  } catch (err) {
+    // If hidden BrowserWindow fails (e.g., ERR_FAILED -2 / renderer init race), seamlessly fall back to node:vm
+    recordDiagnostic(
+      'warn',
+      'stream',
+      `[douyu#${rid}] 沙盒窗口签名失败，已自动切换 VM 兜底：${err instanceof Error ? err.message : String(err)}`
+    );
+    return runDouyuSignInVm(jsCode, rid, did, tt);
+  }
 }
 
 async function extractDouyu(

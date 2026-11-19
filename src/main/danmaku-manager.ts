@@ -356,8 +356,17 @@ async function getDouyinSignerWindow(sdkCode: string): Promise<BrowserWindow> {
       await win.loadURL('https://live.douyin.com/robots.txt');
       await win.webContents.executeJavaScript(`(() => { ${sdkCode}; return true; })()`);
     } catch {
-      await win.loadURL('data:text/html,<!doctype html><html><body></body></html>');
-      await win.webContents.executeJavaScript(sdkCode);
+      try {
+        await win.loadURL('about:blank');
+        await win.webContents.executeJavaScript(`(() => { ${sdkCode}; return true; })()`);
+      } catch (err) {
+        try {
+          if (!win.isDestroyed()) win.destroy();
+        } catch {
+          // Ignore
+        }
+        throw err;
+      }
     }
     win.on('closed', () => {
       if (signerWin === win) signerWin = null;
