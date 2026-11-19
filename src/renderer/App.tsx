@@ -123,6 +123,20 @@ export function App() {
       setAuthStatus(nextStatus);
 
       if (platformsToReload.length > 0) {
+        // Clear any previously pinned low quality on newly authenticated platforms so
+        // autoHighestQuality immediately upgrades Bilibili/etc. from 720P to 1080P 原画.
+        setSettings((prev) => {
+          if (!prev.autoHighestQuality) return prev;
+          let changed = false;
+          const nextPanes = prev.panes.map((p) => {
+            if (p.platform && platformsToReload.includes(p.platform) && p.preferredQualityId) {
+              changed = true;
+              return { ...p, preferredQualityId: undefined };
+            }
+            return p;
+          });
+          return changed ? { ...prev, panes: nextPanes } : prev;
+        });
         setReloadEpochs((epochs) => {
           const updated = { ...epochs };
           platformsToReload.forEach((pid) => {

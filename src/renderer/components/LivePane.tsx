@@ -177,11 +177,11 @@ export const LivePane = memo(function LivePane({
       typeof window.livehub?.resolveStream === 'function'
   );
 
-  const showTempHint = useCallback((msg: string) => {
+  const showTempHint = useCallback((msg: string, durationMs = 2600) => {
     setPaneHint(msg);
     window.setTimeout(() => {
       setPaneHint((cur) => (cur === msg ? null : cur));
-    }, 2600);
+    }, durationMs);
   }, []);
 
   // Stagger initial multi-pane webview mounts slightly to avoid cold-start CPU/network spikes
@@ -317,6 +317,9 @@ export const LivePane = memo(function LivePane({
           if (displayTitle) {
             onUpdateTitleRef.current(pane.slotIndex, displayTitle);
           }
+        }
+        if (res.ok && res.platform === 'bilibili' && (res.qualities || []).some((q) => q.locked)) {
+          showTempHint('B站未登录仅限720P超清，点「登录解锁蓝光」可看1080P原画', 4500);
         }
         if (!res.ok) {
           setIsLoading(false);
@@ -643,6 +646,12 @@ export const LivePane = memo(function LivePane({
   };
 
   const handleSelectQuality = (labelOrId: string) => {
+    const chosen = streamOptions.qualities.find((q) => q.id === labelOrId);
+    if (chosen?.locked && !isPlatformLoggedIn && pane.platform) {
+      showTempHint(`「${chosen.label}」需登录${platformMeta?.shortName || ''}账号后解锁，正在打开登录...`);
+      onLoginPlatform(pane.platform);
+      return;
+    }
     if (useDirectStream) {
       triedLinesRef.current = new Set();
       onUpdatePanePrefs(pane.slotIndex, { preferredQualityId: labelOrId });
@@ -654,12 +663,6 @@ export const LivePane = memo(function LivePane({
     }
     const el = webviewRef.current;
     if (!el || !domReady) return;
-    const chosen = streamOptions.qualities.find((q) => q.id === labelOrId);
-    if (chosen?.locked && !isPlatformLoggedIn && pane.platform) {
-      showTempHint('该画质需登录账号后解锁');
-      onLoginPlatform(pane.platform);
-      return;
-    }
     setStreamOptions((prev) => ({
       ...prev,
       qualities: prev.qualities.map((q) => ({ ...q, active: q.id === labelOrId })),

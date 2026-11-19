@@ -157,7 +157,20 @@ async function getCookieHeaderForDomain(
     const cookies = await liveSession.cookies.get({ domain });
     const filtered = allowNames ? cookies.filter((c) => allowNames.has(c.name)) : cookies;
     if (!filtered.length) return '';
-    return filtered.map((c) => `${c.name}=${c.value}`).join('; ');
+    // Deduplicate by cookie name (prefer root domain cookies like .bilibili.com with non-empty values)
+    const map = new Map<string, string>();
+    for (const c of filtered) {
+      if (!c.value) continue;
+      const existing = map.get(c.name);
+      const isRootDot = (c.domain || '').startsWith('.');
+      if (!existing || isRootDot) {
+        map.set(c.name, c.value);
+      }
+    }
+    if (map.size === 0) return '';
+    return Array.from(map.entries())
+      .map(([k, v]) => `${k}=${v}`)
+      .join('; ');
   } catch {
     return '';
   }
@@ -485,6 +498,30 @@ async function raceFastestBilibiliUrl(
 }
 
 const bilibiliAnchorCache = new Map<number, string>();
+let cachedBiliBuvid3: { value: string; expiresAt: number } | null = null;
+
+async function getBilibiliBuvid3(): Promise<string> {
+  const now = Date.now();
+  if (cachedBiliBuvid3 && now < cachedBiliBuvid3.expiresAt) {
+    return cachedBiliBuvid3.value;
+  }
+  try {
+    const resp = await fetchWithTimeout(
+      'https://api.bilibili.com/x/frontend/finger/spi',
+      { headers: { 'User-Agent': DESKTOP_UA, Referer: 'https://live.bilibili.com/' } },
+      1500
+    );
+    const json = (await resp.json()) as { data?: { b_3?: string } };
+    const b3 = json?.data?.b_3?.trim() || '';
+    if (b3) {
+      cachedBiliBuvid3 = { value: b3, expiresAt: now + 6 * 60 * 60 * 1000 };
+      return b3;
+    }
+  } catch {
+    // Non-fatal
+  }
+  return '';
+}
 
 async function getBilibiliAnchorName(uid: number | undefined): Promise<string | undefined> {
   if (!uid || !Number.isFinite(uid) || uid <= 0) return undefined;
@@ -518,11 +555,30 @@ async function extractBilibili(
   liveSession: Session
 ): Promise<DirectStreamResult> {
   const referer = `https://live.bilibili.com/${req.roomId}`;
-  const cookie = await getCookieHeaderForDomain(
+  let cookie = await getCookieHeaderForDomain(
     liveSession,
     'bilibili.com',
-    new Set(['SESSDATA', 'bili_jct', 'DedeUserID', 'buvid3', 'buvid4', 'b_nut'])
+    new Set([
+      'SESSDATA',
+      'bili_jct',
+      'DedeUserID',
+      'DedeUserID__ckMd5',
+      'sid',
+      'buvid3',
+      'buvid4',
+      'b_nut',
+      'LIVE_BUVID',
+    ])
   );
+  const hasSessdata = /\bSESSDATA=[^;\s]+/.test(cookie);
+  // After QR login via passport.bilibili.com, buvid3 may not be set yet; attach a valid buvid3 so
+  // Bilibili does not downgrade logged-in high-quality playurl requests under risk control.
+  if (hasSessdata && !/\bbuvid3=[^;\s]+/.test(cookie)) {
+    const b3 = await getBilibiliBuvid3();
+    if (b3) {
+      cookie = cookie ? `${cookie}; buvid3=${b3}` : `buvid3=${b3}`;
+    }
+  }
   const commonHeaders: Record<string, string> = {
     'User-Agent': DESKTOP_UA,
     Referer: referer,
@@ -635,17 +691,29 @@ async function extractBilibili(
     }
   }
 
-  // Prefer AVC (H.264) for maximum Chromium MSE compatibility; for HLS prefer fmp4 over ts (ts often lists dead gotcha101)
-  const pickFlvCodec = (entries: CodecEntry[]) =>
-    entries.find((e) => e.codecName === 'avc') || entries[0];
-  const pickHlsCodec = (entries: CodecEntry[]) =>
-    entries.find((e) => e.formatName === 'fmp4' && e.codecName === 'avc') ||
-    entries.find((e) => e.codecName === 'avc') ||
-    entries[0];
+  // Rank by highest achieved currentQn first (some Bilibili 原画/4K rooms only deliver high qn via fmp4 or hevc),
+  // then prefer AVC (H.264) for lowest-CPU Chromium MSE decoding, and prefer fmp4 over ts for HLS.
+  const sortBestEntry = (entries: CodecEntry[], preferFmp4: boolean) =>
+    [...entries].sort((a, b) => {
+      if (b.currentQn !== a.currentQn) return b.currentQn - a.currentQn;
+      if (preferFmp4) {
+        const fa = a.formatName === 'fmp4' ? 0 : 1;
+        const fb = b.formatName === 'fmp4' ? 0 : 1;
+        if (fa !== fb) return fa - fb;
+      }
+      const ca = a.codecName === 'avc' ? 0 : 1;
+      const cb = b.codecName === 'avc' ? 0 : 1;
+      return ca - cb;
+    });
 
-  const flvCodec = pickFlvCodec(flvEntries);
-  const hlsCodec = pickHlsCodec(hlsEntries);
-  const primary = flvCodec || hlsCodec;
+  const flvCodec = sortBestEntry(flvEntries, false)[0];
+  const hlsCodec = sortBestEntry(hlsEntries, true)[0];
+  // If HLS (fmp4) achieves a strictly higher quality than FLV (e.g. 原画 10000 on fmp4 vs 超清 250 on flv),
+  // promote HLS as primary and omit the downgraded FLV URL so DirectPlayer plays the crisp stream.
+  const useHlsAsPrimary = Boolean(
+    hlsCodec && (!flvCodec || hlsCodec.currentQn > flvCodec.currentQn)
+  );
+  const primary = useHlsAsPrimary ? hlsCodec : flvCodec || hlsCodec;
 
   if (!primary) {
     const anchorName = await getBilibiliAnchorName(uid);
@@ -663,19 +731,23 @@ async function extractBilibili(
     };
   }
 
-  const maxLines = Math.max(flvCodec?.urls.length || 0, hlsCodec?.urls.length || 0);
+  const activeCodec = useHlsAsPrimary ? hlsCodec : flvCodec;
+  const maxLines = Math.max(
+    useHlsAsPrimary ? 0 : flvCodec?.urls.length || 0,
+    hlsCodec?.urls.length || 0
+  );
   let lineIdx = Math.min(
     Math.max(0, Number.parseInt(req.lineId || '0', 10) || 0),
     Math.max(0, maxLines - 1)
   );
-  let fastestFlvUrl: string | undefined;
+  let fastestActiveUrl: string | undefined;
 
-  // Run anchor-name lookup in parallel with FLV CDN racing so metadata adds 0ms to startup!
-  const shouldRace = !req.lineId && Boolean(flvCodec && flvCodec.urls.length > 1);
+  // Run anchor-name lookup in parallel with CDN racing so metadata adds 0ms to startup!
+  const shouldRace = !req.lineId && Boolean(activeCodec && activeCodec.urls.length > 1);
   const [anchorName, raced] = await Promise.all([
     getBilibiliAnchorName(uid),
-    shouldRace && flvCodec
-      ? raceFastestBilibiliUrl(flvCodec.urls, {
+    shouldRace && activeCodec
+      ? raceFastestBilibiliUrl(activeCodec.urls, {
           'User-Agent': DESKTOP_UA,
           Referer: referer,
         })
@@ -684,26 +756,31 @@ async function extractBilibili(
 
   if (raced) {
     lineIdx = raced.index;
-    fastestFlvUrl = raced.finalUrl;
+    fastestActiveUrl = raced.finalUrl;
     recordDiagnostic(
       'info',
       'stream',
-      `[bilibili#${req.roomId}] 测速择优命中线路 ${lineIdx + 1}（${raced.ms}ms）`
+      `[bilibili#${req.roomId}] 测速择优命中线路 ${lineIdx + 1}（${raced.ms}ms，${useHlsAsPrimary ? 'HLS-fMP4' : 'FLV'} qn=${primary.currentQn}）`
     );
   }
 
-  const flvUrl =
-    fastestFlvUrl || flvCodec?.urls[Math.min(lineIdx, flvCodec.urls.length - 1)];
-  const hlsUrl = hlsCodec?.urls[Math.min(lineIdx, hlsCodec.urls.length - 1)];
+  const flvUrl = useHlsAsPrimary
+    ? undefined
+    : fastestActiveUrl || flvCodec?.urls[Math.min(lineIdx, flvCodec.urls.length - 1)];
+  const hlsUrl = useHlsAsPrimary
+    ? fastestActiveUrl || hlsCodec?.urls[Math.min(lineIdx, hlsCodec.urls.length - 1)]
+    : hlsCodec?.urls[Math.min(lineIdx, hlsCodec.urls.length - 1)];
 
   const qualities: StreamOptionItem[] = primary.acceptQn.map((qn) => ({
     id: String(qn),
     label: descMap.get(qn) || `${qn}P`,
     active: qn === primary.currentQn,
+    locked: !hasSessdata && qn > primary.currentQn,
   }));
 
   const lines: StreamOptionItem[] = Array.from({ length: maxLines }, (_, i) => {
-    const sampleUrl = flvCodec?.urls[i] || hlsCodec?.urls[i] || '';
+    const sampleUrl =
+      (useHlsAsPrimary ? hlsCodec?.urls[i] : flvCodec?.urls[i] || hlsCodec?.urls[i]) || '';
     return {
       id: String(i),
       label: labelBilibiliUrl(sampleUrl, i),
