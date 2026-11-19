@@ -900,7 +900,7 @@ app.on('web-contents-created', (_event, contents) => {
 const streamHostReferers = new Map<string, string>();
 
 const KNOWN_STREAM_REFERERS: Array<[RegExp, string]> = [
-  [/bilivideo\.(com|cn)$/i, 'https://live.bilibili.com/'],
+  [/(bilivideo\.(com|cn)|smtcdns\.net|hdslb\.com)$/i, 'https://live.bilibili.com/'],
   [/(huya\.com|msstatic\.com|hycdn\.cn)$/i, 'https://www.huya.com/'],
   [/(douyucdn\.cn|douyucdn2\.cn|edgesrv\.com|akmcdn\.com|bytefcdn)/i, 'https://www.douyu.com/'],
   [/(douyincdn\.com|douyinpic\.com|douyinliving\.com|amemv\.com|snssdk\.com|bytecdn\.cn|ibytedtos\.com)/i, 'https://live.douyin.com/'],

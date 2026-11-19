@@ -743,16 +743,17 @@ export class DanmakuManager {
     const [wbi, roomInfo] = await Promise.all([
       getBiliWbiInfo(),
       fetchWithTimeout(
-        `https://api.live.bilibili.com/xlive/web-room/v1/index/getInfoByRoom?room_id=${encodeURIComponent(entry.roomId)}`,
+        `https://api.live.bilibili.com/room/v1/Room/get_info?room_id=${encodeURIComponent(entry.roomId)}`,
         {
           headers: {
             'User-Agent': DESKTOP_UA,
+            Referer: `https://live.bilibili.com/${entry.roomId}`,
             ...(authCookieHeader ? { Cookie: authCookieHeader } : {}),
           },
         }
       )
         .then((r) => r.json())
-        .catch(() => null) as Promise<{ data?: { room_info?: { room_id?: number } } } | null>,
+        .catch(() => null) as Promise<{ data?: { room_id?: number } } | null>,
     ]);
     if (entry.stopped) return;
 
@@ -767,7 +768,7 @@ export class DanmakuManager {
         ? `buvid3=${effectiveBuvid3}`
         : '';
 
-    const realRid = Number(roomInfo?.data?.room_info?.room_id || entry.roomId);
+    const realRid = Number(roomInfo?.data?.room_id || entry.roomId);
     const qs = wbiSignQuery({ id: realRid, type: 0 }, wbi.imgKey, wbi.subKey);
     const dmInfo = (await fetchWithTimeout(
       `https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo?${qs}`,

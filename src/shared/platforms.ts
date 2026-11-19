@@ -259,7 +259,8 @@ export function parseLiveInput(
       }
 
       if (host.includes('live.bilibili.com')) {
-        const roomId = segments[0] === 'blanc' ? segments[1] : segments[0];
+        const first = (segments[0] || '').toLowerCase();
+        const roomId = first === 'blanc' || first === 'h5' ? segments[1] : segments[0];
         if (!roomId || !/^\d+$/.test(roomId)) {
           return { ok: false, needsPlatform: false, reason: '未能从B站直播链接提取数字房间号' };
         }

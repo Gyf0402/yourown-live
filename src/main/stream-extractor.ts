@@ -420,6 +420,99 @@ async function extractHuya(req: DirectStreamRequest): Promise<DirectStreamResult
   };
 }
 
+function scoreBilibiliHost(host: string): number {
+  const h = host.toLowerCase();
+  if (h.includes('mcdn') || h.includes('pcdn')) return 4;
+  if (h.includes('gotcha101') || h.includes('ov-gotcha')) return 3;
+  // Commercial gotcha CDNs (Tencent/Aliyun/etc. like gotcha04b/gotcha208/gotcha209) have much lower TTFB than cn-*-fx-*
+  if (h.includes('gotcha')) return 0;
+  return 1;
+}
+
+function labelBilibiliUrl(url: string, idx: number): string {
+  const lower = url.toLowerCase();
+  if (lower.includes('mcdn') || lower.includes('pcdn')) return `备线 ${idx + 1}`;
+  if (lower.includes('gotcha101') || lower.includes('ov-gotcha')) return `备用 ${idx + 1}`;
+  if (lower.includes('gotcha')) return `高速主线 ${idx + 1}`;
+  return `主线 ${idx + 1}`;
+}
+
+async function raceFastestBilibiliUrl(
+  urls: string[],
+  headers: Record<string, string>
+): Promise<{ index: number; finalUrl: string; ms: number } | null> {
+  if (urls.length <= 1) return null;
+  const maxProbe = Math.min(urls.length, 4);
+  const controllers: AbortController[] = [];
+  const startedAt = Date.now();
+  const hardTimeout = setTimeout(() => {
+    for (const c of controllers) {
+      try {
+        c.abort();
+      } catch {
+        // Ignore
+      }
+    }
+  }, 1500);
+
+  const probes = urls.slice(0, maxProbe).map((url, idx) => {
+    const ac = new AbortController();
+    controllers.push(ac);
+    return fetch(url, { headers, redirect: 'follow', signal: ac.signal }).then((resp) => {
+      void resp.body?.cancel().catch(() => {});
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}`);
+      }
+      return { index: idx, finalUrl: resp.url || url, ms: Date.now() - startedAt };
+    });
+  });
+
+  try {
+    const winner = await Promise.any(probes);
+    return winner;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(hardTimeout);
+    for (const c of controllers) {
+      try {
+        c.abort();
+      } catch {
+        // Ignore
+      }
+    }
+  }
+}
+
+const bilibiliAnchorCache = new Map<number, string>();
+
+async function getBilibiliAnchorName(uid: number | undefined): Promise<string | undefined> {
+  if (!uid || !Number.isFinite(uid) || uid <= 0) return undefined;
+  const cached = bilibiliAnchorCache.get(uid);
+  if (cached) return cached;
+  try {
+    const resp = await fetchWithTimeout(
+      `https://api.live.bilibili.com/live_user/v1/Master/info?uid=${uid}`,
+      {
+        headers: {
+          'User-Agent': DESKTOP_UA,
+          Referer: 'https://live.bilibili.com/',
+        },
+      },
+      1200
+    );
+    const json = (await resp.json()) as { data?: { info?: { uname?: string } } };
+    const uname = json?.data?.info?.uname?.trim();
+    if (uname) {
+      bilibiliAnchorCache.set(uid, uname);
+      return uname;
+    }
+  } catch {
+    // Non-fatal
+  }
+  return undefined;
+}
+
 async function extractBilibili(
   req: DirectStreamRequest,
   liveSession: Session
@@ -438,25 +531,32 @@ async function extractBilibili(
 
   const targetQn = req.qualityId || (req.autoHighestQuality !== false ? '10000' : '400');
 
+  // Use room/v1/Room/get_info instead of xlive/web-room/v1/index/getInfoByRoom:
+  // getInfoByRoom frequently returns risk-control -352 for unauthenticated requests.
   const [infoResp, playResp] = await Promise.all([
     fetchWithTimeout(
-      `https://api.live.bilibili.com/xlive/web-room/v1/index/getInfoByRoom?room_id=${encodeURIComponent(req.roomId)}`,
-      { headers: commonHeaders }
+      `https://api.live.bilibili.com/room/v1/Room/get_info?room_id=${encodeURIComponent(req.roomId)}`,
+      { headers: commonHeaders },
+      1600
     )
       .then((r) => r.json())
       .catch(() => null),
     fetchWithTimeout(
       `https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo?room_id=${encodeURIComponent(req.roomId)}&protocol=0,1&format=0,1,2&codec=0,1&qn=${encodeURIComponent(targetQn)}&platform=web&ptype=8&dolby=5&panorama=1`,
-      { headers: commonHeaders }
+      { headers: commonHeaders },
+      5500
     ).then((r) => r.json()),
   ]);
 
   const infoData = (infoResp as {
-    data?: { room_info?: { title?: string; live_status?: number }; anchor_info?: { base_info?: { uname?: string } } };
+    code?: number;
+    data?: { title?: string; live_status?: number; uid?: number; room_id?: number };
   } | null)?.data;
   const playData = (playResp as {
     code?: number;
     data?: {
+      uid?: number;
+      room_id?: number;
       live_status?: number;
       playurl_info?: {
         playurl?: {
@@ -479,11 +579,12 @@ async function extractBilibili(
     };
   })?.data;
 
-  const title = infoData?.room_info?.title;
-  const anchorName = infoData?.anchor_info?.base_info?.uname;
-  const liveStatus = playData?.live_status ?? infoData?.room_info?.live_status;
+  const title = infoData?.title;
+  const uid = playData?.uid ?? infoData?.uid;
+  const liveStatus = playData?.live_status ?? infoData?.live_status;
 
   if (!playData || liveStatus !== 1) {
+    const anchorName = await getBilibiliAnchorName(uid);
     return {
       ok: false,
       platform: 'bilibili',
@@ -518,11 +619,7 @@ async function extractBilibili(
     for (const fmt of st.format || []) {
       for (const cd of fmt.codec || []) {
         const sortedUrls = [...(cd.url_info || [])]
-          .sort((a, b) => {
-            const aMcdn = a.host.includes('mcdn') ? 1 : 0;
-            const bMcdn = b.host.includes('mcdn') ? 1 : 0;
-            return aMcdn - bMcdn;
-          })
+          .sort((a, b) => scoreBilibiliHost(a.host) - scoreBilibiliHost(b.host))
           .map((u) => `${u.host}${cd.base_url}${u.extra}`);
         if (sortedUrls.length === 0) continue;
         const entry: CodecEntry = {
@@ -538,14 +635,20 @@ async function extractBilibili(
     }
   }
 
-  // Prefer AVC (H.264) for maximum Chromium MSE compatibility
-  const pickCodec = (entries: CodecEntry[]) =>
+  // Prefer AVC (H.264) for maximum Chromium MSE compatibility; for HLS prefer fmp4 over ts (ts often lists dead gotcha101)
+  const pickFlvCodec = (entries: CodecEntry[]) =>
     entries.find((e) => e.codecName === 'avc') || entries[0];
-  const flvCodec = pickCodec(flvEntries);
-  const hlsCodec = pickCodec(hlsEntries);
+  const pickHlsCodec = (entries: CodecEntry[]) =>
+    entries.find((e) => e.formatName === 'fmp4' && e.codecName === 'avc') ||
+    entries.find((e) => e.codecName === 'avc') ||
+    entries[0];
+
+  const flvCodec = pickFlvCodec(flvEntries);
+  const hlsCodec = pickHlsCodec(hlsEntries);
   const primary = flvCodec || hlsCodec;
 
   if (!primary) {
+    const anchorName = await getBilibiliAnchorName(uid);
     return {
       ok: false,
       platform: 'bilibili',
@@ -561,12 +664,36 @@ async function extractBilibili(
   }
 
   const maxLines = Math.max(flvCodec?.urls.length || 0, hlsCodec?.urls.length || 0);
-  const lineIdx = Math.min(
+  let lineIdx = Math.min(
     Math.max(0, Number.parseInt(req.lineId || '0', 10) || 0),
     Math.max(0, maxLines - 1)
   );
+  let fastestFlvUrl: string | undefined;
 
-  const flvUrl = flvCodec?.urls[Math.min(lineIdx, flvCodec.urls.length - 1)];
+  // Run anchor-name lookup in parallel with FLV CDN racing so metadata adds 0ms to startup!
+  const shouldRace = !req.lineId && Boolean(flvCodec && flvCodec.urls.length > 1);
+  const [anchorName, raced] = await Promise.all([
+    getBilibiliAnchorName(uid),
+    shouldRace && flvCodec
+      ? raceFastestBilibiliUrl(flvCodec.urls, {
+          'User-Agent': DESKTOP_UA,
+          Referer: referer,
+        })
+      : Promise.resolve(null),
+  ]);
+
+  if (raced) {
+    lineIdx = raced.index;
+    fastestFlvUrl = raced.finalUrl;
+    recordDiagnostic(
+      'info',
+      'stream',
+      `[bilibili#${req.roomId}] 测速择优命中线路 ${lineIdx + 1}（${raced.ms}ms）`
+    );
+  }
+
+  const flvUrl =
+    fastestFlvUrl || flvCodec?.urls[Math.min(lineIdx, flvCodec.urls.length - 1)];
   const hlsUrl = hlsCodec?.urls[Math.min(lineIdx, hlsCodec.urls.length - 1)];
 
   const qualities: StreamOptionItem[] = primary.acceptQn.map((qn) => ({
@@ -577,10 +704,9 @@ async function extractBilibili(
 
   const lines: StreamOptionItem[] = Array.from({ length: maxLines }, (_, i) => {
     const sampleUrl = flvCodec?.urls[i] || hlsCodec?.urls[i] || '';
-    const isMcdn = sampleUrl.includes('mcdn');
     return {
       id: String(i),
-      label: isMcdn ? `备线 ${i + 1}` : `主线 ${i + 1}`,
+      label: labelBilibiliUrl(sampleUrl, i),
       active: i === lineIdx,
     };
   });
@@ -1183,6 +1309,7 @@ async function checkSingleLiveStatus(item: LiveStatusCheckItem): Promise<LiveRoo
         const json = (await resp.json()) as {
           code?: number;
           data?: {
+            uid?: number;
             live_status?: number;
             title?: string;
           };
@@ -1191,8 +1318,10 @@ async function checkSingleLiveStatus(item: LiveStatusCheckItem): Promise<LiveRoo
         if (json?.code !== 0 || !info) return { status: 'unknown', checkedAt };
         const status =
           info.live_status === 1 ? 'live' : info.live_status === 2 ? 'replay' : 'offline';
+        const anchorName = await getBilibiliAnchorName(info.uid);
         return {
           status,
+          anchorName,
           title: info.title,
           checkedAt,
         };
