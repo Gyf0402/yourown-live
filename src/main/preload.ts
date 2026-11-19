@@ -1,0 +1,120 @@
+import { contextBridge, ipcRenderer } from 'electron';
+import type {
+  AuthStatusMap,
+  DanmakuMessage,
+  DanmakuStatusEvent,
+  DiagnosticLogEntry,
+  DirectStreamRequest,
+  LiveHubAPI,
+  LiveStatusCheckItem,
+  PersistedState,
+  PlatformId,
+} from '../shared/types';
+
+const api: LiveHubAPI = {
+  loadState: () => ipcRenderer.invoke('livehub:load-state'),
+  saveState: (state: PersistedState) => ipcRenderer.invoke('livehub:save-state', state),
+  setAlwaysOnTop: (flag: boolean) => ipcRenderer.invoke('livehub:set-always-on-top', flag),
+  toggleBossHide: () => ipcRenderer.invoke('livehub:toggle-boss-hide'),
+  setBossKeyShortcut: (shortcut: string) =>
+    ipcRenderer.invoke('livehub:set-boss-key', shortcut),
+  openPlatformLogin: (platform: PlatformId) =>
+    ipcRenderer.invoke('livehub:open-login', platform),
+  getAuthStatus: () => ipcRenderer.invoke('livehub:get-auth-status'),
+  clearPlatformCookies: (platform?: PlatformId) =>
+    ipcRenderer.invoke('livehub:clear-cookies', platform),
+  getWebviewPreloadPath: () => ipcRenderer.invoke('livehub:get-webview-preload'),
+  wakeWebview: (webContentsId: number, width?: number, height?: number) =>
+    ipcRenderer.invoke('livehub:wake-webview', webContentsId, width, height),
+  resolveLiveInput: (rawInput: string, fallbackPlatform?: PlatformId) =>
+    ipcRenderer.invoke('livehub:resolve-live-input', rawInput, fallbackPlatform),
+  resolveStream: (req: DirectStreamRequest) =>
+    ipcRenderer.invoke('livehub:resolve-stream', req),
+  checkLiveStatuses: (items: LiveStatusCheckItem[]) =>
+    ipcRenderer.invoke('livehub:check-live-statuses', items),
+  startDanmaku: (
+    slotIndex: number,
+    platform: PlatformId,
+    roomId: string,
+    forceReconnect?: boolean
+  ) => ipcRenderer.invoke('livehub:start-danmaku', slotIndex, platform, roomId, forceReconnect),
+  stopDanmaku: (slotIndex: number) => ipcRenderer.invoke('livehub:stop-danmaku', slotIndex),
+  setWindowTheme: (isDark: boolean) => ipcRenderer.invoke('livehub:set-window-theme', isDark),
+  copyScreenshot: (dataUrl: string) => ipcRenderer.invoke('livehub:copy-screenshot', dataUrl),
+  getDiagnostics: () => ipcRenderer.invoke('livehub:get-diagnostics'),
+  clearDiagnostics: () => ipcRenderer.invoke('livehub:clear-diagnostics'),
+  getAppInfo: () => ipcRenderer.invoke('livehub:get-app-info'),
+  onBossKeyTriggered: (callback: (hidden: boolean) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, hidden: boolean) => {
+      callback(hidden);
+    };
+    ipcRenderer.on('livehub:boss-toggled', listener);
+    return () => {
+      ipcRenderer.removeListener('livehub:boss-toggled', listener);
+    };
+  },
+  onAuthStatusChanged: (
+    callback: (payload: { status: AuthStatusMap; changedPlatform?: PlatformId }) => void
+  ) => {
+    const listener = (
+      _event: Electron.IpcRendererEvent,
+      payload: { status: AuthStatusMap; changedPlatform?: PlatformId }
+    ) => {
+      callback(payload);
+    };
+    ipcRenderer.on('livehub:auth-changed', listener);
+    return () => {
+      ipcRenderer.removeListener('livehub:auth-changed', listener);
+    };
+  },
+  onDanmakuBatch: (callback: (batch: DanmakuMessage[]) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, batch: DanmakuMessage[]) => {
+      callback(batch);
+    };
+    ipcRenderer.on('livehub:danmaku-batch', listener);
+    return () => {
+      ipcRenderer.removeListener('livehub:danmaku-batch', listener);
+    };
+  },
+  onDanmakuStatus: (callback: (ev: DanmakuStatusEvent) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, ev: DanmakuStatusEvent) => {
+      callback(ev);
+    };
+    ipcRenderer.on('livehub:danmaku-status', listener);
+    return () => {
+      ipcRenderer.removeListener('livehub:danmaku-status', listener);
+    };
+  },
+  onDiagnosticLog: (callback: (entry: DiagnosticLogEntry) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, entry: DiagnosticLogEntry) => {
+      callback(entry);
+    };
+    ipcRenderer.on('livehub:diagnostic-log', listener);
+    return () => {
+      ipcRenderer.removeListener('livehub:diagnostic-log', listener);
+    };
+  },
+  onTrayAction: (callback: (action: 'toggle-mute' | 'open-settings') => void) => {
+    const listener = (
+      _event: Electron.IpcRendererEvent,
+      action: 'toggle-mute' | 'open-settings'
+    ) => {
+      callback(action);
+    };
+    ipcRenderer.on('livehub:tray-action', listener);
+    return () => {
+      ipcRenderer.removeListener('livehub:tray-action', listener);
+    };
+  },
+  onBeforeWindowClose: (callback: () => void) => {
+    const listener = () => {
+      callback();
+    };
+    ipcRenderer.on('livehub:before-close', listener);
+    return () => {
+      ipcRenderer.removeListener('livehub:before-close', listener);
+    };
+  },
+};
+
+contextBridge.exposeInMainWorld('livehub', api);
