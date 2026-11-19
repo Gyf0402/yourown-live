@@ -12,6 +12,7 @@ interface CanvasBullet {
 }
 
 interface DanmakuOverlayProps {
+  streamKey?: string;
   incomingBatch: DanmakuMessage[];
   enabled: boolean;
   paused: boolean;
@@ -53,6 +54,7 @@ function compileMatchers(keywords: string[]): Array<(text: string) => boolean> {
 }
 
 export const DanmakuOverlay = memo(function DanmakuOverlay({
+  streamKey = '',
   incomingBatch,
   enabled,
   paused,
@@ -91,19 +93,17 @@ export const DanmakuOverlay = memo(function DanmakuOverlay({
     return Math.max(11, Math.round(baseFont * scale));
   };
 
-  // Clear state when disabled or switching mode
+  // Clear stale bullets & mini-chat when disabled or switching to a different room/stream
   useEffect(() => {
-    if (!enabled) {
-      bulletsRef.current = [];
-      seenIdsRef.current.clear();
-      setChatMessages([]);
-      const canvas = canvasRef.current;
-      if (canvas) {
-        const ctx = canvas.getContext('2d');
-        ctx?.clearRect(0, 0, canvas.width, canvas.height);
-      }
+    bulletsRef.current = [];
+    seenIdsRef.current.clear();
+    setChatMessages([]);
+    const canvas = canvasRef.current;
+    if (canvas) {
+      const ctx = canvas.getContext('2d');
+      ctx?.clearRect(0, 0, canvas.width, canvas.height);
     }
-  }, [enabled]);
+  }, [enabled, streamKey]);
 
   // ResizeObserver for high-DPI canvas sizing
   useEffect(() => {

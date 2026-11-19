@@ -711,15 +711,28 @@ export class DanmakuManager {
         if (len < 8 || off + 4 + len > buf.length) break;
         const txt = buf.subarray(off + 12, off + 4 + len - 1).toString('utf-8');
         off += 4 + len;
-        if (txt.includes('type@=chatmsg/')) {
+        if (txt.includes('type@=chatmsg/') || txt.includes('type@=comm_chatmsg/')) {
+          const isSc = txt.includes('type@=comm_chatmsg/');
           const nick = (txt.match(/\/nn@=([^/]*)/)?.[1] || '')
             .replace(/@S/g, '/')
             .replace(/@A/g, '@');
-          const content = (txt.match(/\/txt@=([^/]*)/)?.[1] || '')
+          const content = (
+            txt.match(/\/txt@=([^/]*)/)?.[1] ||
+            txt.match(/\/content@=([^/]*)/)?.[1] ||
+            ''
+          )
             .replace(/@S/g, '/')
             .replace(/@A/g, '@');
           const colCode = txt.match(/\/col@=([^/]*)/)?.[1] || '';
-          this.enqueue(entry.slotIndex, 'douyu', nick, content, DOUYU_COLORS[colCode]);
+          if (content) {
+            this.enqueue(
+              entry.slotIndex,
+              'douyu',
+              nick,
+              isSc ? `[SC] ${content}` : content,
+              isSc ? '#fbbf24' : DOUYU_COLORS[colCode]
+            );
+          }
         }
       }
     });
@@ -736,14 +749,22 @@ export class DanmakuManager {
     if (this.getSession) {
       try {
         const cookies = await this.getSession().cookies.get({ domain: 'bilibili.com' });
-        const allow = new Set(['SESSDATA', 'bili_jct', 'DedeUserID', 'buvid3', 'buvid4', 'b_nut']);
-        const picked = cookies.filter((c) => allow.has(c.name) && c.value);
-        if (picked.length > 0) {
-          authCookieHeader = picked.map((c) => `${c.name}=${c.value}`).join('; ');
+        const allow = new Set(['SESSDATA', 'bili_jct', 'DedeUserID', 'buvid3', 'buvid4', 'b_nut', 'LIVE_BUVID']);
+        const dedup = new Map<string, string>();
+        for (const c of cookies) {
+          if (!allow.has(c.name) || !c.value) continue;
+          if (!dedup.has(c.name) || (c.domain || '').startsWith('.')) {
+            dedup.set(c.name, c.value);
+          }
         }
-        const uidVal = cookies.find((c) => c.name === 'DedeUserID')?.value;
+        if (dedup.size > 0) {
+          authCookieHeader = Array.from(dedup.entries())
+            .map(([k, v]) => `${k}=${v}`)
+            .join('; ');
+        }
+        const uidVal = dedup.get('DedeUserID');
         if (uidVal && /^\d+$/.test(uidVal)) authUid = Number(uidVal);
-        authBuvid3 = cookies.find((c) => c.name === 'buvid3')?.value || '';
+        authBuvid3 = dedup.get('buvid3') || '';
       } catch {
         // Fallback to anonymous WBI
       }
@@ -837,8 +858,14 @@ export class DanmakuManager {
               const j = JSON.parse(body.toString('utf-8')) as {
                 cmd?: string;
                 info?: unknown[];
+                data?: {
+                  message?: string;
+                  price?: number;
+                  user_info?: { uname?: string };
+                };
               };
-              if (String(j.cmd || '').startsWith('DANMU_MSG') && Array.isArray(j.info)) {
+              const cmd = String(j.cmd || '');
+              if (cmd.startsWith('DANMU_MSG') && Array.isArray(j.info)) {
                 const text = String(j.info[1] || '');
                 const userArr = Array.isArray(j.info[2]) ? j.info[2] : [];
                 const metaArr = Array.isArray(j.info[0]) ? j.info[0] : [];
@@ -849,6 +876,16 @@ export class DanmakuManager {
                     ? `#${decColor.toString(16).padStart(6, '0')}`
                     : undefined;
                 this.enqueue(entry.slotIndex, 'bilibili', nick, text, hexColor);
+              } else if (cmd.startsWith('SUPER_CHAT_MESSAGE') && j.data?.message) {
+                const nick = String(j.data.user_info?.uname || '');
+                const priceTag = j.data.price ? `¥${j.data.price} ` : '';
+                this.enqueue(
+                  entry.slotIndex,
+                  'bilibili',
+                  nick,
+                  `[SC ${priceTag}] ${j.data.message}`,
+                  '#fbbf24'
+                );
               }
             } catch {
               // Ignore non-JSON frames

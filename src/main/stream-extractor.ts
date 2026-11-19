@@ -219,7 +219,13 @@ function buildHuyaAntiCode(
 
   let wsSecret = params.get('wsSecret') || '';
   if (fmRaw) {
-    const fm = Buffer.from(decodeURIComponent(fmRaw), 'base64').toString('utf-8');
+    let fmDecoded = fmRaw;
+    try {
+      fmDecoded = decodeURIComponent(fmRaw);
+    } catch {
+      fmDecoded = fmRaw;
+    }
+    const fm = Buffer.from(fmDecoded, 'base64').toString('utf-8');
     const prefix = fm.split('_')[0];
     const ss = md5(`${seqid}|${ctype}|${t}`);
     wsSecret = md5(`${prefix}_${uid}_${streamName}_${ss}_${wsTime}`);
@@ -321,7 +327,9 @@ async function extractHuya(req: DirectStreamRequest): Promise<DirectStreamResult
     };
   }
 
-  const cdnList = data.stream?.baseSteamInfoList || [];
+  const cdnList = (data.stream?.baseSteamInfoList || []).filter(
+    (c) => Boolean(c.sFlvUrl || c.sHlsUrl)
+  );
   if (cdnList.length === 0) {
     return {
       ok: false,
@@ -1072,9 +1080,17 @@ async function extractDouyu(
 ): Promise<DirectStreamResult> {
   const douyuCookies = await liveSession.cookies.get({ domain: 'douyu.com' }).catch(() => []);
   const allowSet = new Set(['acf_auth', 'acf_uid', 'acf_username', 'dy_did']);
-  const filteredCookies = douyuCookies.filter((c) => allowSet.has(c.name));
-  const cookie = filteredCookies.map((c) => `${c.name}=${c.value}`).join('; ');
-  const cookieDid = douyuCookies.find((c) => c.name === 'dy_did' && c.value)?.value;
+  const dedupDouyu = new Map<string, string>();
+  for (const c of douyuCookies) {
+    if (!allowSet.has(c.name) || !c.value) continue;
+    if (!dedupDouyu.has(c.name) || (c.domain || '').startsWith('.')) {
+      dedupDouyu.set(c.name, c.value);
+    }
+  }
+  const cookie = Array.from(dedupDouyu.entries())
+    .map(([k, v]) => `${k}=${v}`)
+    .join('; ');
+  const cookieDid = dedupDouyu.get('dy_did');
 
   const resolved = await resolveDouyuRealRid(req.roomId);
   const rid = resolved.rid;
@@ -1177,6 +1193,9 @@ async function extractDouyu(
     label: m.name,
     active: m.rate === d.rate,
   }));
+  if (qualities.length > 0 && !qualities.some((q) => q.active)) {
+    qualities[0].active = true;
+  }
 
   const lines: StreamOptionItem[] = (d.cdnsWithName || []).map((c) => ({
     id: c.cdn,
@@ -1206,36 +1225,7 @@ async function extractDouyin(req: DirectStreamRequest): Promise<DirectStreamResu
     '&screen_width=1920&screen_height=1080&browser_language=zh-CN&browser_platform=Win32' +
     `&browser_name=Edge&browser_version=136.0.0.0&web_rid=${encodeURIComponent(req.roomId)}`;
 
-  const fetchEnterText = async (forceRefresh: boolean) => {
-    const cookieHeader = await getDouyinCookieHeader(forceRefresh);
-    const resp = await fetchWithTimeout(apiUrl, {
-      headers: {
-        'User-Agent': DESKTOP_UA,
-        Referer: referer,
-        Cookie: cookieHeader,
-      },
-    });
-    return resp.text();
-  };
-
-  let text = await fetchEnterText(false);
-  if (!text) {
-    text = await fetchEnterText(true);
-  }
-  if (!text) {
-    return {
-      ok: false,
-      platform: 'douyin',
-      roomId: req.roomId,
-      status: 'error',
-      referer,
-      qualities: [],
-      lines: [],
-      error: '抖音接口返回空响应，可重试或切网页模式',
-    };
-  }
-
-  const json = JSON.parse(text) as {
+  type DouyinEnterResponse = {
     status_code?: number;
     data?: {
       user?: { nickname?: string };
@@ -1254,6 +1244,42 @@ async function extractDouyin(req: DirectStreamRequest): Promise<DirectStreamResu
       }>;
     };
   };
+
+  const fetchEnterJson = async (forceRefresh: boolean): Promise<DouyinEnterResponse | null> => {
+    const cookieHeader = await getDouyinCookieHeader(forceRefresh);
+    const resp = await fetchWithTimeout(apiUrl, {
+      headers: {
+        'User-Agent': DESKTOP_UA,
+        Referer: referer,
+        Cookie: cookieHeader,
+      },
+    });
+    const raw = (await resp.text()).trim();
+    if (!raw || !raw.startsWith('{')) return null;
+    try {
+      const parsed = JSON.parse(raw) as DouyinEnterResponse;
+      return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch {
+      return null;
+    }
+  };
+
+  let json = await fetchEnterJson(false);
+  if (!json?.data) {
+    json = await fetchEnterJson(true);
+  }
+  if (!json?.data) {
+    return {
+      ok: false,
+      platform: 'douyin',
+      roomId: req.roomId,
+      status: 'error',
+      referer,
+      qualities: [],
+      lines: [],
+      error: '抖音接口返回空或触发风控，可重试或切网页模式',
+    };
+  }
 
   const room = json?.data?.data?.[0];
   const title = room?.title;

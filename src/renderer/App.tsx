@@ -406,6 +406,13 @@ export function App() {
 
   const handleRemoveChannel = useCallback((id: string) => {
     setChannels((prev) => prev.filter((c) => c.id !== id));
+    setSettings((prev) => {
+      if (!prev.panes.some((p) => p.channelId === id)) return prev;
+      return {
+        ...prev,
+        panes: prev.panes.map((p) => (p.channelId === id ? { ...p, channelId: null } : p)),
+      };
+    });
   }, []);
 
   const handleTogglePin = useCallback((id: string) => {
@@ -501,9 +508,22 @@ export function App() {
 
   const handleToggleMute = useCallback((slotIndex: number) => {
     setSettings((prev) => {
+      // If globally muted, clicking unmute on a specific pane unmutes ONLY that pane cleanly
+      if (prev.globalMuted) {
+        return {
+          ...prev,
+          globalMuted: false,
+          soloSlotIndex: null,
+          panes: prev.panes.map((p) => ({
+            ...p,
+            muted: p.slotIndex === slotIndex ? false : true,
+          })),
+        };
+      }
       if (prev.soloSlotIndex !== null && prev.soloSlotIndex !== slotIndex) {
         return {
           ...prev,
+          globalMuted: false,
           soloSlotIndex: null,
           panes: prev.panes.map((p) =>
             p.slotIndex === slotIndex ? { ...p, muted: false } : p

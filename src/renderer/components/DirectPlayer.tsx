@@ -26,6 +26,7 @@ import { DanmakuOverlay } from './DanmakuOverlay';
 import { DanmakuSettingsPopover } from './DanmakuSettingsPopover';
 
 interface DirectPlayerProps {
+  streamKey?: string;
   flvUrl?: string;
   hlsUrl?: string;
   muted: boolean;
@@ -60,6 +61,7 @@ interface DirectPlayerProps {
 }
 
 export function DirectPlayer({
+  streamKey = '',
   flvUrl,
   hlsUrl,
   muted,
@@ -578,13 +580,20 @@ export function DirectPlayer({
       }`}
       tabIndex={0}
       onWheel={(e) => {
+        const target = e.target as HTMLElement | null;
+        if (target?.closest('.dm-popover, .danmaku-chat-panel')) return;
         if (Math.abs(e.deltaY) < 4) return;
         e.preventDefault();
         applyVolumeDelta(e.deltaY < 0 ? 0.05 : -0.05);
       }}
       onKeyDown={(e) => {
+        const target = e.target as HTMLElement | null;
+        const tag = target?.tagName?.toLowerCase();
         if (e.key === 'Escape' && dmPanelOpen) {
           setDmPanelOpen(false);
+          return;
+        }
+        if (tag === 'input' || tag === 'textarea' || tag === 'select' || target?.isContentEditable) {
           return;
         }
         if (e.code === 'Space') {
@@ -630,6 +639,7 @@ export function DirectPlayer({
       />
 
       <DanmakuOverlay
+        streamKey={streamKey}
         incomingBatch={danmakuBatch}
         enabled={danmakuEnabled}
         paused={isPaused}

@@ -568,8 +568,29 @@ export const LivePane = memo(function LivePane({
     setQuickError(syncRes.reason);
   };
 
-  const handleQuickPickPlatform = (platform: PlatformId) => {
-    if (!quickPendingRoomId) return;
+  const handleQuickPickPlatform = async (platform: PlatformId) => {
+    if (!quickPendingRoomId || quickResolving) return;
+    if (platform === 'douyu' && typeof window.livehub?.resolveLiveInput === 'function') {
+      setQuickResolving(true);
+      setQuickError('正在解析斗鱼真实房间号...');
+      try {
+        const resolved = await window.livehub.resolveLiveInput(quickPendingRoomId, 'douyu');
+        if (resolved.ok && resolved.platform && resolved.roomId && resolved.url) {
+          setQuickError(null);
+          setQuickPendingRoomId(null);
+          setQuickInput('');
+          onLoadUrlInPane(
+            pane.slotIndex,
+            resolved.url,
+            resolved.suggestedName || `${PLATFORMS[resolved.platform].shortName} ${resolved.roomId}`,
+            null
+          );
+          return;
+        }
+      } finally {
+        setQuickResolving(false);
+      }
+    }
     const res = parseLiveInput(quickPendingRoomId, platform);
     if (res.ok) {
       setQuickError(null);
@@ -955,6 +976,7 @@ export const LivePane = memo(function LivePane({
         <div className="direct-stage">
           {directStream?.ok && !directPlayError ? (
             <DirectPlayer
+              streamKey={parsedTarget ? `${parsedTarget.platform}:${parsedTarget.roomId}` : pane.url || ''}
               flvUrl={directStream.flvUrl}
               hlsUrl={directStream.hlsUrl}
               muted={effectiveMuted}
