@@ -154,6 +154,7 @@ export const LivePane = memo(function LivePane({
   const [danmakuBatch, setDanmakuBatch] = useState<DanmakuMessage[]>([]);
   const [danmakuStatus, setDanmakuStatus] = useState<DanmakuStatusEvent | null>(null);
   const autoRetryCountRef = useRef(0);
+  const recentFailTimestampsRef = useRef<number[]>([]);
   const triedLinesRef = useRef<Set<string>>(new Set());
   const stableLineIdRef = useRef<string | null>(null);
   const playingSinceRef = useRef<number | null>(null);
@@ -217,6 +218,7 @@ export const LivePane = memo(function LivePane({
     setDanmakuBatch([]);
     setDanmakuStatus(null);
     autoRetryCountRef.current = 0;
+    recentFailTimestampsRef.current = [];
     triedLinesRef.current = new Set();
     stableLineIdRef.current = null;
     playingSinceRef.current = null;
@@ -247,6 +249,7 @@ export const LivePane = memo(function LivePane({
         retryTimerRef.current = null;
       }
       autoRetryCountRef.current = 0;
+      recentFailTimestampsRef.current = [];
       triedLinesRef.current = new Set();
       stableLineIdRef.current = null;
       playingSinceRef.current = null;
@@ -317,6 +320,27 @@ export const LivePane = memo(function LivePane({
     pane.slotIndex,
   ]);
 
+  // Background couch auto-recovery: if all initial retries failed due to a temporary network/Wi-Fi drop
+  // (while the room is NOT offline), gently re-attempt every 12s so playback recovers hands-free
+  useEffect(() => {
+    const isErrorState =
+      useDirectStream &&
+      !isLoading &&
+      Boolean(pane.url) &&
+      (Boolean(directPlayError) || (directStream !== null && !directStream.ok)) &&
+      directStream?.status !== 'offline';
+    if (!isErrorState) return;
+
+    const timer = window.setTimeout(() => {
+      autoRetryCountRef.current = 0;
+      setDirectPlayError(null);
+      if (!trySwitchFallbackLine('正在尝试备用线路自动恢复')) {
+        setDirectReloadTick((n) => n + 1);
+      }
+    }, 12000);
+    return () => window.clearTimeout(timer);
+  }, [useDirectStream, isLoading, pane.url, directPlayError, directStream]);
+
   // Direct low-latency FLV/HLS stream extraction when in Pure (Direct) mode
   useEffect(() => {
     if (!useDirectStream || !parsedTarget) return;
@@ -378,11 +402,37 @@ export const LivePane = memo(function LivePane({
             );
           }
           if (!res.ok) {
+            if (res.status !== 'offline' && autoRetryCountRef.current < 3) {
+              autoRetryCountRef.current += 1;
+              const delayMs = autoRetryCountRef.current * 1200;
+              showTempHint(`拉流重试中 (${autoRetryCountRef.current}/3)...`);
+              if (retryTimerRef.current !== null) {
+                window.clearTimeout(retryTimerRef.current);
+              }
+              retryTimerRef.current = window.setTimeout(() => {
+                retryTimerRef.current = null;
+                setDirectReloadTick((n) => n + 1);
+              }, delayMs);
+              return;
+            }
             setIsLoading(false);
           }
         })
         .catch((err) => {
           if (cancelled) return;
+          if (autoRetryCountRef.current < 3) {
+            autoRetryCountRef.current += 1;
+            const delayMs = autoRetryCountRef.current * 1200;
+            showTempHint(`网络波动，正在重试拉流 (${autoRetryCountRef.current}/3)...`);
+            if (retryTimerRef.current !== null) {
+              window.clearTimeout(retryTimerRef.current);
+            }
+            retryTimerRef.current = window.setTimeout(() => {
+              retryTimerRef.current = null;
+              setDirectReloadTick((n) => n + 1);
+            }, delayMs);
+            return;
+          }
           setDirectStream({
             ok: false,
             platform: parsedTarget.platform,
@@ -670,6 +720,7 @@ export const LivePane = memo(function LivePane({
         retryTimerRef.current = null;
       }
       autoRetryCountRef.current = 0;
+      recentFailTimestampsRef.current = [];
       triedLinesRef.current = new Set();
       stableLineIdRef.current = null;
       playingSinceRef.current = null;
@@ -688,18 +739,46 @@ export const LivePane = memo(function LivePane({
     }
   };
 
-  const trySwitchFallbackLine = (): boolean => {
+  const trySwitchFallbackLine = (customReason?: string): boolean => {
     const lines = streamOptions.lines;
     if (!lines || lines.length <= 1) return false;
-    const currentId = lines.find((l) => l.active)?.id || directLineId || stableLineIdRef.current || undefined;
+    const currentId =
+      lines.find((l) => l.active)?.id || directLineId || stableLineIdRef.current || lines[0]?.id;
+    const currentIdx = Math.max(
+      0,
+      lines.findIndex((l) => l.id === currentId)
+    );
     if (currentId) triedLinesRef.current.add(currentId);
-    const nextLine = lines.find((l) => !triedLinesRef.current.has(l.id));
-    if (!nextLine) return false;
+
+    // Search circularly from currentIdx + 1 for the next untried line
+    let nextLine = null;
+    for (let offset = 1; offset < lines.length; offset++) {
+      const candidate = lines[(currentIdx + offset) % lines.length];
+      if (candidate && !triedLinesRef.current.has(candidate.id)) {
+        nextLine = candidate;
+        break;
+      }
+    }
+
+    // If all lines were already tried in this session, wrap around circularly to the next line
+    // so line failover never gets permanently stuck on long watching sessions
+    if (!nextLine) {
+      triedLinesRef.current = new Set(currentId ? [currentId] : []);
+      nextLine = lines[(currentIdx + 1) % lines.length] || null;
+    }
+    if (!nextLine || nextLine.id === currentId) return false;
+
     triedLinesRef.current.add(nextLine.id);
     stableLineIdRef.current = null;
     playingSinceRef.current = null;
-    onUpdatePanePrefs(pane.slotIndex, { preferredLineId: nextLine.id });
-    showTempHint(`线路波动，自动切换至 ${nextLine.label}...`);
+    recentFailTimestampsRef.current = [];
+    silentReconnectRef.current = true;
+    showTempHint(`${customReason || '当前线路不稳定'}，已自动切换至「${nextLine.label}」...`, 3200);
+    if (directLineId === nextLine.id) {
+      setDirectReloadTick((n) => n + 1);
+    } else {
+      onUpdatePanePrefs(pane.slotIndex, { preferredLineId: nextLine.id });
+    }
     return true;
   };
 
@@ -1115,18 +1194,45 @@ export const LivePane = memo(function LivePane({
               onAutoReconnect={(reason) => {
                 if (retryTimerRef.current !== null) return;
                 playingSinceRef.current = null;
-                if (autoRetryCountRef.current >= 2 && trySwitchFallbackLine()) {
+                const now = Date.now();
+                // Routine long-playback FLV EOF on a stable line does NOT count as a line failure unless it happens repeatedly
+                const isHardDisconnect =
+                  reason === 'early-eof' || reason === 'startup-timeout' || reason === 'stall-watchdog';
+                recentFailTimestampsRef.current = [
+                  ...recentFailTimestampsRef.current.filter((ts) => now - ts < 45000),
+                  now,
+                ];
+                const recentDisconnectCount = recentFailTimestampsRef.current.length;
+
+                // Immediately switch to fallback CDN line if:
+                // 1) Current line failed during startup or closed within <6s ('early-eof' / 'startup-timeout'), OR
+                // 2) Current line disconnected/stalled >= 2 times within 45s (even if it briefly played a few frames in between), OR
+                // 3) Consecutive autoRetryCount >= 2
+                if (
+                  (reason === 'early-eof' ||
+                    reason === 'startup-timeout' ||
+                    (isHardDisconnect && recentDisconnectCount >= 2) ||
+                    recentDisconnectCount >= 3 ||
+                    autoRetryCountRef.current >= 2) &&
+                  trySwitchFallbackLine(
+                    reason === 'startup-timeout'
+                      ? '当前线路响应超时'
+                      : reason === 'early-eof'
+                        ? '当前线路连接中断'
+                        : '当前线路频繁波动'
+                  )
+                ) {
                   autoRetryCountRef.current = 0;
                   setDirectPlayError(null);
                   return;
                 }
                 if (autoRetryCountRef.current >= 4) {
-                  setDirectPlayError('直播流长时间无响应，请点击重试或切换线路');
+                  setDirectPlayError('直播流长时间无响应，正在后台等待自动恢复（也可点击立即重试）');
                   setIsLoading(false);
                   return;
                 }
                 autoRetryCountRef.current += 1;
-                const delayMs = reason === 'flv-eof' ? 250 : Math.min(5000, autoRetryCountRef.current * 900);
+                const delayMs = reason === 'flv-eof' ? 250 : Math.min(4500, autoRetryCountRef.current * 900);
                 showTempHint(reason === 'flv-eof' ? '连接自动续播中...' : '流连接刷新中，自动续播...');
                 retryTimerRef.current = window.setTimeout(() => {
                   retryTimerRef.current = null;
@@ -1137,13 +1243,14 @@ export const LivePane = memo(function LivePane({
               }}
               onPlaying={() => {
                 setIsLoading(false);
-                autoRetryCountRef.current = 0;
                 const now = Date.now();
                 if (playingSinceRef.current === null) {
                   playingSinceRef.current = now;
-                } else if (now - playingSinceRef.current >= 15000) {
-                  // Stream has been continuously stable for >= 15s: lock onto this line on routine EOF reconnects
-                  // instead of re-racing or switching CDN lines
+                } else if (now - playingSinceRef.current >= 12000) {
+                  // Only reset retry & failure counters after >= 12s of genuinely continuous playback!
+                  // Never reset on the very first frame, otherwise a flaky line that plays 2s and drops will loop forever.
+                  autoRetryCountRef.current = 0;
+                  recentFailTimestampsRef.current = [];
                   const currentActiveLine =
                     streamOptions.lines.find((l) => l.active)?.id || directLineId || null;
                   if (currentActiveLine) {
@@ -1155,7 +1262,15 @@ export const LivePane = memo(function LivePane({
               onStats={setDirectStats}
               onError={(reason) => {
                 playingSinceRef.current = null;
-                if (autoRetryCountRef.current >= 1 && trySwitchFallbackLine()) {
+                const now = Date.now();
+                recentFailTimestampsRef.current = [
+                  ...recentFailTimestampsRef.current.filter((ts) => now - ts < 45000),
+                  now,
+                ];
+                if (
+                  (autoRetryCountRef.current >= 1 || recentFailTimestampsRef.current.length >= 2) &&
+                  trySwitchFallbackLine('当前线路拉流异常')
+                ) {
                   autoRetryCountRef.current = 0;
                   setDirectPlayError(null);
                   return;

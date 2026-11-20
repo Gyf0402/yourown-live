@@ -342,6 +342,7 @@ export function DirectPlayer({
     let autoResumeTimer: number | null = null;
     let lastObservedTime = -1;
     let stalledTicks = 0;
+    let startupTicks = 0;
     let healthyTicks = 0;
 
     video.muted = mutedRef.current;
@@ -426,7 +427,7 @@ export function DirectPlayer({
     };
     const handleEnded = () => {
       if (!disposed && !userPausedRef.current) {
-        triggerSeamlessReconnect('video-ended');
+        triggerSeamlessReconnect(healthyTicks < 4 ? 'early-eof' : 'video-ended');
       }
     };
     const handleVisibility = () => {
@@ -487,9 +488,10 @@ export function DirectPlayer({
 
         // Critical for long playback: CDNs periodically close chunked HTTP-FLV connections (EOF)
         // which fires LOADING_COMPLETE rather than ERROR — reconnect seamlessly with a fresh URL!
+        // If EOF fires before ~6s of healthy playback, mark as 'early-eof' so LivePane switches CDN line immediately.
         flvPlayer.on(mpegts.Events.LOADING_COMPLETE, () => {
           if (!disposed && !userPausedRef.current) {
-            triggerSeamlessReconnect('flv-eof');
+            triggerSeamlessReconnect(healthyTicks < 4 ? 'early-eof' : 'flv-eof');
           }
         });
 
@@ -599,6 +601,7 @@ export function DirectPlayer({
         }
 
         if (v.readyState >= 2 && v.videoWidth > 0) {
+          startupTicks = 0;
           if (lastObservedTime >= 0 && Math.abs(v.currentTime - lastObservedTime) < 0.05) {
             stalledTicks += 1;
             healthyTicks = 0;
@@ -609,8 +612,8 @@ export function DirectPlayer({
             // on a normal single-range network pause, NEVER seek (seeking triggers mpegts flush!) — just wait for packets.
             if (stalledTicks === 4 && hasBuffer && v.buffered.length > 1) {
               jumpToLiveEdgeAndPlay(v);
-            } else if (stalledTicks >= 12) {
-              // Hard stall (~18s completely frozen): TCP socket stalled or signed URL expired -> reconnect cleanly
+            } else if (stalledTicks >= 10) {
+              // Hard stall (~15s completely frozen): TCP socket stalled or signed URL expired -> reconnect cleanly
               triggerSeamlessReconnect('stall-watchdog');
               return;
             }
@@ -623,9 +626,22 @@ export function DirectPlayer({
             }
           }
           lastObservedTime = v.currentTime;
+        } else {
+          // Stream has not decoded its first frame yet: guard against blackhole CDN nodes that accept TCP but send 0 frames
+          startupTicks += 1;
+          if (startupTicks >= 5) {
+            startupTicks = 0;
+            if (shouldUseFlv && hlsUrl && !useHlsFallback) {
+              setUseHlsFallback(true);
+              return;
+            }
+            triggerSeamlessReconnect('startup-timeout');
+            return;
+          }
         }
       } else {
         stalledTicks = 0;
+        startupTicks = 0;
         if (userPausedRef.current && v.playbackRate !== 1) {
           v.playbackRate = 1;
         }
