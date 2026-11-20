@@ -153,6 +153,8 @@ export const LivePane = memo(function LivePane({
   const [danmakuStatus, setDanmakuStatus] = useState<DanmakuStatusEvent | null>(null);
   const autoRetryCountRef = useRef(0);
   const triedLinesRef = useRef<Set<string>>(new Set());
+  const stableLineIdRef = useRef<string | null>(null);
+  const playingSinceRef = useRef<number | null>(null);
   const retryTimerRef = useRef<number | null>(null);
   const pendingQualityRef = useRef<{ id: string; label: string } | null>(null);
   const onUpdateTitleRef = useRef(onUpdateTitle);
@@ -214,6 +216,8 @@ export const LivePane = memo(function LivePane({
     setDanmakuStatus(null);
     autoRetryCountRef.current = 0;
     triedLinesRef.current = new Set();
+    stableLineIdRef.current = null;
+    playingSinceRef.current = null;
     pendingQualityRef.current = null;
     if (retryTimerRef.current !== null) {
       window.clearTimeout(retryTimerRef.current);
@@ -237,6 +241,8 @@ export const LivePane = memo(function LivePane({
     if (useDirectStream) {
       autoRetryCountRef.current = 0;
       triedLinesRef.current = new Set();
+      stableLineIdRef.current = null;
+      playingSinceRef.current = null;
       setDirectPlayError(null);
       setDirectReloadTick((n) => n + 1);
     } else if (webviewRef.current) {
@@ -310,12 +316,14 @@ export const LivePane = memo(function LivePane({
     setIsLoading(true);
     setDirectPlayError(null);
 
+    const effectiveLineId = directLineId || stableLineIdRef.current || undefined;
+
     void window.livehub
       .resolveStream({
         platform: parsedTarget.platform,
         roomId: parsedTarget.roomId,
         qualityId: directQualityId,
-        lineId: directLineId,
+        lineId: effectiveLineId,
         autoHighestQuality,
       })
       .then((res) => {
@@ -643,6 +651,8 @@ export const LivePane = memo(function LivePane({
     if (useDirectStream) {
       autoRetryCountRef.current = 0;
       triedLinesRef.current = new Set();
+      stableLineIdRef.current = null;
+      playingSinceRef.current = null;
       setDirectPlayError(null);
       setDirectReloadTick((n) => n + 1);
       return;
@@ -660,11 +670,13 @@ export const LivePane = memo(function LivePane({
   const trySwitchFallbackLine = (): boolean => {
     const lines = streamOptions.lines;
     if (!lines || lines.length <= 1) return false;
-    const currentId = lines.find((l) => l.active)?.id || directLineId;
+    const currentId = lines.find((l) => l.active)?.id || directLineId || stableLineIdRef.current || undefined;
     if (currentId) triedLinesRef.current.add(currentId);
     const nextLine = lines.find((l) => !triedLinesRef.current.has(l.id));
     if (!nextLine) return false;
     triedLinesRef.current.add(nextLine.id);
+    stableLineIdRef.current = null;
+    playingSinceRef.current = null;
     onUpdatePanePrefs(pane.slotIndex, { preferredLineId: nextLine.id });
     showTempHint(`线路波动，自动切换至 ${nextLine.label}...`);
     return true;
@@ -709,6 +721,8 @@ export const LivePane = memo(function LivePane({
     }
     if (useDirectStream) {
       triedLinesRef.current = new Set();
+      stableLineIdRef.current = null;
+      playingSinceRef.current = null;
       pendingQualityRef.current = chosen
         ? { id: chosen.id, label: chosen.label }
         : { id: labelOrId, label: labelOrId };
@@ -738,6 +752,8 @@ export const LivePane = memo(function LivePane({
   const handleSelectLine = (labelOrId: string) => {
     if (useDirectStream) {
       triedLinesRef.current = new Set([labelOrId]);
+      stableLineIdRef.current = labelOrId;
+      playingSinceRef.current = null;
       onUpdatePanePrefs(pane.slotIndex, { preferredLineId: labelOrId });
       setStreamOptions((prev) => ({
         ...prev,
@@ -1065,6 +1081,7 @@ export const LivePane = memo(function LivePane({
               onToggleFullscreen={() => onToggleFullscreen(pane.slotIndex)}
               onAutoReconnect={() => {
                 if (retryTimerRef.current !== null) return;
+                playingSinceRef.current = null;
                 if (autoRetryCountRef.current >= 2 && trySwitchFallbackLine()) {
                   autoRetryCountRef.current = 0;
                   setDirectPlayError(null);
@@ -1087,9 +1104,23 @@ export const LivePane = memo(function LivePane({
               onPlaying={() => {
                 setIsLoading(false);
                 autoRetryCountRef.current = 0;
+                const now = Date.now();
+                if (playingSinceRef.current === null) {
+                  playingSinceRef.current = now;
+                } else if (now - playingSinceRef.current >= 15000) {
+                  // Stream has been continuously stable for >= 15s: lock onto this line on routine EOF reconnects
+                  // instead of re-racing or switching CDN lines
+                  const currentActiveLine =
+                    streamOptions.lines.find((l) => l.active)?.id || directLineId || null;
+                  if (currentActiveLine) {
+                    stableLineIdRef.current = currentActiveLine;
+                  }
+                  triedLinesRef.current = new Set();
+                }
               }}
               onStats={setDirectStats}
               onError={(reason) => {
+                playingSinceRef.current = null;
                 if (autoRetryCountRef.current >= 1 && trySwitchFallbackLine()) {
                   autoRetryCountRef.current = 0;
                   setDirectPlayError(null);

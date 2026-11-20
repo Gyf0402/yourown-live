@@ -277,19 +277,22 @@ export function DirectPlayer({
       if (video.buffered && video.buffered.length > 0) {
         try {
           const end = video.buffered.end(video.buffered.length - 1);
-          if (Number.isFinite(end) && end - video.currentTime > 1.2) {
-            video.currentTime = Math.max(0, end - 0.55);
+          const start = video.buffered.start(0);
+          if (Number.isFinite(end) && end - video.currentTime > 2.0) {
+            video.currentTime = Math.max(start, end - 1.1);
           }
         } catch {
           // Ignore seek errors
         }
       }
+      video.playbackRate = 1;
       video.muted = mutedRef.current;
       video.volume = volumeRef.current;
       void video.play().catch(() => {});
       setIsPaused(false);
     } else {
       userPausedRef.current = true;
+      video.playbackRate = 1;
       video.pause();
       setIsPaused(true);
     }
@@ -354,8 +357,9 @@ export function DirectPlayer({
           const end = v.buffered.end(v.buffered.length - 1);
           const start = v.buffered.start(0);
           if (Number.isFinite(end) && end > 0) {
-            const target = Math.max(start, end - 0.6);
-            if (Math.abs(v.currentTime - target) > 0.25) {
+            const target = Math.max(start, end - 1.2);
+            // Only jump forward (or out of a cleaned-buffer gap); never seek backwards and replay old frames
+            if (v.currentTime < start - 0.05 || target > v.currentTime + 0.6) {
               v.currentTime = target;
             }
           }
@@ -363,6 +367,7 @@ export function DirectPlayer({
           // Ignore seek errors
         }
       }
+      v.playbackRate = 1;
       v.muted = mutedRef.current;
       v.volume = volumeRef.current;
       void v.play().catch(() => {});
@@ -432,14 +437,13 @@ export function DirectPlayer({
           },
           {
             enableWorker: false,
-            enableStashBuffer: false,
-            stashInitialSize: 64,
-            liveBufferLatencyChasing: true,
-            liveBufferLatencyMaxLatency: 2.6,
-            liveBufferLatencyMinRemain: 0.7,
+            enableStashBuffer: true,
+            stashInitialSize: 128,
+            // Disable aggressive hard-seek latency chasing so a stable stream never jumps/skips frames
+            liveBufferLatencyChasing: false,
             autoCleanupSourceBuffer: true,
-            autoCleanupMaxBackwardDuration: 20,
-            autoCleanupMinBackwardDuration: 10,
+            autoCleanupMaxBackwardDuration: 24,
+            autoCleanupMinBackwardDuration: 12,
           }
         );
 
@@ -483,11 +487,12 @@ export function DirectPlayer({
     } else if (Hls.isSupported()) {
       hlsPlayer = new Hls({
         enableWorker: false,
-        lowLatencyMode: true,
+        lowLatencyMode: false,
         startFragPrefetch: true,
-        liveSyncDurationCount: 2,
-        liveMaxLatencyDurationCount: 5,
-        backBufferLength: 10,
+        liveSyncDurationCount: 3,
+        liveMaxLatencyDurationCount: 10,
+        maxLiveSyncPlaybackRate: 1.08,
+        backBufferLength: 15,
       });
       hlsPlayer.loadSource(targetUrl);
       hlsPlayer.attachMedia(video);
@@ -532,23 +537,34 @@ export function DirectPlayer({
         bufEnd = v.buffered.end(v.buffered.length - 1);
         const drift = bufEnd - v.currentTime;
 
-        // Rescue if currentTime fell behind cleaned SourceBuffer range (buffer gap stall)
+        // Rescue only if currentTime fell behind cleaned SourceBuffer range (buffer gap stall)
         if (!userPausedRef.current && v.currentTime < firstStart - 0.05) {
           jumpToLiveEdgeAndPlay(v);
         } else if (Number.isFinite(drift) && drift >= 0) {
           latencySec = Math.round(drift * 10) / 10;
-          // Only manually chase drift on FLV; hls.js manages its own live sync window
-          if (activeProtocol === 'FLV' && drift > 3.2 && !v.paused && !userPausedRef.current) {
-            try {
-              v.currentTime = Math.max(v.currentTime, bufEnd - 0.65);
-            } catch {
-              // Ignore seek errors
+          // Stability-first FLV latency control:
+          // Never hard-jump a healthy stream; only apply imperceptible playbackRate catch-up if drift grows large,
+          // and only hard-seek on extreme backlog (>15s, e.g. system sleep resume).
+          if (activeProtocol === 'FLV' && !v.paused && !userPausedRef.current) {
+            if (drift > 18) {
+              try {
+                v.playbackRate = 1;
+                v.currentTime = Math.max(firstStart, bufEnd - 1.8);
+              } catch {
+                // Ignore seek errors
+              }
+            } else if (stalledTicks === 0 && drift > 11.5) {
+              if (v.playbackRate !== 1.1) v.playbackRate = 1.1;
+            } else if (stalledTicks === 0 && drift > 8.0) {
+              if (v.playbackRate !== 1.05) v.playbackRate = 1.05;
+            } else if (drift <= 4.5 || stalledTicks > 0) {
+              if (v.playbackRate !== 1) v.playbackRate = 1;
             }
           }
         }
       }
 
-      // Watchdog for long playback: detect unexpected pause or frozen frames while user did NOT pause
+      // Watchdog for long playback: detect unexpected pause or truly frozen frames while user did NOT pause
       if (!userPausedRef.current) {
         if (v.paused && hasBuffer && v.readyState >= 2) {
           jumpToLiveEdgeAndPlay(v);
@@ -557,11 +573,15 @@ export function DirectPlayer({
         if (v.readyState >= 2 && v.videoWidth > 0) {
           if (lastObservedTime >= 0 && Math.abs(v.currentTime - lastObservedTime) < 0.05) {
             stalledTicks += 1;
-            if (stalledTicks === 2 && hasBuffer && bufEnd > 0) {
-              // Soft rescue: jump over micro buffer gap and resume playback
+            if (v.playbackRate !== 1) {
+              v.playbackRate = 1;
+            }
+            if (stalledTicks === 3 && hasBuffer && bufEnd - v.currentTime > 1.5) {
+              // Soft rescue only when buffered data actually exists ahead (micro gap);
+              // if buffer is empty we are simply waiting on the network — don't jump!
               jumpToLiveEdgeAndPlay(v);
-            } else if (stalledTicks >= 5) {
-              // Hard stall (~7.5s frozen): TCP socket stalled or signed URL expired -> reconnect cleanly
+            } else if (stalledTicks >= 8) {
+              // Hard stall (~12s completely frozen): TCP socket stalled or signed URL expired -> reconnect cleanly
               triggerSeamlessReconnect();
               return;
             }
@@ -572,6 +592,9 @@ export function DirectPlayer({
         }
       } else {
         stalledTicks = 0;
+        if (v.playbackRate !== 1) {
+          v.playbackRate = 1;
+        }
       }
 
       if (v.readyState >= 2 && v.videoWidth > 0) {
@@ -618,6 +641,7 @@ export function DirectPlayer({
           // Ignore teardown errors
         }
       }
+      video.playbackRate = 1;
       video.removeAttribute('src');
       try {
         video.load();
