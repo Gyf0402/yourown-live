@@ -1103,9 +1103,36 @@ export const LivePane = memo(function LivePane({
           )}
           {isLoading && (
             <div className="pane-loading-overlay">
-              <div className="pane-loading-pill">
-                <span className="pane-spinner" />
-                <span>极速直连拉流中...</span>
+              <div
+                className="stream-loader-card"
+                style={
+                  {
+                    '--loader-accent': platformMeta?.color || '#007aff',
+                  } as React.CSSProperties
+                }
+              >
+                <div className="stream-loader-orb" aria-hidden="true">
+                  <span className="stream-loader-ripple r1" />
+                  <span className="stream-loader-ripple r2" />
+                  <span className="stream-loader-ring" />
+                  <span className="stream-loader-core">
+                    <Zap size={16} strokeWidth={2.3} />
+                  </span>
+                </div>
+                <div className="stream-loader-body">
+                  <div className="stream-loader-title">
+                    <span>{platformMeta ? `${platformMeta.shortName} · ` : ''}极速直连拉流中</span>
+                    <span className="stream-loader-bars" aria-hidden="true">
+                      <i />
+                      <i />
+                      <i />
+                      <i />
+                    </span>
+                  </div>
+                  <div className="stream-loader-track" aria-hidden="true">
+                    <span className="stream-loader-beam" />
+                  </div>
+                </div>
               </div>
             </div>
           )}
