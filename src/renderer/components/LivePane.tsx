@@ -143,6 +143,8 @@ export const LivePane = memo(function LivePane({
   const [paneHint, setPaneHint] = useState<string | null>(null);
   const [directStream, setDirectStream] = useState<DirectStreamResult | null>(null);
   const [directReloadTick, setDirectReloadTick] = useState(0);
+  const [directStreamSeq, setDirectStreamSeq] = useState(0);
+  const silentReconnectRef = useRef(false);
   const [directStats, setDirectStats] = useState<{
     protocol: 'FLV' | 'HLS';
     latencySec: number | null;
@@ -218,6 +220,7 @@ export const LivePane = memo(function LivePane({
     triedLinesRef.current = new Set();
     stableLineIdRef.current = null;
     playingSinceRef.current = null;
+    silentReconnectRef.current = false;
     pendingQualityRef.current = null;
     if (retryTimerRef.current !== null) {
       window.clearTimeout(retryTimerRef.current);
@@ -239,10 +242,15 @@ export const LivePane = memo(function LivePane({
     lastSlotReloadRef.current = slotReloadTick;
     if (!pane.url) return;
     if (useDirectStream) {
+      if (retryTimerRef.current !== null) {
+        window.clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
+      }
       autoRetryCountRef.current = 0;
       triedLinesRef.current = new Set();
       stableLineIdRef.current = null;
       playingSinceRef.current = null;
+      silentReconnectRef.current = false;
       setDirectPlayError(null);
       setDirectReloadTick((n) => n + 1);
     } else if (webviewRef.current) {
@@ -313,77 +321,85 @@ export const LivePane = memo(function LivePane({
   useEffect(() => {
     if (!useDirectStream || !parsedTarget) return;
     let cancelled = false;
-    setIsLoading(true);
+    const isSilent = silentReconnectRef.current;
+    silentReconnectRef.current = false;
+    if (!isSilent) {
+      setIsLoading(true);
+    }
     setDirectPlayError(null);
 
     const effectiveLineId = directLineId || stableLineIdRef.current || undefined;
 
-    void window.livehub
-      .resolveStream({
-        platform: parsedTarget.platform,
-        roomId: parsedTarget.roomId,
-        qualityId: directQualityId,
-        lineId: effectiveLineId,
-        autoHighestQuality,
-      })
-      .then((res) => {
-        if (cancelled) return;
-        setDirectStream(res);
-        setStreamOptions({ qualities: res.qualities || [], lines: res.lines || [] });
-        if (res.anchorName || res.title) {
-          const displayTitle = res.anchorName
-            ? res.title && res.title !== res.anchorName
-              ? `${res.anchorName} · ${res.title}`
-              : res.anchorName
-            : res.title || '';
-          if (displayTitle) {
-            onUpdateTitleRef.current(pane.slotIndex, displayTitle);
-          }
-        }
-        if (res.ok && res.category && pane.channelId) {
-          onDetectedCategoryRef.current?.(pane.channelId, res.category, res.title, res.anchorName);
-        }
-        const pendingQ = pendingQualityRef.current;
-        pendingQualityRef.current = null;
-        const actualActiveQ = (res.qualities || []).find((q) => q.active);
-        if (res.ok && pendingQ && actualActiveQ && actualActiveQ.id !== pendingQ.id) {
-          onUpdatePanePrefs(pane.slotIndex, { preferredQualityId: undefined });
-          showTempHint(
-            !isPlatformLoggedIn
-              ? `「${pendingQ.label}」受平台限制未能切到，已保持「${actualActiveQ.label}」（请先登录解锁）`
-              : `平台限制未能切到「${pendingQ.label}」，已自动保持「${actualActiveQ.label}」（可切「网页」模式尝试）`,
-            4600
-          );
-        } else if (res.ok && !isPlatformLoggedIn && (res.qualities || []).some((q) => q.locked)) {
-          const lockedFirst = (res.qualities || []).find((q) => q.locked);
-          const pName = PLATFORMS[res.platform]?.shortName || '';
-          const curLabel = actualActiveQ?.label || '当前画质';
-          showTempHint(
-            `${pName}未登录仅限${curLabel}，点「登录解锁蓝光」可解锁${lockedFirst?.label || '更高画质'}`,
-            4500
-          );
-        }
-        if (!res.ok) {
-          setIsLoading(false);
-        }
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        setDirectStream({
-          ok: false,
+    const timer = window.setTimeout(() => {
+      void window.livehub
+        .resolveStream({
           platform: parsedTarget.platform,
           roomId: parsedTarget.roomId,
-          status: 'error',
-          referer: '',
-          qualities: [],
-          lines: [],
-          error: err instanceof Error ? err.message : '抓流请求失败',
+          qualityId: directQualityId,
+          lineId: effectiveLineId,
+          autoHighestQuality,
+        })
+        .then((res) => {
+          if (cancelled) return;
+          setDirectStream(res);
+          setDirectStreamSeq((s) => s + 1);
+          setStreamOptions({ qualities: res.qualities || [], lines: res.lines || [] });
+          if (res.anchorName || res.title) {
+            const displayTitle = res.anchorName
+              ? res.title && res.title !== res.anchorName
+                ? `${res.anchorName} · ${res.title}`
+                : res.anchorName
+              : res.title || '';
+            if (displayTitle) {
+              onUpdateTitleRef.current(pane.slotIndex, displayTitle);
+            }
+          }
+          if (res.ok && res.category && pane.channelId) {
+            onDetectedCategoryRef.current?.(pane.channelId, res.category, res.title, res.anchorName);
+          }
+          const pendingQ = pendingQualityRef.current;
+          pendingQualityRef.current = null;
+          const actualActiveQ = (res.qualities || []).find((q) => q.active);
+          if (res.ok && pendingQ && actualActiveQ && actualActiveQ.id !== pendingQ.id) {
+            onUpdatePanePrefs(pane.slotIndex, { preferredQualityId: undefined });
+            showTempHint(
+              !isPlatformLoggedIn
+                ? `「${pendingQ.label}」受平台限制未能切到，已保持「${actualActiveQ.label}」（请先登录解锁）`
+                : `平台限制未能切到「${pendingQ.label}」，已自动保持「${actualActiveQ.label}」（可切「网页」模式尝试）`,
+              4600
+            );
+          } else if (res.ok && !isPlatformLoggedIn && (res.qualities || []).some((q) => q.locked)) {
+            const lockedFirst = (res.qualities || []).find((q) => q.locked);
+            const pName = PLATFORMS[res.platform]?.shortName || '';
+            const curLabel = actualActiveQ?.label || '当前画质';
+            showTempHint(
+              `${pName}未登录仅限${curLabel}，点「登录解锁蓝光」可解锁${lockedFirst?.label || '更高画质'}`,
+              4500
+            );
+          }
+          if (!res.ok) {
+            setIsLoading(false);
+          }
+        })
+        .catch((err) => {
+          if (cancelled) return;
+          setDirectStream({
+            ok: false,
+            platform: parsedTarget.platform,
+            roomId: parsedTarget.roomId,
+            status: 'error',
+            referer: '',
+            qualities: [],
+            lines: [],
+            error: err instanceof Error ? err.message : '抓流请求失败',
+          });
+          setIsLoading(false);
         });
-        setIsLoading(false);
-      });
+    }, 60);
 
     return () => {
       cancelled = true;
+      window.clearTimeout(timer);
     };
   }, [
     useDirectStream,
@@ -649,10 +665,15 @@ export const LivePane = memo(function LivePane({
 
   const handleReload = () => {
     if (useDirectStream) {
+      if (retryTimerRef.current !== null) {
+        window.clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
+      }
       autoRetryCountRef.current = 0;
       triedLinesRef.current = new Set();
       stableLineIdRef.current = null;
       playingSinceRef.current = null;
+      silentReconnectRef.current = false;
       setDirectPlayError(null);
       setDirectReloadTick((n) => n + 1);
       return;
@@ -720,9 +741,15 @@ export const LivePane = memo(function LivePane({
       return;
     }
     if (useDirectStream) {
+      if (retryTimerRef.current !== null) {
+        window.clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
+      }
+      autoRetryCountRef.current = 0;
       triedLinesRef.current = new Set();
       stableLineIdRef.current = null;
       playingSinceRef.current = null;
+      silentReconnectRef.current = false;
       pendingQualityRef.current = chosen
         ? { id: chosen.id, label: chosen.label }
         : { id: labelOrId, label: labelOrId };
@@ -751,9 +778,15 @@ export const LivePane = memo(function LivePane({
 
   const handleSelectLine = (labelOrId: string) => {
     if (useDirectStream) {
+      if (retryTimerRef.current !== null) {
+        window.clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
+      }
+      autoRetryCountRef.current = 0;
       triedLinesRef.current = new Set([labelOrId]);
       stableLineIdRef.current = labelOrId;
       playingSinceRef.current = null;
+      silentReconnectRef.current = false;
       onUpdatePanePrefs(pane.slotIndex, { preferredLineId: labelOrId });
       setStreamOptions((prev) => ({
         ...prev,
@@ -1040,7 +1073,7 @@ export const LivePane = memo(function LivePane({
               muted={effectiveMuted}
               volume={paneVolume}
               fitMode={paneFitMode}
-              reloadToken={directReloadTick}
+              reloadToken={directStreamSeq}
               danmakuEnabled={localDanmakuOn}
               danmakuArea={danmakuArea}
               danmakuOpacity={danmakuOpacity}
@@ -1079,7 +1112,7 @@ export const LivePane = memo(function LivePane({
               onReload={handleReload}
               isFullscreen={isPlayerFullscreen}
               onToggleFullscreen={() => onToggleFullscreen(pane.slotIndex)}
-              onAutoReconnect={() => {
+              onAutoReconnect={(reason) => {
                 if (retryTimerRef.current !== null) return;
                 playingSinceRef.current = null;
                 if (autoRetryCountRef.current >= 2 && trySwitchFallbackLine()) {
@@ -1093,10 +1126,11 @@ export const LivePane = memo(function LivePane({
                   return;
                 }
                 autoRetryCountRef.current += 1;
-                const delayMs = Math.min(5000, autoRetryCountRef.current * 900);
-                showTempHint('流连接刷新中，自动续播...');
+                const delayMs = reason === 'flv-eof' ? 250 : Math.min(5000, autoRetryCountRef.current * 900);
+                showTempHint(reason === 'flv-eof' ? '连接自动续播中...' : '流连接刷新中，自动续播...');
                 retryTimerRef.current = window.setTimeout(() => {
                   retryTimerRef.current = null;
+                  silentReconnectRef.current = true;
                   setDirectPlayError(null);
                   setDirectReloadTick((n) => n + 1);
                 }, delayMs);
@@ -1135,6 +1169,7 @@ export const LivePane = memo(function LivePane({
                   }
                   retryTimerRef.current = window.setTimeout(() => {
                     retryTimerRef.current = null;
+                    silentReconnectRef.current = true;
                     setDirectReloadTick((n) => n + 1);
                   }, delayMs);
                   return;

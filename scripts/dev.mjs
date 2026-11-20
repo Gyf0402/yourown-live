@@ -1,22 +1,55 @@
 // YourOwn Live development runner (Vite + Electron)
 import { spawn } from 'node:child_process';
 import http from 'node:http';
+import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
-const binExt = process.platform === 'win32' ? '.cmd' : '';
+const require = createRequire(import.meta.url);
 
-function binPath(name) {
-  return path.join(rootDir, 'node_modules', '.bin', `${name}${binExt}`);
+function resolveCommand(name, args) {
+  if (name === 'tsc') {
+    return {
+      command: process.execPath,
+      args: [path.join(rootDir, 'node_modules', 'typescript', 'bin', 'tsc'), ...args],
+    };
+  }
+  if (name === 'vite') {
+    return {
+      command: process.execPath,
+      args: [path.join(rootDir, 'node_modules', 'vite', 'bin', 'vite.js'), ...args],
+    };
+  }
+  if (name === 'electron') {
+    // Electron's package exports the exact platform executable path (no .cmd wrapper needed)
+    const electronPath = require('electron');
+    return {
+      command: String(electronPath),
+      args,
+    };
+  }
+  const binExt = process.platform === 'win32' ? '.cmd' : '';
+  const bin = path.join(rootDir, 'node_modules', '.bin', `${name}${binExt}`);
+  if (process.platform === 'win32') {
+    const quoted = [bin, ...args].map((a) => `"${String(a).replace(/"/g, '\\"')}"`).join(' ');
+    return {
+      command: process.env.ComSpec || 'cmd.exe',
+      args: ['/d', '/s', '/c', `"${quoted}"`],
+      windowsVerbatimArguments: true,
+    };
+  }
+  return { command: bin, args };
 }
 
 function runBin(name, args, extraEnv = {}) {
-  return spawn(binPath(name), args, {
+  const resolved = resolveCommand(name, args);
+  return spawn(resolved.command, resolved.args, {
     cwd: rootDir,
     stdio: 'inherit',
-    shell: process.platform === 'win32',
+    shell: false,
+    windowsVerbatimArguments: Boolean(resolved.windowsVerbatimArguments),
     env: { ...process.env, ...extraEnv },
   });
 }

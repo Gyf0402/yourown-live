@@ -93,7 +93,7 @@ export const DanmakuOverlay = memo(function DanmakuOverlay({
     return Math.max(11, Math.round(baseFont * scale));
   };
 
-  // Clear stale bullets & mini-chat when disabled or switching to a different room/stream
+  // Clear stale bullets, mini-chat & seen IDs when switching to a different room/stream
   useEffect(() => {
     bulletsRef.current = [];
     seenIdsRef.current.clear();
@@ -103,7 +103,19 @@ export const DanmakuOverlay = memo(function DanmakuOverlay({
       const ctx = canvas.getContext('2d');
       ctx?.clearRect(0, 0, canvas.width, canvas.height);
     }
-  }, [enabled, streamKey]);
+  }, [streamKey]);
+
+  // Clear visible bullets & mini-chat when danmaku is toggled off (without forgetting already-seen message IDs)
+  useEffect(() => {
+    if (enabled) return;
+    bulletsRef.current = [];
+    setChatMessages([]);
+    const canvas = canvasRef.current;
+    if (canvas) {
+      const ctx = canvas.getContext('2d');
+      ctx?.clearRect(0, 0, canvas.width, canvas.height);
+    }
+  }, [enabled]);
 
   // ResizeObserver for high-DPI canvas sizing (always sync actual DOM canvas.width/height on remount!)
   useEffect(() => {

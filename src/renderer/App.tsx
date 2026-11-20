@@ -112,6 +112,7 @@ export function App() {
   const [checkingStatuses, setCheckingStatuses] = useState(false);
   const muteBeforeBossRef = useRef<boolean | null>(null);
   const prevAuthRef = useRef<AuthStatusMap>(DEFAULT_AUTH_STATUS);
+  const authHydratedRef = useRef(false);
   const channelsRef = useRef<Channel[]>(channels);
   channelsRef.current = channels;
   const settingsRef = useRef<AppSettings>(settings);
@@ -124,13 +125,15 @@ export function App() {
     (nextStatus: AuthStatusMap, changedPlatform?: PlatformId) => {
       const prev = prevAuthRef.current;
       const platformsToReload: PlatformId[] = [];
-      (['huya', 'douyu', 'bilibili', 'douyin'] as PlatformId[]).forEach((pid) => {
-        if (!prev[pid]?.loggedIn && nextStatus[pid]?.loggedIn) {
-          platformsToReload.push(pid);
-        } else if (changedPlatform === pid && nextStatus[pid]?.loggedIn && !prev[pid]?.loggedIn) {
-          platformsToReload.push(pid);
-        }
-      });
+      if (authHydratedRef.current) {
+        (['huya', 'douyu', 'bilibili', 'douyin'] as PlatformId[]).forEach((pid) => {
+          if (!prev[pid]?.loggedIn && nextStatus[pid]?.loggedIn) {
+            platformsToReload.push(pid);
+          } else if (changedPlatform === pid && nextStatus[pid]?.loggedIn && !prev[pid]?.loggedIn) {
+            platformsToReload.push(pid);
+          }
+        });
+      }
       prevAuthRef.current = nextStatus;
       setAuthStatus(nextStatus);
 
@@ -193,6 +196,7 @@ export function App() {
       setSettings(state.settings);
       setWebviewPreloadPath(preloadPath);
       prevAuthRef.current = initialAuth;
+      authHydratedRef.current = true;
       setAuthStatus(initialAuth);
       setHydrated(true);
       if (state.settings.alwaysOnTop) {

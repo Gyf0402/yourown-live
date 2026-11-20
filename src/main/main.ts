@@ -86,6 +86,7 @@ let boundsSaveTimer: NodeJS.Timeout | null = null;
 const loginWindows = new Map<PlatformId, BrowserWindow>();
 const extraWindows = new Set<BrowserWindow>();
 let authSyncTimer: NodeJS.Timeout | null = null;
+let lastEmittedAuthJson = '';
 const danmakuManager = new DanmakuManager(
   (batch) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
@@ -287,6 +288,9 @@ function notifyAuthStatusChanged(changedPlatform?: PlatformId): void {
   if (authSyncTimer) clearTimeout(authSyncTimer);
   authSyncTimer = setTimeout(() => {
     void computeAuthStatus().then((status) => {
+      const serialized = JSON.stringify(status);
+      if (serialized === lastEmittedAuthJson) return;
+      lastEmittedAuthJson = serialized;
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('livehub:auth-changed', {
           status,
@@ -300,7 +304,7 @@ function notifyAuthStatusChanged(changedPlatform?: PlatformId): void {
         }
       }
     });
-  }, 260);
+  }, 400);
 }
 
 // Ad-source & P2P upload domains/paths (based on douyu-p2p-block, Huya-Ad-Skipper, better-douyin & live telemetry traces)
@@ -363,7 +367,9 @@ function configureLiveSession(): void {
     callback(permission === 'fullscreen' || permission === 'media' || permission === 'pointerLock');
   });
 
-  liveSession.cookies.on('changed', (_event, cookie) => {
+  liveSession.cookies.on('changed', (_event, cookie, cause, removed) => {
+    // Ignore transient overwrite removals during normal cookie rotation so loggedIn never blips false -> true
+    if (removed && cause === 'overwrite') return;
     const domain = (cookie.domain || '').toLowerCase();
     let changedPlatform: PlatformId | undefined;
     if (domain.includes('huya.com')) changedPlatform = 'huya';

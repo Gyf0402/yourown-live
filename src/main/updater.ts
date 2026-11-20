@@ -317,14 +317,27 @@ export async function downloadUpdateAsset(
     }
   }, 18000);
 
-  try {
-    const response = await getUpdaterSession().fetch(url, {
-      redirect: 'follow',
-      signal: controller.signal,
-      headers: {
-        'User-Agent': `YourOwn-Live/${app.getVersion()}`,
-      },
+  const abortPromise = new Promise<never>((_, reject) => {
+    if (controller.signal.aborted) {
+      reject(new Error('DOWNLOAD_ABORTED'));
+      return;
+    }
+    controller.signal.addEventListener('abort', () => reject(new Error('DOWNLOAD_ABORTED')), {
+      once: true,
     });
+  });
+
+  try {
+    const response = await Promise.race([
+      getUpdaterSession().fetch(url, {
+        redirect: 'follow',
+        signal: controller.signal,
+        headers: {
+          'User-Agent': `YourOwn-Live/${app.getVersion()}`,
+        },
+      }),
+      abortPromise,
+    ]);
     clearTimeout(connectTimer);
 
     if (!response.ok || !response.body) {
@@ -355,7 +368,7 @@ export async function downloadUpdateAsset(
         if (controller.signal.aborted) {
           throw new Error('DOWNLOAD_ABORTED');
         }
-        const { done, value } = await reader.read();
+        const { done, value } = await Promise.race([reader.read(), abortPromise]);
         if (controller.signal.aborted) {
           throw new Error('DOWNLOAD_ABORTED');
         }

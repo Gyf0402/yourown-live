@@ -70,11 +70,14 @@ function parseProtoFields(buf: Buffer): ProtoField[] {
   let pos = 0;
   while (pos < buf.length) {
     const tagRes = readVarint(buf, pos);
+    if (tagRes.next <= pos) break;
     pos = tagRes.next;
     const fieldNum = Number(tagRes.val >> 3n);
     const wireType = Number(tagRes.val & 7n);
+    if (fieldNum <= 0) break;
     if (wireType === 0) {
       const v = readVarint(buf, pos);
+      if (v.next <= pos) break;
       pos = v.next;
       fields.push({ fieldNum, wireType, val: v.val });
     } else if (wireType === 1) {
@@ -182,95 +185,159 @@ function tarsReadFields(
   let pos = start;
 
   const readHead = () => {
+    if (pos >= end) return { type: 11, tag: 0 };
     const b = buf[pos++];
     const type = b & 0x0f;
     let tag = (b & 0xf0) >> 4;
-    if (tag === 15) tag = buf[pos++];
+    if (tag === 15) {
+      if (pos >= end) return { type: 11, tag: 0 };
+      tag = buf[pos++];
+    }
     return { type, tag };
   };
 
   const readIntVal = (type: number): bigint => {
     if (type === 12) return 0n;
-    if (type === 0) return BigInt(buf.readInt8(pos++));
+    if (type === 0) {
+      if (pos + 1 > end) {
+        pos = end;
+        return 0n;
+      }
+      return BigInt(buf.readInt8(pos++));
+    }
     if (type === 1) {
+      if (pos + 2 > end) {
+        pos = end;
+        return 0n;
+      }
       const v = BigInt(buf.readInt16BE(pos));
       pos += 2;
       return v;
     }
     if (type === 2) {
+      if (pos + 4 > end) {
+        pos = end;
+        return 0n;
+      }
       const v = BigInt(buf.readInt32BE(pos));
       pos += 4;
       return v;
     }
     if (type === 3) {
+      if (pos + 8 > end) {
+        pos = end;
+        return 0n;
+      }
       const v = buf.readBigInt64BE(pos);
       pos += 8;
       return v;
     }
+    pos = end;
     return 0n;
   };
 
-  const skipField = (type: number) => {
+  const skipField = (type: number, depth = 0) => {
+    if (pos >= end || depth > 16) {
+      pos = end;
+      return;
+    }
+    if (type === 12) return;
     if (type === 0) pos += 1;
     else if (type === 1) pos += 2;
     else if (type === 2 || type === 4) pos += 4;
     else if (type === 3 || type === 5) pos += 8;
     else if (type === 6) {
+      if (pos >= end) {
+        pos = end;
+        return;
+      }
       const l = buf[pos++];
       pos += l;
     } else if (type === 7) {
+      if (pos + 4 > end) {
+        pos = end;
+        return;
+      }
       const l = buf.readUInt32BE(pos);
+      if (l > end - pos - 4) {
+        pos = end;
+        return;
+      }
       pos += 4 + l;
     } else if (type === 8) {
       const cnt = Number(readIntVal(readHead().type));
-      for (let i = 0; i < cnt * 2; i++) skipField(readHead().type);
+      if (cnt < 0 || cnt > 2048) {
+        pos = end;
+        return;
+      }
+      for (let i = 0; i < cnt * 2 && pos < end; i++) skipField(readHead().type, depth + 1);
     } else if (type === 9) {
       const cnt = Number(readIntVal(readHead().type));
-      for (let i = 0; i < cnt; i++) skipField(readHead().type);
+      if (cnt < 0 || cnt > 2048) {
+        pos = end;
+        return;
+      }
+      for (let i = 0; i < cnt && pos < end; i++) skipField(readHead().type, depth + 1);
     } else if (type === 10) {
-      while (pos < end) {
+      let guard = 0;
+      while (pos < end && ++guard <= 2048) {
         const h = readHead();
         if (h.type === 11) break;
-        skipField(h.type);
+        skipField(h.type, depth + 1);
       }
     } else if (type === 13) {
       readHead();
       const cnt = Number(readIntVal(readHead().type));
+      if (cnt < 0 || cnt > end - pos) {
+        pos = end;
+        return;
+      }
       pos += cnt;
+    } else {
+      pos = end;
     }
   };
 
-  while (pos < end) {
+  let topGuard = 0;
+  while (pos < end && ++topGuard <= 2048) {
     const { type, tag } = readHead();
     if (type === 11) break;
     if (type === 0 || type === 1 || type === 2 || type === 3 || type === 12) {
       map.set(tag, readIntVal(type));
     } else if (type === 6) {
+      if (pos >= end) break;
       const l = buf[pos++];
+      if (l < 0 || pos + l > end) break;
       map.set(tag, buf.subarray(pos, pos + l).toString('utf-8'));
       pos += l;
     } else if (type === 7) {
+      if (pos + 4 > end) break;
       const l = buf.readUInt32BE(pos);
       pos += 4;
+      if (l > end - pos) break;
       map.set(tag, buf.subarray(pos, pos + l).toString('utf-8'));
       pos += l;
     } else if (type === 13) {
       readHead();
       const l = Number(readIntVal(readHead().type));
+      if (l < 0 || l > end - pos) break;
       map.set(tag, buf.subarray(pos, pos + l));
       pos += l;
     } else if (type === 10) {
       const subStart = pos;
       let depth = 1;
-      while (pos < end && depth > 0) {
+      let structGuard = 0;
+      while (pos < end && depth > 0 && ++structGuard <= 2048) {
         const h = readHead();
         if (h.type === 10) depth++;
         else if (h.type === 11) depth--;
-        else skipField(h.type);
+        else skipField(h.type, 1);
       }
-      map.set(tag, buf.subarray(subStart, pos - 1));
+      if (pos - 1 >= subStart && pos - 1 <= end) {
+        map.set(tag, buf.subarray(subStart, pos - 1));
+      }
     } else {
-      skipField(type);
+      skipField(type, 0);
     }
   }
   return map;
@@ -607,6 +674,10 @@ export class DanmakuManager {
 
   private scheduleReconnect(entry: ActiveSlotDanmaku): void {
     if (entry.stopped || this.slots.get(entry.slotIndex)?.token !== entry.token) return;
+    if (entry.reconnectTimer) {
+      clearTimeout(entry.reconnectTimer);
+      entry.reconnectTimer = null;
+    }
     if (entry.retries >= 20) {
       recordDiagnostic(
         'error',
@@ -693,17 +764,20 @@ export class DanmakuManager {
     entry.ws = ws;
 
     ws.on('open', () => {
+      if (entry.stopped || entry.ws !== ws || this.slots.get(entry.slotIndex)?.token !== entry.token) return;
       entry.retries = 0;
       this.notifyStatus(entry.slotIndex, 'connected', 'douyu');
       recordDiagnostic('info', 'danmaku', `[槽位${entry.slotIndex + 1} douyu#${rid}] 弹幕已连接`);
       ws.send(pack(`type@=loginreq/roomid@=${rid}/`));
       ws.send(pack(`type@=joingroup/rid@=${rid}/gid@=-9999/`));
+      if (entry.heartbeatTimer) clearInterval(entry.heartbeatTimer);
       entry.heartbeatTimer = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) ws.send(pack('type@=mrkl/'));
       }, 45000);
     });
 
     ws.on('message', (data) => {
+      if (entry.stopped || entry.ws !== ws || this.slots.get(entry.slotIndex)?.token !== entry.token) return;
       const buf = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
       let off = 0;
       while (off + 12 <= buf.length) {
@@ -854,7 +928,7 @@ export class DanmakuManager {
         const hlen = buf.readUInt16BE(off + 4);
         const ver = buf.readUInt16BE(off + 6);
         const op = buf.readUInt32BE(off + 8);
-        if (plen < hlen || off + plen > buf.length) break;
+        if (plen < 16 || hlen < 16 || plen < hlen || off + plen > buf.length) break;
         const body = buf.subarray(off + hlen, off + plen);
         off += plen;
         if (op === 5) {
@@ -918,6 +992,7 @@ export class DanmakuManager {
     entry.ws = ws;
 
     ws.on('open', () => {
+      if (entry.stopped || entry.ws !== ws || this.slots.get(entry.slotIndex)?.token !== entry.token) return;
       entry.retries = 0;
       this.notifyStatus(entry.slotIndex, 'connected', 'bilibili');
       recordDiagnostic(
@@ -938,12 +1013,14 @@ export class DanmakuManager {
       );
       ws.send(pack(7, auth));
       ws.send(pack(2, Buffer.alloc(0)));
+      if (entry.heartbeatTimer) clearInterval(entry.heartbeatTimer);
       entry.heartbeatTimer = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) ws.send(pack(2, Buffer.alloc(0)));
       }, 30000);
     });
 
     ws.on('message', (data) => {
+      if (entry.stopped || entry.ws !== ws || this.slots.get(entry.slotIndex)?.token !== entry.token) return;
       unpack(Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer));
     });
     ws.on('close', () => this.scheduleReconnect(entry));
@@ -978,6 +1055,7 @@ export class DanmakuManager {
     entry.ws = ws;
 
     ws.on('open', () => {
+      if (entry.stopped || entry.ws !== ws || this.slots.get(entry.slotIndex)?.token !== entry.token) return;
       entry.retries = 0;
       this.notifyStatus(entry.slotIndex, 'connected', 'huya');
       recordDiagnostic('info', 'danmaku', `[槽位${entry.slotIndex + 1} huya#${numericRid}] 弹幕已连接`);
@@ -986,6 +1064,7 @@ export class DanmakuManager {
         tarsWriteString(1, ''),
       ]);
       ws.send(Buffer.concat([tarsWriteInt(0, 16), tarsWriteBytes(1, groupReq)]));
+      if (entry.heartbeatTimer) clearInterval(entry.heartbeatTimer);
       entry.heartbeatTimer = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(Buffer.concat([tarsWriteInt(0, 1), tarsWriteBytes(1, Buffer.alloc(0))]));
@@ -994,6 +1073,7 @@ export class DanmakuManager {
     });
 
     ws.on('message', (data) => {
+      if (entry.stopped || entry.ws !== ws || this.slots.get(entry.slotIndex)?.token !== entry.token) return;
       const buf = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
       try {
         const cf = tarsReadFields(buf);
@@ -1108,10 +1188,12 @@ export class DanmakuManager {
     entry.ws = ws;
 
     ws.on('open', () => {
+      if (entry.stopped || entry.ws !== ws || this.slots.get(entry.slotIndex)?.token !== entry.token) return;
       entry.retries = 0;
       this.notifyStatus(entry.slotIndex, 'connected', 'douyin');
       recordDiagnostic('info', 'danmaku', `[槽位${entry.slotIndex + 1} douyin#${entry.roomId}] 弹幕已连接`);
       const hbFrame = encodeProtoBytes(7, Buffer.from('hb'));
+      if (entry.heartbeatTimer) clearInterval(entry.heartbeatTimer);
       entry.heartbeatTimer = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) {
           try {
@@ -1124,6 +1206,7 @@ export class DanmakuManager {
     });
 
     ws.on('message', (data) => {
+      if (entry.stopped || entry.ws !== ws || this.slots.get(entry.slotIndex)?.token !== entry.token) return;
       const buf = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
       try {
         const frameFields = parseProtoFields(buf);

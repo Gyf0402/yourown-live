@@ -56,7 +56,7 @@ interface DirectPlayerProps {
   onReload: () => void;
   isFullscreen?: boolean;
   onToggleFullscreen?: () => void;
-  onAutoReconnect?: () => void;
+  onAutoReconnect?: (reason?: string) => void;
   onPlaying?: () => void;
   onStats?: (stats: { protocol: 'FLV' | 'HLS'; latencySec: number | null; resolution?: string }) => void;
   onError?: (reason: string) => void;
@@ -276,10 +276,16 @@ export function DirectPlayer({
       // Jump to live edge on resume so latency does not accumulate while paused
       if (video.buffered && video.buffered.length > 0) {
         try {
-          const end = video.buffered.end(video.buffered.length - 1);
-          const start = video.buffered.start(0);
-          if (Number.isFinite(end) && end - video.currentTime > 2.0) {
-            video.currentTime = Math.max(start, end - 1.1);
+          const lastIdx = video.buffered.length - 1;
+          const lastStart = video.buffered.start(lastIdx);
+          const lastEnd = video.buffered.end(lastIdx);
+          const span = lastEnd - lastStart;
+          if (Number.isFinite(lastEnd) && span >= 0.8 && lastEnd - video.currentTime > 2.5) {
+            const desired = lastEnd - Math.min(1.2, span * 0.45);
+            const target = Math.max(lastStart + 0.15, Math.min(lastEnd - 0.25, desired));
+            if (target > video.currentTime + 0.5) {
+              video.currentTime = target;
+            }
           }
         } catch {
           // Ignore seek errors
@@ -336,30 +342,39 @@ export function DirectPlayer({
     let autoResumeTimer: number | null = null;
     let lastObservedTime = -1;
     let stalledTicks = 0;
+    let healthyTicks = 0;
 
     video.muted = mutedRef.current;
     video.volume = volumeRef.current;
     setLiveBadge(activeProtocol);
 
-    const triggerSeamlessReconnect = () => {
+    const triggerSeamlessReconnect = (reason: string) => {
       if (disposed || reconnectTriggered || userPausedRef.current) return;
       reconnectTriggered = true;
       if (onAutoReconnectRef.current) {
-        onAutoReconnectRef.current();
+        onAutoReconnectRef.current(reason);
       } else {
-        onErrorRef.current?.('直播流连接已断开，正在重连');
+        onErrorRef.current?.(`直播流连接已断开（${reason}），正在重连`);
       }
     };
 
     const jumpToLiveEdgeAndPlay = (v: HTMLVideoElement) => {
       if (v.buffered && v.buffered.length > 0) {
         try {
-          const end = v.buffered.end(v.buffered.length - 1);
-          const start = v.buffered.start(0);
-          if (Number.isFinite(end) && end > 0) {
-            const target = Math.max(start, end - 1.2);
-            // Only jump forward (or out of a cleaned-buffer gap); never seek backwards and replay old frames
-            if (v.currentTime < start - 0.05 || target > v.currentTime + 0.6) {
+          const firstStart = v.buffered.start(0);
+          const lastIdx = v.buffered.length - 1;
+          const lastStart = v.buffered.start(lastIdx);
+          const lastEnd = v.buffered.end(lastIdx);
+          const span = lastEnd - lastStart;
+          // CRITICAL: target must be strictly inside the last buffered range [lastStart, lastEnd).
+          // Seeking into an unbuffered gap between two ranges causes mpegts.js SeekingHandler to flush
+          // the entire MSE SourceBuffer and abort the live stream!
+          if (Number.isFinite(lastEnd) && span >= 0.8) {
+            const desired = lastEnd - Math.min(1.2, span * 0.45);
+            const target = Math.max(lastStart + 0.15, Math.min(lastEnd - 0.25, desired));
+            const fellBehindBuffer = v.currentTime < firstStart - 0.05;
+            const stuckBeforeGap = v.buffered.length > 1 && v.currentTime < lastStart - 0.05;
+            if ((fellBehindBuffer || stuckBeforeGap || target > v.currentTime + 1.5) && target > v.currentTime) {
               v.currentTime = target;
             }
           }
@@ -399,13 +414,19 @@ export function DirectPlayer({
         if (disposed || userPausedRef.current || !videoRef.current) return;
         const v = videoRef.current;
         if (v.paused) {
-          jumpToLiveEdgeAndPlay(v);
+          if (v.buffered && v.buffered.length > 0 && v.currentTime < v.buffered.start(0) - 0.05) {
+            jumpToLiveEdgeAndPlay(v);
+          } else {
+            v.muted = mutedRef.current;
+            v.volume = volumeRef.current;
+            void v.play().catch(() => {});
+          }
         }
       }, 280);
     };
     const handleEnded = () => {
       if (!disposed && !userPausedRef.current) {
-        triggerSeamlessReconnect();
+        triggerSeamlessReconnect('video-ended');
       }
     };
     const handleVisibility = () => {
@@ -438,12 +459,15 @@ export function DirectPlayer({
           {
             enableWorker: false,
             enableStashBuffer: true,
-            stashInitialSize: 128,
+            stashInitialSize: 128 * 1024,
+            // Critical for continuous live FLV: prevent mpegts.js LoadingController from pausing/aborting HTTP stream
+            lazyLoad: false,
             // Disable aggressive hard-seek latency chasing so a stable stream never jumps/skips frames
             liveBufferLatencyChasing: false,
             autoCleanupSourceBuffer: true,
-            autoCleanupMaxBackwardDuration: 24,
-            autoCleanupMinBackwardDuration: 12,
+            // Keep >= 60s backward buffer so SourceBuffer.remove never slices into an active 10-16s GOP
+            autoCleanupMaxBackwardDuration: 90,
+            autoCleanupMinBackwardDuration: 60,
           }
         );
 
@@ -465,7 +489,7 @@ export function DirectPlayer({
         // which fires LOADING_COMPLETE rather than ERROR — reconnect seamlessly with a fresh URL!
         flvPlayer.on(mpegts.Events.LOADING_COMPLETE, () => {
           if (!disposed && !userPausedRef.current) {
-            triggerSeamlessReconnect();
+            triggerSeamlessReconnect('flv-eof');
           }
         });
 
@@ -504,7 +528,7 @@ export function DirectPlayer({
       });
       hlsPlayer.on(Hls.Events.ERROR, (_event, data) => {
         if (disposed || !data.fatal) return;
-        if (recoverTries < 2) {
+        if (recoverTries < 4) {
           recoverTries += 1;
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
             hlsPlayer?.startLoad();
@@ -534,7 +558,9 @@ export function DirectPlayer({
       if (v.buffered && v.buffered.length > 0) {
         hasBuffer = true;
         const firstStart = v.buffered.start(0);
-        bufEnd = v.buffered.end(v.buffered.length - 1);
+        const lastIdx = v.buffered.length - 1;
+        const lastStart = v.buffered.start(lastIdx);
+        bufEnd = v.buffered.end(lastIdx);
         const drift = bufEnd - v.currentTime;
 
         // Rescue only if currentTime fell behind cleaned SourceBuffer range (buffer gap stall)
@@ -544,19 +570,19 @@ export function DirectPlayer({
           latencySec = Math.round(drift * 10) / 10;
           // Stability-first FLV latency control:
           // Never hard-jump a healthy stream; only apply imperceptible playbackRate catch-up if drift grows large,
-          // and only hard-seek on extreme backlog (>15s, e.g. system sleep resume).
+          // and only hard-seek on extreme backlog (>24s, e.g. system sleep resume) strictly inside the last range.
           if (activeProtocol === 'FLV' && !v.paused && !userPausedRef.current) {
-            if (drift > 18) {
+            if (drift > 24 && bufEnd - lastStart >= 1.2) {
               try {
                 v.playbackRate = 1;
-                v.currentTime = Math.max(firstStart, bufEnd - 1.8);
+                v.currentTime = Math.max(lastStart + 0.2, bufEnd - 1.8);
               } catch {
                 // Ignore seek errors
               }
-            } else if (stalledTicks === 0 && drift > 11.5) {
-              if (v.playbackRate !== 1.1) v.playbackRate = 1.1;
-            } else if (stalledTicks === 0 && drift > 8.0) {
-              if (v.playbackRate !== 1.05) v.playbackRate = 1.05;
+            } else if (stalledTicks === 0 && drift > 12.0) {
+              if (v.playbackRate !== 1.08) v.playbackRate = 1.08;
+            } else if (stalledTicks === 0 && drift > 8.5) {
+              if (v.playbackRate !== 1.04) v.playbackRate = 1.04;
             } else if (drift <= 4.5 || stalledTicks > 0) {
               if (v.playbackRate !== 1) v.playbackRate = 1;
             }
@@ -564,35 +590,43 @@ export function DirectPlayer({
         }
       }
 
-      // Watchdog for long playback: detect unexpected pause or truly frozen frames while user did NOT pause
-      if (!userPausedRef.current) {
+      // Watchdog for long playback: detect unexpected pause or truly frozen frames while user did NOT pause.
+      // Never falsely trigger stall reconnect while the window or pane is hidden (minimized / boss-key / maximize-hidden).
+      const isPaneHidden = document.hidden || v.offsetParent === null;
+      if (!userPausedRef.current && !isPaneHidden) {
         if (v.paused && hasBuffer && v.readyState >= 2) {
-          jumpToLiveEdgeAndPlay(v);
+          void v.play().catch(() => {});
         }
 
         if (v.readyState >= 2 && v.videoWidth > 0) {
           if (lastObservedTime >= 0 && Math.abs(v.currentTime - lastObservedTime) < 0.05) {
             stalledTicks += 1;
+            healthyTicks = 0;
             if (v.playbackRate !== 1) {
               v.playbackRate = 1;
             }
-            if (stalledTicks === 3 && hasBuffer && bufEnd - v.currentTime > 1.5) {
-              // Soft rescue only when buffered data actually exists ahead (micro gap);
-              // if buffer is empty we are simply waiting on the network — don't jump!
+            // Only jump if there is an actual disjoint buffer gap (v.buffered.length > 1) and a playable range ahead;
+            // on a normal single-range network pause, NEVER seek (seeking triggers mpegts flush!) — just wait for packets.
+            if (stalledTicks === 4 && hasBuffer && v.buffered.length > 1) {
               jumpToLiveEdgeAndPlay(v);
-            } else if (stalledTicks >= 8) {
-              // Hard stall (~12s completely frozen): TCP socket stalled or signed URL expired -> reconnect cleanly
-              triggerSeamlessReconnect();
+            } else if (stalledTicks >= 12) {
+              // Hard stall (~18s completely frozen): TCP socket stalled or signed URL expired -> reconnect cleanly
+              triggerSeamlessReconnect('stall-watchdog');
               return;
             }
           } else {
             stalledTicks = 0;
+            healthyTicks += 1;
+            // After ~15s of continuous healthy playback, reset transient HLS recover budget
+            if (healthyTicks >= 10 && recoverTries > 0) {
+              recoverTries = 0;
+            }
           }
           lastObservedTime = v.currentTime;
         }
       } else {
         stalledTicks = 0;
-        if (v.playbackRate !== 1) {
+        if (userPausedRef.current && v.playbackRate !== 1) {
           v.playbackRate = 1;
         }
       }
