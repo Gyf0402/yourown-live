@@ -342,7 +342,7 @@ export function LoginModal({
             <div className="update-settings-row">
               <div className="update-settings-info">
                 <span className="update-settings-ver">
-                  当前版本：<strong>v{appInfo?.version || updateInfo?.currentVersion || '0.1.5'}</strong>
+                  当前版本：<strong>v{appInfo?.version || updateInfo?.currentVersion || '0.1.6'}</strong>
                 </span>
                 {updateInfo?.hasUpdate && updateInfo.latestVersion ? (
                   <span className="update-settings-badge has-update">
