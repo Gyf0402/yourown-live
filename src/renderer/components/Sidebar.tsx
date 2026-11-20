@@ -41,8 +41,7 @@ interface SidebarProps {
   onReorderChannels: (
     fromId: string,
     toId: string,
-    position: 'before' | 'after',
-    visibleOrderIds?: string[]
+    position: 'before' | 'after'
   ) => void;
   onChangeChannelSortMode: (mode: ChannelSortMode) => void;
   onRenameChannel: (id: string, name: string, group?: string) => void;
@@ -486,8 +485,8 @@ export function Sidebar({
               }
               title={
                 channelSortMode === 'custom'
-                  ? '当前：自定义顺序（拖拽卡片自由排序，点击切回开播优先）'
-                  : '当前：开播优先（点击切换自定义顺序，或直接上下拖拽卡片排序）'
+                  ? '当前：纯自定义顺序（无视开播状态，严格按拖拽位置固定；点击切回开播优先）'
+                  : '当前：开播优先 + 同状态内按你的自定义拖拽顺序排（点击切纯自定义顺序）'
               }
             >
               <ArrowUpDown size={11} />
@@ -596,12 +595,15 @@ export function Sidebar({
                   const rect = e.currentTarget.getBoundingClientRect();
                   const pos: 'before' | 'after' =
                     e.clientY < rect.top + rect.height / 2 ? 'before' : 'after';
-                  onReorderChannels(
-                    draggingId,
-                    channel.id,
-                    pos,
-                    filteredChannels.map((c) => c.id)
-                  );
+                  const draggedCh = channels.find((c) => c.id === draggingId);
+                  onReorderChannels(draggingId, channel.id, pos);
+                  if (channelSortMode === 'live' && draggedCh) {
+                    const fromRank = STATUS_SORT_RANK[liveStatuses[draggedCh.id]?.status ?? 'unknown'] ?? 2;
+                    const toRank = STATUS_SORT_RANK[liveStatuses[channel.id]?.status ?? 'unknown'] ?? 2;
+                    if (Boolean(draggedCh.pinned) !== Boolean(channel.pinned) || fromRank !== toRank) {
+                      setHint('已记住自定义优先级（当前为「开播序」，点上方切「自定义」可无视开播状态自由排）');
+                    }
+                  }
                   setDraggingId(null);
                   setDropTarget(null);
                 }}

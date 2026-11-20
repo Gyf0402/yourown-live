@@ -423,33 +423,10 @@ export function App() {
   }, []);
 
   const handleReorderChannels = useCallback(
-    (
-      fromId: string,
-      toId: string,
-      position: 'before' | 'after',
-      visibleOrderIds?: string[]
-    ) => {
+    (fromId: string, toId: string, position: 'before' | 'after') => {
       if (!fromId || !toId || fromId === toId) return;
       setChannels((prev) => {
-        // If switching from live-status sort into custom order, first align the array
-        // with the currently displayed order so untouched cards stay right where the user saw them.
-        let working = [...prev];
-        if (
-          settingsRef.current.channelSortMode !== 'custom' &&
-          visibleOrderIds &&
-          visibleOrderIds.length > 1
-        ) {
-          const rank = new Map<string, number>();
-          visibleOrderIds.forEach((id, idx) => rank.set(id, idx));
-          working.sort((a, b) => {
-            const ra = rank.get(a.id);
-            const rb = rank.get(b.id);
-            if (ra !== undefined && rb !== undefined) return ra - rb;
-            if (ra !== undefined) return -1;
-            if (rb !== undefined) return 1;
-            return 0;
-          });
-        }
+        const working = [...prev];
         const fromIdx = working.findIndex((c) => c.id === fromId);
         if (fromIdx === -1) return prev;
         const [moved] = working.splice(fromIdx, 1);
@@ -459,9 +436,6 @@ export function App() {
         working.splice(insertIdx, 0, moved);
         return working;
       });
-      setSettings((prev) =>
-        prev.channelSortMode === 'custom' ? prev : { ...prev, channelSortMode: 'custom' }
-      );
     },
     []
   );
