@@ -56,28 +56,38 @@ interface DouyuBetardRoom {
   nickname?: string;
   show_status?: number;
   videoLoop?: number;
+  second_lvl_name?: string;
+  cate_name?: string;
 }
 
 async function fetchDouyuBetard(
   rid: string,
-  extraHeaders: Record<string, string> = {}
+  extraHeaders: Record<string, string> = {},
+  liveSession?: Session
 ): Promise<DouyuBetardRoom | null> {
   try {
-    const resp = await fetchWithTimeout(
-      `https://www.douyu.com/betard/${encodeURIComponent(rid)}`,
-      {
-        headers: {
-          'User-Agent': DESKTOP_UA,
-          Referer: `https://www.douyu.com/${rid}`,
-          ...extraHeaders,
-        },
-      },
-      5500
-    );
+    const url = `https://www.douyu.com/betard/${encodeURIComponent(rid)}`;
+    const resp = liveSession
+      ? await sessionFetchWithTimeout(liveSession, url, 5500)
+      : await fetchWithTimeout(
+          url,
+          {
+            headers: {
+              'User-Agent': DESKTOP_UA,
+              Referer: `https://www.douyu.com/${rid}`,
+              ...extraHeaders,
+            },
+          },
+          5500
+        );
     const text = await resp.text();
     if (!text.trim().startsWith('{')) return null;
-    const json = JSON.parse(text) as { room?: DouyuBetardRoom };
-    return json?.room?.room_id ? json.room : null;
+    const json = JSON.parse(text) as { room?: DouyuBetardRoom; game?: { tag_name?: string } };
+    if (!json?.room?.room_id) return null;
+    if (!json.room.second_lvl_name && json.game?.tag_name) {
+      json.room.second_lvl_name = json.game.tag_name;
+    }
+    return json.room;
   } catch {
     return null;
   }
@@ -289,7 +299,7 @@ async function extractHuya(req: DirectStreamRequest): Promise<DirectStreamResult
     data?: {
       liveStatus?: string;
       profileInfo?: { nick?: string };
-      liveData?: { introduction?: string; nick?: string };
+      liveData?: { introduction?: string; nick?: string; gameFullName?: string };
       stream?: {
         baseSteamInfoList?: Array<{
           sCdnType: string;
@@ -311,6 +321,7 @@ async function extractHuya(req: DirectStreamRequest): Promise<DirectStreamResult
   const data = json?.data;
   const title = data?.liveData?.introduction || data?.profileInfo?.nick;
   const anchorName = data?.profileInfo?.nick || data?.liveData?.nick;
+  const category = data?.liveData?.gameFullName?.trim() || undefined;
 
   if (!data || data.liveStatus !== 'ON') {
     return {
@@ -320,6 +331,7 @@ async function extractHuya(req: DirectStreamRequest): Promise<DirectStreamResult
       status: 'offline',
       title,
       anchorName,
+      category,
       referer,
       qualities: [],
       lines: [],
@@ -338,6 +350,7 @@ async function extractHuya(req: DirectStreamRequest): Promise<DirectStreamResult
       status: 'error',
       title,
       anchorName,
+      category,
       referer,
       qualities: [],
       lines: [],
@@ -346,7 +359,10 @@ async function extractHuya(req: DirectStreamRequest): Promise<DirectStreamResult
   }
 
   const rateArray = data.stream?.flv?.rateArray || [];
-  const rawQualities: Array<{ id: string; label: string }> = [{ id: '0', label: '原画' }];
+  const zeroRate = rateArray.find((r) => r.iBitRate === 0);
+  const rawQualities: Array<{ id: string; label: string }> = [
+    { id: '0', label: zeroRate?.sDisplayName || '原画' },
+  ];
   for (const r of rateArray) {
     const id = String(r.iBitRate);
     if (!rawQualities.some((q) => q.id === id)) {
@@ -406,6 +422,7 @@ async function extractHuya(req: DirectStreamRequest): Promise<DirectStreamResult
     status: 'live',
     title,
     anchorName,
+    category,
     flvUrl,
     hlsUrl,
     referer,
@@ -491,18 +508,39 @@ let lastBiliWarmAt = 0;
 async function sessionFetchWithTimeout(
   liveSession: Session,
   url: string,
-  timeoutMs = 5500
+  timeoutMs = 5500,
+  init: RequestInit = {}
 ): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await liveSession.fetch(url, {
+      ...init,
       credentials: 'include',
       signal: controller.signal,
     });
   } finally {
     clearTimeout(timer);
   }
+}
+
+function resolveBilibiliCategory(info?: {
+  area_name?: string;
+  parent_area_name?: string;
+  tags?: string;
+}): string | undefined {
+  if (!info) return undefined;
+  const area = (info.area_name || '').trim();
+  const parent = (info.parent_area_name || '').trim();
+  const tags = (info.tags || '').trim();
+  if (tags && (!area || /赛事|综合|其他/.test(area))) {
+    const firstGameTag = tags
+      .split(/[,，\s]+/)
+      .map((t) => t.trim())
+      .find((t) => /^(英雄联盟|lol|王者荣耀|dota2?|cs2|csgo|无畏契约|绝地求生|apex|原神|三角洲)$/i.test(t));
+    if (firstGameTag) return firstGameTag;
+  }
+  return area || parent || undefined;
 }
 
 async function getBilibiliWbiKeys(
@@ -653,8 +691,17 @@ async function extractBilibili(
 
   const infoData = (infoResp as {
     code?: number;
-    data?: { title?: string; live_status?: number; uid?: number; room_id?: number };
+    data?: {
+      title?: string;
+      live_status?: number;
+      uid?: number;
+      room_id?: number;
+      area_name?: string;
+      parent_area_name?: string;
+      tags?: string;
+    };
   } | null)?.data;
+  const category = resolveBilibiliCategory(infoData);
 
   const cachedRid = bilibiliRealRidCache.get(req.roomId);
   const realRid = String(infoData?.room_id || cachedRid?.realRid || req.roomId);
@@ -726,6 +773,7 @@ async function extractBilibili(
       status: 'offline',
       title,
       anchorName,
+      category,
       referer,
       qualities: [],
       lines: [],
@@ -886,6 +934,7 @@ async function extractBilibili(
     status: 'live',
     title,
     anchorName,
+    category,
     flvUrl,
     hlsUrl,
     referer,
@@ -1079,18 +1128,20 @@ async function extractDouyu(
   liveSession: Session
 ): Promise<DirectStreamResult> {
   const douyuCookies = await liveSession.cookies.get({ domain: 'douyu.com' }).catch(() => []);
-  const allowSet = new Set(['acf_auth', 'acf_uid', 'acf_username', 'dy_did']);
   const dedupDouyu = new Map<string, string>();
   for (const c of douyuCookies) {
-    if (!allowSet.has(c.name) || !c.value) continue;
+    if (!c.name || !c.value) continue;
     if (!dedupDouyu.has(c.name) || (c.domain || '').startsWith('.')) {
       dedupDouyu.set(c.name, c.value);
     }
   }
+  const hasDouyuAuth = Boolean(
+    dedupDouyu.get('acf_auth') || dedupDouyu.get('dy_auth') || dedupDouyu.get('acf_uid')
+  );
+  const cookieDid = dedupDouyu.get('dy_did') || dedupDouyu.get('acf_did');
   const cookie = Array.from(dedupDouyu.entries())
     .map(([k, v]) => `${k}=${v}`)
     .join('; ');
-  const cookieDid = dedupDouyu.get('dy_did');
 
   const resolved = await resolveDouyuRealRid(req.roomId);
   const rid = resolved.rid;
@@ -1101,9 +1152,35 @@ async function extractDouyu(
     ...(cookie ? { Cookie: cookie } : {}),
   };
 
-  const roomInfo = resolved.room ?? (await fetchDouyuBetard(rid, cookie ? { Cookie: cookie } : {}));
+  const douyuFetchJson = async <T>(
+    url: string,
+    init: RequestInit = {},
+    timeoutMs = 6500
+  ): Promise<T> => {
+    try {
+      const resp = await sessionFetchWithTimeout(liveSession, url, timeoutMs, init);
+      return (await resp.json()) as T;
+    } catch {
+      const resp = await fetchWithTimeout(
+        url,
+        {
+          ...init,
+          headers: {
+            ...commonHeaders,
+            ...(init.headers as Record<string, string> | undefined),
+          },
+        },
+        timeoutMs
+      );
+      return (await resp.json()) as T;
+    }
+  };
+
+  const roomInfo =
+    resolved.room ?? (await fetchDouyuBetard(rid, cookie ? { Cookie: cookie } : {}, liveSession));
   const title = roomInfo?.room_name;
   const anchorName = roomInfo?.nickname;
+  const category = (roomInfo?.second_lvl_name || roomInfo?.cate_name || '').trim() || undefined;
 
   if (roomInfo && roomInfo.show_status !== 1) {
     return {
@@ -1113,6 +1190,7 @@ async function extractDouyu(
       status: 'offline',
       title,
       anchorName,
+      category,
       referer,
       qualities: [],
       lines: [],
@@ -1120,10 +1198,9 @@ async function extractDouyu(
     };
   }
 
-  const encRes = (await fetchWithTimeout(
-    `https://www.douyu.com/swf_api/homeH5Enc?rids=${encodeURIComponent(rid)}`,
-    { headers: commonHeaders }
-  ).then((r) => r.json())) as { data?: Record<string, string> };
+  const encRes = await douyuFetchJson<{ data?: Record<string, string> }>(
+    `https://www.douyu.com/swf_api/homeH5Enc?rids=${encodeURIComponent(rid)}`
+  );
 
   const jsCode = encRes?.data?.[`room${rid}`];
   if (!jsCode) {
@@ -1134,6 +1211,7 @@ async function extractDouyu(
       status: 'error',
       title,
       anchorName,
+      category,
       referer,
       qualities: [],
       lines: [],
@@ -1149,14 +1227,7 @@ async function extractDouyu(
   const targetCdn = req.lineId || '';
   const body = `${signQuery}&cdn=${encodeURIComponent(targetCdn)}&rate=${encodeURIComponent(targetRate)}&ver=Douyu_223061205&iar=0&ive=0&hevc=0&fa=0`;
 
-  const playRes = (await fetchWithTimeout(`https://www.douyu.com/lapi/live/getH5Play/${rid}`, {
-    method: 'POST',
-    headers: {
-      ...commonHeaders,
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body,
-  }).then((r) => r.json())) as {
+  const playRes = await douyuFetchJson<{
     error?: number;
     msg?: string;
     data?: {
@@ -1167,7 +1238,13 @@ async function extractDouyu(
       multirates?: Array<{ name: string; rate: number }>;
       cdnsWithName?: Array<{ name: string; cdn: string }>;
     };
-  };
+  }>(`https://www.douyu.com/lapi/live/getH5Play/${rid}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body,
+  });
 
   if (playRes?.error !== 0 || !playRes.data?.rtmp_url || !playRes.data?.rtmp_live) {
     const isOffline = playRes?.error === -5;
@@ -1178,6 +1255,7 @@ async function extractDouyu(
       status: isOffline ? 'offline' : 'error',
       title,
       anchorName,
+      category,
       referer,
       qualities: [],
       lines: [],
@@ -1188,10 +1266,21 @@ async function extractDouyu(
   const d = playRes.data;
   const flvUrl = `${d.rtmp_url}/${d.rtmp_live}`;
 
-  const qualities: StreamOptionItem[] = (d.multirates || []).map((m) => ({
+  const multirates = d.multirates || [];
+  const activeIdx = multirates.findIndex((m) => m.rate === d.rate);
+  const requestedRateNum = Number(targetRate);
+  const downgradedHighest =
+    !hasDouyuAuth &&
+    activeIdx > 0 &&
+    (targetRate === '0' ||
+      (Number.isFinite(requestedRateNum) &&
+        multirates.findIndex((m) => m.rate === requestedRateNum) < activeIdx));
+
+  const qualities: StreamOptionItem[] = multirates.map((m, idx) => ({
     id: String(m.rate),
     label: m.name,
     active: m.rate === d.rate,
+    locked: !hasDouyuAuth && ((downgradedHighest && idx < activeIdx) || (m.rate === 0 && d.rate !== 0)),
   }));
   if (qualities.length > 0 && !qualities.some((q) => q.active)) {
     qualities[0].active = true;
@@ -1203,6 +1292,12 @@ async function extractDouyu(
     active: c.cdn === d.rtmp_cdn,
   }));
 
+  recordDiagnostic(
+    'info',
+    'stream',
+    `[douyu#${rid}] ${hasDouyuAuth ? '已登录' : '未登录'} 请求rate=${targetRate} -> 实际rate=${d.rate} (cdn=${d.rtmp_cdn || ''})`
+  );
+
   return {
     ok: true,
     platform: 'douyu',
@@ -1210,6 +1305,7 @@ async function extractDouyu(
     status: 'live',
     title,
     anchorName,
+    category,
     flvUrl,
     referer,
     qualities,
@@ -1229,6 +1325,10 @@ async function extractDouyin(req: DirectStreamRequest): Promise<DirectStreamResu
     status_code?: number;
     data?: {
       user?: { nickname?: string };
+      partition_road_map?: {
+        partition?: { title?: string };
+        sub_partition?: { title?: string };
+      };
       data?: Array<{
         status?: number;
         title?: string;
@@ -1284,6 +1384,12 @@ async function extractDouyin(req: DirectStreamRequest): Promise<DirectStreamResu
   const room = json?.data?.data?.[0];
   const title = room?.title;
   const anchorName = json?.data?.user?.nickname;
+  const category =
+    (
+      json?.data?.partition_road_map?.sub_partition?.title ||
+      json?.data?.partition_road_map?.partition?.title ||
+      ''
+    ).trim() || undefined;
 
   if (!room || room.status !== 2) {
     return {
@@ -1293,6 +1399,7 @@ async function extractDouyin(req: DirectStreamRequest): Promise<DirectStreamResu
       status: 'offline',
       title,
       anchorName,
+      category,
       referer,
       qualities: [],
       lines: [],
@@ -1382,6 +1489,7 @@ async function extractDouyin(req: DirectStreamRequest): Promise<DirectStreamResu
     status: 'live',
     title,
     anchorName,
+    category,
     flvUrl: preferHls ? undefined : rawFlv,
     hlsUrl: rawHls,
     referer: 'https://live.douyin.com/',
@@ -1482,7 +1590,7 @@ async function checkSingleLiveStatus(item: LiveStatusCheckItem): Promise<LiveRoo
             liveStatus?: string;
             realLiveStatus?: string;
             profileInfo?: { nick?: string };
-            liveData?: { introduction?: string; nick?: string };
+            liveData?: { introduction?: string; nick?: string; gameFullName?: string };
           };
         };
         const d = json?.data;
@@ -1494,6 +1602,7 @@ async function checkSingleLiveStatus(item: LiveStatusCheckItem): Promise<LiveRoo
           status,
           anchorName: d.profileInfo?.nick || d.liveData?.nick,
           title: d.liveData?.introduction,
+          category: d.liveData?.gameFullName?.trim() || undefined,
           checkedAt,
         };
       }
@@ -1511,6 +1620,7 @@ async function checkSingleLiveStatus(item: LiveStatusCheckItem): Promise<LiveRoo
           status,
           anchorName: room.nickname,
           title: room.room_name,
+          category: (room.second_lvl_name || room.cate_name || '').trim() || undefined,
           checkedAt,
         };
       }
@@ -1532,6 +1642,9 @@ async function checkSingleLiveStatus(item: LiveStatusCheckItem): Promise<LiveRoo
             uid?: number;
             live_status?: number;
             title?: string;
+            area_name?: string;
+            parent_area_name?: string;
+            tags?: string;
           };
         };
         const info = json?.data;
@@ -1543,6 +1656,7 @@ async function checkSingleLiveStatus(item: LiveStatusCheckItem): Promise<LiveRoo
           status,
           anchorName,
           title: info.title,
+          category: resolveBilibiliCategory(info),
           checkedAt,
         };
       }
@@ -1575,6 +1689,10 @@ async function checkSingleLiveStatus(item: LiveStatusCheckItem): Promise<LiveRoo
           if (!text.trim()) return null;
           return JSON.parse(text) as {
             data?: {
+              partition_road_map?: {
+                partition?: { title?: string };
+                sub_partition?: { title?: string };
+              };
               data?: Array<{
                 status?: number;
                 title?: string;
@@ -1592,10 +1710,17 @@ async function checkSingleLiveStatus(item: LiveStatusCheckItem): Promise<LiveRoo
         if (!parsed?.data) return { status: 'unknown', checkedAt };
         const room = parsed.data.data?.[0];
         const status = room?.status === 2 ? 'live' : 'offline';
+        const category =
+          (
+            parsed.data.partition_road_map?.sub_partition?.title ||
+            parsed.data.partition_road_map?.partition?.title ||
+            ''
+          ).trim() || undefined;
         return {
           status,
           anchorName: parsed.data.user?.nickname || room?.owner?.nickname,
           title: room?.title,
+          category,
           checkedAt,
         };
       }

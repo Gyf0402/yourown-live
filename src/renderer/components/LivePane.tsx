@@ -39,6 +39,7 @@ interface LivePaneProps {
   isMaximized: boolean;
   canMaximize: boolean;
   isHiddenByMaximize: boolean;
+  isPlayerFullscreen: boolean;
   effectiveMuted: boolean;
   isPlatformLoggedIn: boolean;
   platformReloadEpoch: number;
@@ -67,6 +68,8 @@ interface LivePaneProps {
     >
   ) => void;
   onToggleMaximize: (slotIndex: number) => void;
+  onToggleFullscreen: (slotIndex: number) => void;
+  onDetectedCategory?: (channelId: string, category: string, title?: string, anchorName?: string) => void;
   onSelectPane: (slotIndex: number) => void;
   onLoadUrlInPane: (slotIndex: number, url: string, title?: string, channelId?: string | null) => void;
   onLoadChannelInPane: (slotIndex: number, channel: Channel) => void;
@@ -86,6 +89,7 @@ export const LivePane = memo(function LivePane({
   isMaximized,
   canMaximize,
   isHiddenByMaximize,
+  isPlayerFullscreen,
   effectiveMuted,
   isPlatformLoggedIn,
   platformReloadEpoch,
@@ -109,6 +113,8 @@ export const LivePane = memo(function LivePane({
   onChangeDanmakuBlockKeywords,
   onUpdatePanePrefs,
   onToggleMaximize,
+  onToggleFullscreen,
+  onDetectedCategory,
   onSelectPane,
   onLoadUrlInPane,
   onLoadChannelInPane,
@@ -148,8 +154,11 @@ export const LivePane = memo(function LivePane({
   const autoRetryCountRef = useRef(0);
   const triedLinesRef = useRef<Set<string>>(new Set());
   const retryTimerRef = useRef<number | null>(null);
+  const pendingQualityRef = useRef<{ id: string; label: string } | null>(null);
   const onUpdateTitleRef = useRef(onUpdateTitle);
   onUpdateTitleRef.current = onUpdateTitle;
+  const onDetectedCategoryRef = useRef(onDetectedCategory);
+  onDetectedCategoryRef.current = onDetectedCategory;
   const lastEpochRef = useRef(platformReloadEpoch);
   const lastSlotReloadRef = useRef(slotReloadTick);
 
@@ -205,6 +214,7 @@ export const LivePane = memo(function LivePane({
     setDanmakuStatus(null);
     autoRetryCountRef.current = 0;
     triedLinesRef.current = new Set();
+    pendingQualityRef.current = null;
     if (retryTimerRef.current !== null) {
       window.clearTimeout(retryTimerRef.current);
       retryTimerRef.current = null;
@@ -322,8 +332,28 @@ export const LivePane = memo(function LivePane({
             onUpdateTitleRef.current(pane.slotIndex, displayTitle);
           }
         }
-        if (res.ok && res.platform === 'bilibili' && (res.qualities || []).some((q) => q.locked)) {
-          showTempHint('B站未登录仅限720P超清，点「登录解锁蓝光」可看1080P原画', 4500);
+        if (res.ok && res.category && pane.channelId) {
+          onDetectedCategoryRef.current?.(pane.channelId, res.category, res.title, res.anchorName);
+        }
+        const pendingQ = pendingQualityRef.current;
+        pendingQualityRef.current = null;
+        const actualActiveQ = (res.qualities || []).find((q) => q.active);
+        if (res.ok && pendingQ && actualActiveQ && actualActiveQ.id !== pendingQ.id) {
+          onUpdatePanePrefs(pane.slotIndex, { preferredQualityId: undefined });
+          showTempHint(
+            !isPlatformLoggedIn
+              ? `「${pendingQ.label}」受平台限制未能切到，已保持「${actualActiveQ.label}」（请先登录解锁）`
+              : `平台限制未能切到「${pendingQ.label}」，已自动保持「${actualActiveQ.label}」（可切「网页」模式尝试）`,
+            4600
+          );
+        } else if (res.ok && !isPlatformLoggedIn && (res.qualities || []).some((q) => q.locked)) {
+          const lockedFirst = (res.qualities || []).find((q) => q.locked);
+          const pName = PLATFORMS[res.platform]?.shortName || '';
+          const curLabel = actualActiveQ?.label || '当前画质';
+          showTempHint(
+            `${pName}未登录仅限${curLabel}，点「登录解锁蓝光」可解锁${lockedFirst?.label || '更高画质'}`,
+            4500
+          );
         }
         if (!res.ok) {
           setIsLoading(false);
@@ -679,7 +709,13 @@ export const LivePane = memo(function LivePane({
     }
     if (useDirectStream) {
       triedLinesRef.current = new Set();
+      pendingQualityRef.current = chosen
+        ? { id: chosen.id, label: chosen.label }
+        : { id: labelOrId, label: labelOrId };
       onUpdatePanePrefs(pane.slotIndex, { preferredQualityId: labelOrId });
+      if (directQualityId === labelOrId) {
+        setDirectReloadTick((n) => n + 1);
+      }
       setStreamOptions((prev) => ({
         ...prev,
         qualities: prev.qualities.map((q) => ({ ...q, active: q.id === labelOrId })),
@@ -759,7 +795,9 @@ export const LivePane = memo(function LivePane({
     <div
       className={`pane-wrapper ${isActive ? 'active-pane' : ''} ${!pane.url ? 'empty' : ''} ${
         dragOver ? 'drag-over' : ''
-      } ${isMaximized ? 'is-maximized' : ''} ${isHiddenByMaximize ? 'is-hidden-by-max' : ''}`}
+      } ${isMaximized ? 'is-maximized' : ''} ${isHiddenByMaximize ? 'is-hidden-by-max' : ''} ${
+        isPlayerFullscreen ? 'is-player-fullscreen' : ''
+      }`}
       onMouseDown={() => onSelectPane(pane.slotIndex)}
       onDragOver={(e) => {
         e.preventDefault();
@@ -1023,6 +1061,8 @@ export const LivePane = memo(function LivePane({
               onChangeDanmakuBlockKeywords={onChangeDanmakuBlockKeywords}
               onToggleMute={() => onToggleMute(pane.slotIndex)}
               onReload={handleReload}
+              isFullscreen={isPlayerFullscreen}
+              onToggleFullscreen={() => onToggleFullscreen(pane.slotIndex)}
               onAutoReconnect={() => {
                 if (retryTimerRef.current !== null) return;
                 if (autoRetryCountRef.current >= 2 && trySwitchFallbackLine()) {

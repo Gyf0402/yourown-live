@@ -153,6 +153,7 @@ function createDefaultSettings(): AppSettings {
     danmakuBlockKeywords: [],
     theme: 'light',
     customGroups: [],
+    hiddenDefaultGroups: [],
     splitRatios: { col: 50, row: 50 },
     bossKeyShortcut: 'Alt+X',
     panes: createDefaultPanes(),
@@ -234,7 +235,7 @@ async function computeAuthStatus(): Promise<AuthStatusMap> {
 
   const huyaCookie = findCookie('huya.com', ['yyuid', 'udb_uid', 'username']);
   const huyaName = findCookie('huya.com', ['username'])?.value;
-  const douyuCookie = findCookie('douyu.com', ['acf_auth', 'acf_uid', 'acf_username']);
+  const douyuCookie = findCookie('douyu.com', ['acf_auth', 'dy_auth', 'acf_uid', 'acf_username']);
   const douyuName = findCookie('douyu.com', ['acf_username', 'acf_uid'])?.value;
   const biliCookie = findCookie('bilibili.com', ['SESSDATA']);
   const biliUid = findCookie('bilibili.com', ['DedeUserID'])?.value;
@@ -326,18 +327,34 @@ function configureLiveSession(): void {
     callback({});
   });
 
-  // Ensure liveSession.fetch() calls to Bilibili APIs carry matching Referer & Origin headers
+  // Ensure liveSession.fetch() calls to Bilibili & Douyu APIs carry matching Referer & Origin headers
   liveSession.webRequest.onBeforeSendHeaders(
-    { urls: ['https://api.live.bilibili.com/*', 'https://api.bilibili.com/*'] },
+    {
+      urls: [
+        'https://api.live.bilibili.com/*',
+        'https://api.bilibili.com/*',
+        'https://www.douyu.com/*',
+      ],
+    },
     (details, callback) => {
       const headers = { ...details.requestHeaders };
       const hasRef = Object.keys(headers).some((k) => k.toLowerCase() === 'referer');
       const hasOrigin = Object.keys(headers).some((k) => k.toLowerCase() === 'origin');
-      if (!hasRef) headers['Referer'] = 'https://live.bilibili.com/';
-      if (!hasOrigin) headers['Origin'] = 'https://live.bilibili.com';
+      if (details.url.includes('douyu.com')) {
+        if (!hasRef) headers['Referer'] = 'https://www.douyu.com/';
+        if (!hasOrigin) headers['Origin'] = 'https://www.douyu.com';
+      } else {
+        if (!hasRef) headers['Referer'] = 'https://live.bilibili.com/';
+        if (!hasOrigin) headers['Origin'] = 'https://live.bilibili.com';
+      }
       callback({ requestHeaders: headers });
     }
   );
+
+  // Explicitly approve fullscreen permissions inside webviews
+  liveSession.setPermissionRequestHandler((_wc, permission, callback) => {
+    callback(permission === 'fullscreen' || permission === 'media' || permission === 'pointerLock');
+  });
 
   liveSession.cookies.on('changed', (_event, cookie) => {
     const domain = (cookie.domain || '').toLowerCase();
@@ -569,7 +586,7 @@ function createTray(): void {
 }
 
 function captureWindowBounds(): void {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (!mainWindow || mainWindow.isDestroyed() || mainWindow.isFullScreen()) return;
   const isMaximized = mainWindow.isMaximized();
   const b = isMaximized ? mainWindow.getNormalBounds() : mainWindow.getBounds();
   latestWindowBounds = {
@@ -808,6 +825,16 @@ function createMainWindow(initialState: PersistedState): void {
   mainWindow.on('move', scheduleBoundsPersist);
   mainWindow.on('maximize', scheduleBoundsPersist);
   mainWindow.on('unmaximize', scheduleBoundsPersist);
+  mainWindow.on('enter-full-screen', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('livehub:fullscreen-changed', true);
+    }
+  });
+  mainWindow.on('leave-full-screen', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('livehub:fullscreen-changed', false);
+    }
+  });
   mainWindow.on('show', updateTrayMenu);
   mainWindow.on('hide', updateTrayMenu);
 
@@ -952,6 +979,10 @@ function matchStreamReferer(rawUrl: string): string | null {
 function configureDirectStreamNetworking(): void {
   const defaultSes = session.defaultSession;
 
+  defaultSes.setPermissionRequestHandler((_wc, permission, callback) => {
+    callback(permission === 'fullscreen' || permission === 'media' || permission === 'pointerLock');
+  });
+
   defaultSes.webRequest.onBeforeSendHeaders(
     { urls: ['http://*/*', 'https://*/*'] },
     (details, callback) => {
@@ -1023,6 +1054,15 @@ app.whenReady().then(async () => {
     if (!mainWindow) return false;
     mainWindow.setAlwaysOnTop(Boolean(flag), 'screen-saver');
     return mainWindow.isAlwaysOnTop();
+  });
+
+  ipcMain.handle('livehub:set-window-fullscreen', (_event, flag: boolean) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return false;
+    const next = Boolean(flag);
+    if (mainWindow.isFullScreen() !== next) {
+      mainWindow.setFullScreen(next);
+    }
+    return mainWindow.isFullScreen();
   });
 
   ipcMain.handle('livehub:toggle-boss-hide', () => toggleBossMode());
@@ -1108,6 +1148,8 @@ async function resolveShortLiveInput(
           roomId: resolved.rid || initial.roomId,
           url: buildCanonicalUrl('douyu', resolved.rid || initial.roomId),
           suggestedName: initial.suggestedName || resolved.room?.nickname,
+          suggestedCategory:
+            (resolved.room?.second_lvl_name || resolved.room?.cate_name || '').trim() || undefined,
         };
       } catch {
         return initial;

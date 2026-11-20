@@ -22,9 +22,12 @@ interface SplitGridProps {
   channels: Channel[];
   activeSlotIndex: number;
   maximizedSlotIndex: number | null;
+  fullscreenSlotIndex: number | null;
   webviewPreloadPath: string;
   onSelectPane: (slotIndex: number) => void;
   onToggleMaximize: (slotIndex: number) => void;
+  onToggleFullscreen: (slotIndex: number) => void;
+  onDetectedCategory: (channelId: string, category: string, title?: string, anchorName?: string) => void;
   onChangeSplitRatios: (ratios: SplitRatios) => void;
   onLoadUrlInPane: (slotIndex: number, url: string, title?: string, channelId?: string | null) => void;
   onLoadChannelInPane: (slotIndex: number, channel: Channel) => void;
@@ -62,9 +65,12 @@ export function SplitGrid({
   channels,
   activeSlotIndex,
   maximizedSlotIndex,
+  fullscreenSlotIndex,
   webviewPreloadPath,
   onSelectPane,
   onToggleMaximize,
+  onToggleFullscreen,
+  onDetectedCategory,
   onChangeSplitRatios,
   onLoadUrlInPane,
   onLoadChannelInPane,
@@ -174,6 +180,7 @@ export function SplitGrid({
           const isMaximized = effectiveMaxSlot === pane.slotIndex;
           const isHiddenByMaximize =
             effectiveMaxSlot !== null && effectiveMaxSlot !== pane.slotIndex;
+          const isPlayerFullscreen = fullscreenSlotIndex === pane.slotIndex;
 
           return (
             <LivePane
@@ -184,6 +191,7 @@ export function SplitGrid({
               isMaximized={isMaximized}
               canMaximize={canMaximize}
               isHiddenByMaximize={isHiddenByMaximize}
+              isPlayerFullscreen={isPlayerFullscreen}
               effectiveMuted={effectiveMuted}
               isPlatformLoggedIn={isPlatformLoggedIn}
               platformReloadEpoch={platformReloadEpoch}
@@ -207,6 +215,8 @@ export function SplitGrid({
               onChangeDanmakuBlockKeywords={onChangeDanmakuBlockKeywords}
               onUpdatePanePrefs={onUpdatePanePrefs}
               onToggleMaximize={onToggleMaximize}
+              onToggleFullscreen={onToggleFullscreen}
+              onDetectedCategory={onDetectedCategory}
               onSelectPane={onSelectPane}
               onLoadUrlInPane={onLoadUrlInPane}
               onLoadChannelInPane={onLoadChannelInPane}

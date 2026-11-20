@@ -54,6 +54,8 @@ interface DirectPlayerProps {
   onChangeDanmakuBlockKeywords?: (keywords: string[]) => void;
   onToggleMute: () => void;
   onReload: () => void;
+  isFullscreen?: boolean;
+  onToggleFullscreen?: () => void;
   onAutoReconnect?: () => void;
   onPlaying?: () => void;
   onStats?: (stats: { protocol: 'FLV' | 'HLS'; latencySec: number | null; resolution?: string }) => void;
@@ -89,6 +91,8 @@ export function DirectPlayer({
   onChangeDanmakuBlockKeywords,
   onToggleMute,
   onReload,
+  isFullscreen: controlledFullscreen,
+  onToggleFullscreen,
   onAutoReconnect,
   onPlaying,
   onStats,
@@ -100,7 +104,8 @@ export function DirectPlayer({
   const hudTimerRef = useRef<number | null>(null);
   const [useHlsFallback, setUseHlsFallback] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
-  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [localFullscreen, setLocalFullscreen] = useState(false);
+  const isFullscreen = onToggleFullscreen ? Boolean(controlledFullscreen) : localFullscreen;
   const [liveBadge, setLiveBadge] = useState<string>('FLV');
   const [videoReady, setVideoReady] = useState(false);
   const [dmPanelOpen, setDmPanelOpen] = useState(false);
@@ -196,15 +201,16 @@ export function DirectPlayer({
   }, [muted, volume]);
 
   useEffect(() => {
+    if (onToggleFullscreen) return;
     const handleFsChange = () => {
       const container = containerRef.current;
       const video = videoRef.current;
       const fsEl = document.fullscreenElement;
-      setIsFullscreen(Boolean(fsEl && (fsEl === container || fsEl === video)));
+      setLocalFullscreen(Boolean(fsEl && (fsEl === container || fsEl === video)));
     };
     document.addEventListener('fullscreenchange', handleFsChange);
     return () => document.removeEventListener('fullscreenchange', handleFsChange);
-  }, []);
+  }, [onToggleFullscreen]);
 
   const togglePlayPause = useCallback(() => {
     const video = videoRef.current;
@@ -234,6 +240,10 @@ export function DirectPlayer({
   }, []);
 
   const toggleFullscreen = useCallback(() => {
+    if (onToggleFullscreen) {
+      onToggleFullscreen();
+      return;
+    }
     const container = containerRef.current;
     if (!container) return;
     if (document.fullscreenElement) {
@@ -244,7 +254,7 @@ export function DirectPlayer({
         void videoRef.current?.requestFullscreen().catch(() => {});
       });
     }
-  }, []);
+  }, [onToggleFullscreen]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -590,6 +600,7 @@ export function DirectPlayer({
         const target = e.target as HTMLElement | null;
         const tag = target?.tagName?.toLowerCase();
         if (e.key === 'Escape' && dmPanelOpen) {
+          e.stopPropagation();
           setDmPanelOpen(false);
           return;
         }
@@ -800,8 +811,12 @@ export function DirectPlayer({
             )}
 
           <button
+            type="button"
             className="direct-ctrl-btn"
-            onClick={toggleFullscreen}
+            onClick={(e) => {
+              e.currentTarget.blur();
+              toggleFullscreen();
+            }}
             title={isFullscreen ? '退出全屏 (Esc / F)' : '全屏观看 (双击画面 / F)'}
           >
             {isFullscreen ? <Minimize2 size={14} /> : <Maximize2 size={14} />}

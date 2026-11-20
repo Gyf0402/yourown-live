@@ -5,6 +5,9 @@ import {
   PLATFORMS,
   SAMPLE_CHANNELS,
   detectPlatformFromUrl,
+  getFallbackGroup,
+  getVisibleGroups,
+  matchChannelGroup,
 } from '../shared/platforms';
 import type {
   AppSettings,
@@ -58,6 +61,7 @@ const FALLBACK_SETTINGS: AppSettings = {
   danmakuBlockKeywords: [],
   theme: 'light',
   customGroups: [],
+  hiddenDefaultGroups: [],
   splitRatios: { col: 50, row: 50 },
   bossKeyShortcut: 'Alt+X',
   panes: [0, 1, 2, 3].map((slotIndex) => ({
@@ -93,6 +97,7 @@ export function App() {
   const [slotReloadTicks, setSlotReloadTicks] = useState<number[]>([0, 0, 0, 0]);
   const [activeSlotIndex, setActiveSlotIndex] = useState(0);
   const [maximizedSlotIndex, setMaximizedSlotIndex] = useState<number | null>(null);
+  const [fullscreenSlotIndex, setFullscreenSlotIndex] = useState<number | null>(null);
   const [webviewPreloadPath, setWebviewPreloadPath] = useState('');
   const [loginModalOpen, setLoginModalOpen] = useState(false);
   const [hydrated, setHydrated] = useState(false);
@@ -226,12 +231,22 @@ export function App() {
           })
         : () => {};
 
+    const unlistenFullscreen =
+      typeof window.livehub.onWindowFullScreenChanged === 'function'
+        ? window.livehub.onWindowFullScreenChanged((isFs) => {
+            if (!isFs) {
+              setFullscreenSlotIndex(null);
+            }
+          })
+        : () => {};
+
     return () => {
       mounted = false;
       unlistenBoss();
       unlistenAuth();
       unlistenTray();
       unlistenClose();
+      unlistenFullscreen();
     };
   }, [applyAuthStatusUpdate]);
 
@@ -271,19 +286,41 @@ export function App() {
       );
       if (res && typeof res === 'object') {
         setLiveStatuses((prev) => ({ ...prev, ...res }));
-        // Auto-fill friendly anchorName for newly added channels that still have placeholder names
+        // Auto-fill friendly anchorName for newly added channels with placeholder names,
+        // and auto-match group for channels added in auto-group mode (!groupLocked).
         const renamedMap = new Map<string, string>();
         setChannels((prev) => {
           let changed = false;
+          const visibleGroups = getVisibleGroups(
+            settingsRef.current.customGroups,
+            settingsRef.current.hiddenDefaultGroups,
+            prev
+          );
           const next = prev.map((ch) => {
             const info = res[ch.id];
-            const anchor = info?.anchorName?.trim();
+            if (!info) return ch;
+            let updated = ch;
+            const anchor = info.anchorName?.trim();
             if (anchor && !ch.remarkLocked && isPlaceholderChannelName(ch) && ch.name !== anchor) {
               changed = true;
               renamedMap.set(ch.id, anchor);
-              return { ...ch, name: anchor };
+              updated = { ...updated, name: anchor };
             }
-            return ch;
+            if (!updated.groupLocked) {
+              const matchedGroup = matchChannelGroup(
+                {
+                  category: info.category,
+                  title: info.title,
+                  anchorName: anchor || updated.name,
+                },
+                visibleGroups
+              );
+              if (matchedGroup && matchedGroup !== updated.group) {
+                changed = true;
+                updated = { ...updated, group: matchedGroup };
+              }
+            }
+            return updated;
           });
           return changed ? next : prev;
         });
@@ -447,6 +484,20 @@ export function App() {
   const handleRenameChannel = useCallback((id: string, nextName: string, nextGroup?: string) => {
     const trimmed = nextName.trim();
     if (!trimmed) return;
+    const cleanGroup = nextGroup?.trim();
+    if (cleanGroup && cleanGroup !== '全部') {
+      setSettings((prev) => {
+        const isDefault = DEFAULT_GROUPS.includes(cleanGroup);
+        const hidden = prev.hiddenDefaultGroups ?? [];
+        const custom = prev.customGroups ?? [];
+        if (isDefault) {
+          if (!hidden.includes(cleanGroup)) return prev;
+          return { ...prev, hiddenDefaultGroups: hidden.filter((g) => g !== cleanGroup) };
+        }
+        if (custom.includes(cleanGroup)) return prev;
+        return { ...prev, customGroups: [...custom, cleanGroup] };
+      });
+    }
     setChannels((prev) =>
       prev.map((c) =>
         c.id === id
@@ -454,7 +505,12 @@ export function App() {
               ...c,
               name: trimmed,
               remarkLocked: trimmed !== c.name ? true : c.remarkLocked,
-              ...(nextGroup ? { group: nextGroup } : {}),
+              ...(cleanGroup && cleanGroup !== '全部'
+                ? {
+                    group: cleanGroup,
+                    groupLocked: cleanGroup !== c.group ? true : c.groupLocked,
+                  }
+                : {}),
             }
           : c
       )
@@ -470,10 +526,54 @@ export function App() {
     });
   }, []);
 
+  const handleDetectedCategory = useCallback(
+    (channelId: string, category: string, title?: string, anchorName?: string) => {
+      if (!channelId || !category) return;
+      setLiveStatuses((prev) => {
+        const existing = prev[channelId];
+        if (existing?.category === category) return prev;
+        return {
+          ...prev,
+          [channelId]: {
+            status: existing?.status ?? 'live',
+            title: title || existing?.title,
+            anchorName: anchorName || existing?.anchorName,
+            category,
+            checkedAt: existing?.checkedAt ?? Date.now(),
+          },
+        };
+      });
+      setChannels((prev) => {
+        const target = prev.find((c) => c.id === channelId);
+        if (!target || target.groupLocked) return prev;
+        const visibleGroups = getVisibleGroups(
+          settingsRef.current.customGroups,
+          settingsRef.current.hiddenDefaultGroups,
+          prev
+        );
+        const matched = matchChannelGroup(
+          { category, title, anchorName: anchorName || target.name },
+          visibleGroups
+        );
+        if (!matched || matched === target.group) return prev;
+        return prev.map((c) => (c.id === channelId ? { ...c, group: matched } : c));
+      });
+    },
+    []
+  );
+
   const handleAddGroup = useCallback((name: string) => {
-    const trimmed = name.trim();
-    if (!trimmed || DEFAULT_GROUPS.includes(trimmed)) return;
+    const trimmed = name.trim().slice(0, 12);
+    if (!trimmed || trimmed === '全部') return;
     setSettings((prev) => {
+      const hidden = prev.hiddenDefaultGroups ?? [];
+      if (DEFAULT_GROUPS.includes(trimmed)) {
+        if (!hidden.includes(trimmed)) return prev;
+        return {
+          ...prev,
+          hiddenDefaultGroups: hidden.filter((g) => g !== trimmed),
+        };
+      }
       const existing = prev.customGroups ?? [];
       if (existing.includes(trimmed)) return prev;
       return { ...prev, customGroups: [...existing, trimmed] };
@@ -481,13 +581,81 @@ export function App() {
   }, []);
 
   const handleRemoveGroup = useCallback((name: string) => {
+    if (!name || name === '全部') return;
+    const curSettings = settingsRef.current;
+    const isDefault = DEFAULT_GROUPS.includes(name);
+    const nextHidden = isDefault
+      ? Array.from(new Set([...(curSettings.hiddenDefaultGroups ?? []), name]))
+      : (curSettings.hiddenDefaultGroups ?? []);
+    const nextCustom = (curSettings.customGroups ?? []).filter((g) => g !== name);
+    const remaining = getVisibleGroups(
+      nextCustom,
+      nextHidden,
+      channelsRef.current.filter((c) => c.group !== name)
+    ).filter((g) => g !== '全部');
+    const fallbackGroup = getFallbackGroup(remaining);
+
     setSettings((prev) => ({
       ...prev,
       customGroups: (prev.customGroups ?? []).filter((g) => g !== name),
+      hiddenDefaultGroups: isDefault
+        ? Array.from(new Set([...(prev.hiddenDefaultGroups ?? []), name]))
+        : prev.hiddenDefaultGroups,
     }));
     setChannels((prev) =>
-      prev.map((c) => (c.group === name ? { ...c, group: '综合' } : c))
+      prev.map((c) => (c.group === name ? { ...c, group: fallbackGroup } : c))
     );
+  }, []);
+
+  const handleRenameGroup = useCallback((oldName: string, nextNameRaw: string) => {
+    const nextName = nextNameRaw.trim().slice(0, 12);
+    if (!oldName || oldName === '全部' || !nextName || nextName === '全部' || oldName === nextName) {
+      return;
+    }
+    setSettings((prev) => {
+      const oldIsDefault = DEFAULT_GROUPS.includes(oldName);
+      const nextIsDefault = DEFAULT_GROUPS.includes(nextName);
+      let nextHidden = [...(prev.hiddenDefaultGroups ?? [])];
+      let nextCustom = [...(prev.customGroups ?? [])];
+
+      if (oldIsDefault) {
+        if (!nextHidden.includes(oldName)) nextHidden.push(oldName);
+        if (nextIsDefault) {
+          nextHidden = nextHidden.filter((g) => g !== nextName);
+        } else if (!nextCustom.includes(nextName)) {
+          nextCustom.push(nextName);
+        }
+      } else {
+        if (nextIsDefault) {
+          nextCustom = nextCustom.filter((g) => g !== oldName);
+          nextHidden = nextHidden.filter((g) => g !== nextName);
+        } else {
+          const idx = nextCustom.indexOf(oldName);
+          if (idx !== -1) {
+            nextCustom[idx] = nextName;
+            nextCustom = Array.from(new Set(nextCustom));
+          } else if (!nextCustom.includes(nextName)) {
+            nextCustom.push(nextName);
+          }
+        }
+      }
+
+      return {
+        ...prev,
+        customGroups: nextCustom,
+        hiddenDefaultGroups: nextHidden,
+      };
+    });
+    setChannels((prev) =>
+      prev.map((c) => (c.group === oldName ? { ...c, group: nextName } : c))
+    );
+  }, []);
+
+  const handleRestoreDefaultGroups = useCallback(() => {
+    setSettings((prev) => ({
+      ...prev,
+      hiddenDefaultGroups: [],
+    }));
   }, []);
 
   const handleImportChannels = useCallback(
@@ -625,6 +793,13 @@ export function App() {
 
   const handleClearPane = useCallback((slotIndex: number) => {
     setMaximizedSlotIndex((cur) => (cur === slotIndex ? null : cur));
+    setFullscreenSlotIndex((cur) => {
+      if (cur === slotIndex) {
+        void window.livehub?.setWindowFullScreen?.(false);
+        return null;
+      }
+      return cur;
+    });
     setSettings((prev) => ({
       ...prev,
       soloSlotIndex: prev.soloSlotIndex === slotIndex ? null : prev.soloSlotIndex,
@@ -669,12 +844,24 @@ export function App() {
       if (cur === toSlot) return fromSlot;
       return cur;
     });
+    setFullscreenSlotIndex((cur) => {
+      if (cur === fromSlot) return toSlot;
+      if (cur === toSlot) return fromSlot;
+      return cur;
+    });
     setActiveSlotIndex(toSlot);
   }, []);
 
   const handleChangeLayout = useCallback((layout: LayoutMode) => {
     const nextCount = LAYOUT_CONFIGS[layout].count;
     setMaximizedSlotIndex((cur) => (cur !== null && cur >= nextCount ? null : cur));
+    setFullscreenSlotIndex((cur) => {
+      if (cur !== null && cur >= nextCount) {
+        void window.livehub?.setWindowFullScreen?.(false);
+        return null;
+      }
+      return cur;
+    });
     setActiveSlotIndex((cur) => (cur >= nextCount ? 0 : cur));
     setSettings((prev) => ({
       ...prev,
@@ -693,6 +880,17 @@ export function App() {
 
   const handleToggleMaximize = useCallback((slotIndex: number) => {
     setMaximizedSlotIndex((cur) => (cur === slotIndex ? null : slotIndex));
+    setActiveSlotIndex(slotIndex);
+  }, []);
+
+  const handleToggleFullscreen = useCallback((slotIndex: number) => {
+    setFullscreenSlotIndex((cur) => {
+      const next = cur === slotIndex ? null : slotIndex;
+      if (typeof window.livehub?.setWindowFullScreen === 'function') {
+        void window.livehub.setWindowFullScreen(next !== null);
+      }
+      return next;
+    });
     setActiveSlotIndex(slotIndex);
   }, []);
 
@@ -790,6 +988,14 @@ export function App() {
           setLoginModalOpen(false);
           return;
         }
+        if (fullscreenSlotIndex !== null) {
+          e.preventDefault();
+          setFullscreenSlotIndex(null);
+          if (typeof window.livehub?.setWindowFullScreen === 'function') {
+            void window.livehub.setWindowFullScreen(false);
+          }
+          return;
+        }
         if (maximizedSlotIndex !== null && !document.fullscreenElement) {
           setMaximizedSlotIndex(null);
           return;
@@ -831,10 +1037,14 @@ export function App() {
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [loginModalOpen, maximizedSlotIndex, handleToggleSolo, handleToggleMute]);
+  }, [loginModalOpen, fullscreenSlotIndex, maximizedSlotIndex, handleToggleSolo, handleToggleMute]);
 
   return (
-    <div className={`app-shell ${hydrated ? 'is-ready' : ''}`}>
+    <div
+      className={`app-shell ${hydrated ? 'is-ready' : ''} ${
+        fullscreenSlotIndex !== null ? 'is-player-fullscreen' : ''
+      }`}
+    >
       <div className="ambient-aurora" aria-hidden="true">
         <span className="aurora-orb orb-1" />
         <span className="aurora-orb orb-2" />
@@ -903,6 +1113,7 @@ export function App() {
           <Sidebar
             channels={channels}
             customGroups={settings.customGroups ?? []}
+            hiddenDefaultGroups={settings.hiddenDefaultGroups ?? []}
             channelSortMode={settings.channelSortMode ?? 'live'}
             authStatus={authStatus}
             playingChannelIds={playingChannelIds}
@@ -917,6 +1128,8 @@ export function App() {
             onRenameChannel={handleRenameChannel}
             onAddGroup={handleAddGroup}
             onRemoveGroup={handleRemoveGroup}
+            onRenameGroup={handleRenameGroup}
+            onRestoreDefaultGroups={handleRestoreDefaultGroups}
             onOpenChannel={openChannelSmart}
             onLoginPlatform={handleLoginPlatform}
             onOpenLoginModal={() => setLoginModalOpen(true)}
@@ -931,9 +1144,12 @@ export function App() {
           channels={channels}
           activeSlotIndex={activeSlotIndex}
           maximizedSlotIndex={maximizedSlotIndex}
+          fullscreenSlotIndex={fullscreenSlotIndex}
           webviewPreloadPath={webviewPreloadPath}
           onSelectPane={setActiveSlotIndex}
           onToggleMaximize={handleToggleMaximize}
+          onToggleFullscreen={handleToggleFullscreen}
+          onDetectedCategory={handleDetectedCategory}
           onChangeSplitRatios={handleChangeSplitRatios}
           onLoadUrlInPane={loadUrlInPane}
           onLoadChannelInPane={loadChannelInPane}

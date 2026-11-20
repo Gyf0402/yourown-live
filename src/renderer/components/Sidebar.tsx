@@ -7,15 +7,20 @@ import {
   Play,
   Plus,
   RefreshCw,
+  RotateCcw,
   Search,
+  Sparkles,
   Star,
   Trash2,
   X,
 } from 'lucide-react';
 import {
-  DEFAULT_GROUPS,
+  AUTO_GROUP_VALUE,
   PLATFORM_LIST,
   PLATFORMS,
+  getFallbackGroup,
+  getVisibleGroups,
+  matchChannelGroup,
   parseLiveInput,
 } from '../../shared/platforms';
 import type {
@@ -29,6 +34,7 @@ import type {
 interface SidebarProps {
   channels: Channel[];
   customGroups: string[];
+  hiddenDefaultGroups: string[];
   channelSortMode: ChannelSortMode;
   authStatus: AuthStatusMap;
   playingChannelIds: Set<string>;
@@ -47,6 +53,8 @@ interface SidebarProps {
   onRenameChannel: (id: string, name: string, group?: string) => void;
   onAddGroup: (name: string) => void;
   onRemoveGroup: (name: string) => void;
+  onRenameGroup: (oldName: string, newName: string) => void;
+  onRestoreDefaultGroups: () => void;
   onOpenChannel: (channel: Channel) => void;
   onLoginPlatform: (platform: PlatformId) => void;
   onOpenLoginModal: () => void;
@@ -62,6 +70,7 @@ const STATUS_SORT_RANK: Record<string, number> = {
 export function Sidebar({
   channels,
   customGroups,
+  hiddenDefaultGroups,
   channelSortMode,
   authStatus,
   playingChannelIds,
@@ -76,6 +85,8 @@ export function Sidebar({
   onRenameChannel,
   onAddGroup,
   onRemoveGroup,
+  onRenameGroup,
+  onRestoreDefaultGroups,
   onOpenChannel,
   onLoginPlatform,
   onOpenLoginModal,
@@ -83,7 +94,7 @@ export function Sidebar({
   const [rawInput, setRawInput] = useState('');
   const [customName, setCustomName] = useState('');
   const [selectedPlatform, setSelectedPlatform] = useState<PlatformId | 'auto'>('auto');
-  const [selectedGroup, setSelectedGroup] = useState('综合');
+  const [selectedGroup, setSelectedGroup] = useState(AUTO_GROUP_VALUE);
   const [activeGroupFilter, setActiveGroupFilter] = useState('全部');
   const [searchQuery, setSearchQuery] = useState('');
   const [pendingRoomId, setPendingRoomId] = useState<string | null>(null);
@@ -94,6 +105,8 @@ export function Sidebar({
   const [editingGroup, setEditingGroup] = useState('综合');
   const [addingGroup, setAddingGroup] = useState(false);
   const [newGroupName, setNewGroupName] = useState('');
+  const [editingGroupTab, setEditingGroupTab] = useState<string | null>(null);
+  const [editingGroupTabValue, setEditingGroupTabValue] = useState('');
   const [onlyLiveFilter, setOnlyLiveFilter] = useState(false);
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<{ id: string; pos: 'before' | 'after' } | null>(null);
@@ -107,19 +120,13 @@ export function Sidebar({
     [channels, liveStatuses]
   );
 
-  const groups = useMemo(() => {
-    const set = new Set<string>(DEFAULT_GROUPS);
-    customGroups.forEach((g) => {
-      if (g && g !== '全部') set.add(g);
-    });
-    channels.forEach((ch) => {
-      if (ch.group) set.add(ch.group);
-    });
-    return Array.from(set);
-  }, [channels, customGroups]);
+  const groups = useMemo(
+    () => getVisibleGroups(customGroups, hiddenDefaultGroups, channels),
+    [channels, customGroups, hiddenDefaultGroups]
+  );
 
   const selectableGroups = useMemo(() => groups.filter((g) => g !== '全部'), [groups]);
-  const defaultGroupSet = useMemo(() => new Set<string>(DEFAULT_GROUPS), []);
+  const fallbackGroup = useMemo(() => getFallbackGroup(selectableGroups), [selectableGroups]);
 
   const filteredChannels = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -157,7 +164,8 @@ export function Sidebar({
     platform: PlatformId,
     roomId: string,
     url: string,
-    suggestedName?: string
+    suggestedName?: string,
+    suggestedCategory?: string
   ) => {
     const existing = channels.find(
       (c) => c.platform === platform && c.roomId.toLowerCase() === roomId.toLowerCase()
@@ -174,15 +182,28 @@ export function Sidebar({
     const meta = PLATFORMS[platform];
     const displayName =
       customName.trim() || suggestedName || `${meta.shortName} ${roomId}`;
+    const isAutoGroup = selectedGroup === AUTO_GROUP_VALUE;
+    const matchedGroup = isAutoGroup
+      ? matchChannelGroup(
+          {
+            category: suggestedCategory,
+            anchorName: displayName,
+            title: rawInput,
+          },
+          groups
+        ) || fallbackGroup
+      : selectedGroup || fallbackGroup;
+
     const newChannel: Channel = {
       id: `${platform}-${roomId}-${Date.now()}`,
       platform,
       roomId,
       name: displayName,
-      group: selectedGroup || '综合',
+      group: matchedGroup,
       url,
       pinned: false,
       remarkLocked: Boolean(customName.trim()),
+      groupLocked: !isAutoGroup,
       createdAt: Date.now(),
     };
     onAddChannel(newChannel, true);
@@ -197,10 +218,22 @@ export function Sidebar({
     if (name && name !== '全部') {
       onAddGroup(name);
       setActiveGroupFilter(name);
-      setSelectedGroup(name);
     }
     setNewGroupName('');
     setAddingGroup(false);
+  };
+
+  const commitRenameGroupTab = () => {
+    if (!editingGroupTab) return;
+    const oldName = editingGroupTab;
+    const nextName = editingGroupTabValue.trim().slice(0, 12);
+    if (nextName && nextName !== '全部' && nextName !== oldName) {
+      onRenameGroup(oldName, nextName);
+      if (activeGroupFilter === oldName) setActiveGroupFilter(nextName);
+      if (selectedGroup === oldName) setSelectedGroup(nextName);
+    }
+    setEditingGroupTab(null);
+    setEditingGroupTabValue('');
   };
 
   const resolveAndCommitDouyu = async (raw: string, fallback?: PlatformId) => {
@@ -209,7 +242,13 @@ export function Sidebar({
     try {
       const resolved = await window.livehub.resolveLiveInput(raw, fallback);
       if (resolved.ok && resolved.platform && resolved.roomId && resolved.url) {
-        commitAdd(resolved.platform, resolved.roomId, resolved.url, resolved.suggestedName);
+        commitAdd(
+          resolved.platform,
+          resolved.roomId,
+          resolved.url,
+          resolved.suggestedName,
+          resolved.suggestedCategory
+        );
         return;
       }
       setHint(resolved.reason || '无法识别该斗鱼房间');
@@ -244,7 +283,8 @@ export function Sidebar({
             resolved.platform,
             resolved.roomId,
             resolved.url,
-            resolved.suggestedName
+            resolved.suggestedName,
+            resolved.suggestedCategory
           );
           return;
         }
@@ -347,9 +387,15 @@ export function Sidebar({
             />
             <select
               className="select-input"
-              value={selectedGroup}
+              value={
+                selectedGroup === AUTO_GROUP_VALUE || selectableGroups.includes(selectedGroup)
+                  ? selectedGroup
+                  : AUTO_GROUP_VALUE
+              }
               onChange={(e) => setSelectedGroup(e.target.value)}
+              title="选择添加后的分组（选「自动分组」将按直播分区自动匹配已有分组）"
             >
+              <option value={AUTO_GROUP_VALUE}>自动分组</option>
               {selectableGroups.map((g) => (
                 <option key={g} value={g}>
                   {g}
@@ -397,29 +443,66 @@ export function Sidebar({
 
         <div className="group-tabs">
           {groups.map((g) => {
-            const isCustom = !defaultGroupSet.has(g);
+            const canEditOrDelete = g !== '全部';
+            const isRenamingThis = editingGroupTab === g;
+            if (isRenamingThis) {
+              return (
+                <input
+                  key={g}
+                  className="group-add-input"
+                  value={editingGroupTabValue}
+                  autoFocus
+                  maxLength={12}
+                  placeholder="分组名..."
+                  onChange={(e) => setEditingGroupTabValue(e.target.value)}
+                  onBlur={commitRenameGroupTab}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      commitRenameGroupTab();
+                    } else if (e.key === 'Escape') {
+                      e.preventDefault();
+                      setEditingGroupTab(null);
+                      setEditingGroupTabValue('');
+                    }
+                  }}
+                />
+              );
+            }
             return (
               <div
                 key={g}
                 className={`group-tab-wrap ${activeGroupFilter === g ? 'active' : ''}`}
               >
                 <button
+                  type="button"
                   className={`group-tab ${activeGroupFilter === g ? 'active' : ''} ${
-                    isCustom ? 'has-close' : ''
+                    canEditOrDelete ? 'has-close' : ''
                   }`}
                   onClick={() => setActiveGroupFilter(g)}
+                  onDoubleClick={(e) => {
+                    if (!canEditOrDelete) return;
+                    e.stopPropagation();
+                    setEditingGroupTab(g);
+                    setEditingGroupTabValue(g);
+                  }}
+                  title={
+                    canEditOrDelete
+                      ? `单击筛选「${g}」，双击重命名分组，点 × 删除`
+                      : '显示全部收藏主播'
+                  }
                 >
                   <span>{g}</span>
-                  {isCustom && (
+                  {canEditOrDelete && (
                     <span
                       className="group-tab-del"
                       role="button"
-                      title={`删除自定义分组「${g}」（主播将归入综合）`}
+                      title={`删除分组「${g}」（该分组下主播将归入其他分组）`}
                       onClick={(e) => {
                         e.stopPropagation();
                         onRemoveGroup(g);
                         if (activeGroupFilter === g) setActiveGroupFilter('全部');
-                        if (selectedGroup === g) setSelectedGroup('综合');
+                        if (selectedGroup === g) setSelectedGroup(AUTO_GROUP_VALUE);
                       }}
                     >
                       <X size={10} />
@@ -455,9 +538,20 @@ export function Sidebar({
               type="button"
               className="group-tab group-add-btn"
               onClick={() => setAddingGroup(true)}
-              title="新建自定义分组"
+              title="新建自定义分组（新添加主播支持按分区自动匹配）"
             >
               <Plus size={11} />
+            </button>
+          )}
+
+          {hiddenDefaultGroups.length > 0 && (
+            <button
+              type="button"
+              className="group-tab group-add-btn"
+              onClick={onRestoreDefaultGroups}
+              title={`恢复已删除的预置分组（${hiddenDefaultGroups.join('、')}）`}
+            >
+              <RotateCcw size={10} />
             </button>
           )}
         </div>
@@ -526,7 +620,7 @@ export function Sidebar({
             const startEditing = () => {
               setEditingId(channel.id);
               setEditingValue(channel.name);
-              setEditingGroup(channel.group || '综合');
+              setEditingGroup(channel.group || fallbackGroup);
             };
 
             const saveEditing = () => {
@@ -654,12 +748,37 @@ export function Sidebar({
                         onChange={(e) => setEditingGroup(e.target.value)}
                         title="修改所属分组"
                       >
+                        {!selectableGroups.includes(editingGroup) && editingGroup && (
+                          <option value={editingGroup}>{editingGroup}</option>
+                        )}
                         {selectableGroups.map((g) => (
                           <option key={g} value={g}>
                             {g}
                           </option>
                         ))}
                       </select>
+                      {liveInfo?.category && liveInfo.category !== editingGroup && (
+                        <button
+                          type="button"
+                          className="channel-auto-group-chip"
+                          title={`自动识别直播分区为「${liveInfo.category}」，点击一键归入此分组`}
+                          onClick={() => {
+                            const suggested =
+                              matchChannelGroup(
+                                {
+                                  category: liveInfo.category,
+                                  title: liveInfo.title,
+                                  anchorName: liveInfo.anchorName || channel.name,
+                                },
+                                groups
+                              ) || liveInfo.category!.slice(0, 12);
+                            setEditingGroup(suggested);
+                          }}
+                        >
+                          <Sparkles size={10} />
+                          <span>{liveInfo.category.slice(0, 8)}</span>
+                        </button>
+                      )}
                     </div>
                   ) : (
                     <div className="channel-name-row">

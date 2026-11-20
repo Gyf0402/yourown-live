@@ -51,6 +51,7 @@ export interface Channel {
   url: string;
   pinned?: boolean;
   remarkLocked?: boolean;
+  groupLocked?: boolean;
   createdAt: number;
 }
 
@@ -87,6 +88,7 @@ export interface AppSettings {
   theme?: ThemeMode;
   channelSortMode?: ChannelSortMode;
   customGroups?: string[];
+  hiddenDefaultGroups?: string[];
   splitRatios?: SplitRatios;
   windowBounds?: WindowBounds;
   bossKeyShortcut: string;
@@ -139,6 +141,7 @@ export interface ResolvedLiveInput {
   roomId?: string;
   url?: string;
   suggestedName?: string;
+  suggestedCategory?: string;
   needsPlatform?: boolean;
   reason?: string;
 }
@@ -158,6 +161,7 @@ export interface DirectStreamResult {
   status: 'live' | 'offline' | 'error';
   title?: string;
   anchorName?: string;
+  category?: string;
   flvUrl?: string;
   hlsUrl?: string;
   referer: string;
@@ -188,6 +192,7 @@ export interface LiveRoomStatus {
   status: LiveStatusState;
   title?: string;
   anchorName?: string;
+  category?: string;
   checkedAt: number;
 }
 
@@ -195,6 +200,7 @@ export interface LiveHubAPI {
   loadState: () => Promise<PersistedState>;
   saveState: (state: PersistedState) => Promise<void>;
   setAlwaysOnTop: (flag: boolean) => Promise<boolean>;
+  setWindowFullScreen: (flag: boolean) => Promise<boolean>;
   toggleBossHide: () => Promise<boolean>;
   setBossKeyShortcut: (shortcut: string) => Promise<{ ok: boolean; error?: string }>;
   openPlatformLogin: (platform: PlatformId) => Promise<void>;
@@ -228,4 +234,5 @@ export interface LiveHubAPI {
   onDiagnosticLog: (callback: (entry: DiagnosticLogEntry) => void) => () => void;
   onTrayAction: (callback: (action: 'toggle-mute' | 'open-settings') => void) => () => void;
   onBeforeWindowClose: (callback: () => void) => () => void;
+  onWindowFullScreenChanged: (callback: (isFullScreen: boolean) => void) => () => void;
 }

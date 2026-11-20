@@ -15,6 +15,8 @@ const api: LiveHubAPI = {
   loadState: () => ipcRenderer.invoke('livehub:load-state'),
   saveState: (state: PersistedState) => ipcRenderer.invoke('livehub:save-state', state),
   setAlwaysOnTop: (flag: boolean) => ipcRenderer.invoke('livehub:set-always-on-top', flag),
+  setWindowFullScreen: (flag: boolean) =>
+    ipcRenderer.invoke('livehub:set-window-fullscreen', flag),
   toggleBossHide: () => ipcRenderer.invoke('livehub:toggle-boss-hide'),
   setBossKeyShortcut: (shortcut: string) =>
     ipcRenderer.invoke('livehub:set-boss-key', shortcut),
@@ -113,6 +115,15 @@ const api: LiveHubAPI = {
     ipcRenderer.on('livehub:before-close', listener);
     return () => {
       ipcRenderer.removeListener('livehub:before-close', listener);
+    };
+  },
+  onWindowFullScreenChanged: (callback: (isFullScreen: boolean) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, isFullScreen: boolean) => {
+      callback(isFullScreen);
+    };
+    ipcRenderer.on('livehub:fullscreen-changed', listener);
+    return () => {
+      ipcRenderer.removeListener('livehub:fullscreen-changed', listener);
     };
   },
 };

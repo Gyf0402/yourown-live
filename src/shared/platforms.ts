@@ -73,6 +73,150 @@ export const LAYOUT_CONFIGS: Record<
 };
 
 export const DEFAULT_GROUPS = ['全部', 'LOL', '王者', '户外', '娱乐', '综合'];
+export const AUTO_GROUP_VALUE = '__auto__';
+
+export function getVisibleGroups(
+  customGroups: string[] = [],
+  hiddenDefaultGroups: string[] = [],
+  channels: Channel[] = []
+): string[] {
+  const hiddenSet = new Set(hiddenDefaultGroups.filter((g) => g && g !== '全部'));
+  const set = new Set<string>(['全部']);
+  for (const g of DEFAULT_GROUPS) {
+    if (g !== '全部' && !hiddenSet.has(g)) {
+      set.add(g);
+    }
+  }
+  for (const g of customGroups) {
+    if (g && g !== '全部') {
+      set.add(g);
+    }
+  }
+  for (const ch of channels) {
+    if (ch.group && ch.group !== '全部' && !hiddenSet.has(ch.group)) {
+      set.add(ch.group);
+    }
+  }
+  return Array.from(set);
+}
+
+export function getFallbackGroup(selectableGroups: string[]): string {
+  if (selectableGroups.includes('综合')) return '综合';
+  return selectableGroups[0] || '未分组';
+}
+
+const GROUP_SYNONYM_RULES: Array<{ groupAliases: RegExp; contentPatterns: RegExp }> = [
+  {
+    groupAliases: /^(lol|英雄联盟|lpl|联盟)$/i,
+    contentPatterns: /(英雄联盟|\blol\b|\blpl\b|\blck\b|\bmsi\b|云顶之弈|金铲铲|峡谷之巅|召唤师峡谷|世界赛|全球总决赛)/i,
+  },
+  {
+    groupAliases: /^(王者|王者荣耀|kpl|农药)$/i,
+    contentPatterns: /(王者荣耀|\bkpl\b|王者峡谷|巅峰赛|农药)/i,
+  },
+  {
+    groupAliases: /^(户外|生活|美食|旅游|钓鱼)$/i,
+    contentPatterns: /(户外|美食|探店|旅游|旅行|赶海|钓鱼|骑行|自驾|日常|生活分享|运动|健身|萌宠)/i,
+  },
+  {
+    groupAliases: /^(娱乐|星秀|颜值|唱歌|音乐|舞蹈|一起看|影视|脱口秀|聊天)$/i,
+    contentPatterns: /(娱乐|星秀|颜值|唱歌|音乐|歌会|电台|舞蹈|一起看|影视|电影|脱口秀|相声|聊天|交友|配音|助眠)/i,
+  },
+  {
+    groupAliases: /^(dota2?|刀塔)$/i,
+    contentPatterns: /(dota\s*2|dota|刀塔|ti\d+|中单|天梯)/i,
+  },
+  {
+    groupAliases: /^(cs2?|csgo|反恐精英)$/i,
+    contentPatterns: /(\bcs2\b|\bcsgo\b|反恐精英|完美平台|faceit|major)/i,
+  },
+  {
+    groupAliases: /^(瓦|无畏契约|valorant)$/i,
+    contentPatterns: /(无畏契约|valorant|瓦罗兰特|\bvct\b)/i,
+  },
+  {
+    groupAliases: /^(fps|射击|枪战)$/i,
+    contentPatterns: /(\bfps\b|射击|cs2|csgo|无畏契约|valorant|绝地求生|pubg|apex|三角洲|穿越火线|\bcf\b|逃离塔科夫|和平精英|守望先锋|使命召唤|暗区突围)/i,
+  },
+  {
+    groupAliases: /^(吃鸡|pubg|绝地求生|和平精英)$/i,
+    contentPatterns: /(绝地求生|\bpubg\b|和平精英|吃鸡)/i,
+  },
+  {
+    groupAliases: /^(三角洲|三角洲行动)$/i,
+    contentPatterns: /(三角洲行动|三角洲)/i,
+  },
+  {
+    groupAliases: /^(apex)$/i,
+    contentPatterns: /(\bapex\b|apex英雄)/i,
+  },
+  {
+    groupAliases: /^(二次元|虚拟|vtb|vup|虚拟主播)$/i,
+    contentPatterns: /(虚拟主播|虚拟偶像|\bvtuber\b|\bvup\b|二次元|原神|星穹铁道|崩坏|鸣潮|绝区零|明日方舟|碧蓝航线)/i,
+  },
+  {
+    groupAliases: /^(单机|主机|steam|独立游戏)$/i,
+    contentPatterns: /(单机|主机|steam|黑神话|艾尔登|塞尔达|恐怖游戏|我的世界|minecraft|\bgta\b|饥荒|泰拉瑞亚|博德之门|怪物猎人|魂系)/i,
+  },
+  {
+    groupAliases: /^(赛事|比赛|电竞)$/i,
+    contentPatterns: /(游戏赛事|官方赛事|总决赛|\blpl\b|\blck\b|\bkpl\b|major|锦标赛)/i,
+  },
+  {
+    groupAliases: /^(棋牌|麻将|卡牌|桌游)$/i,
+    contentPatterns: /(棋牌|斗地主|麻将|象棋|围棋|炉石传说|三国杀|狼人杀|雀魂|鹅鸭杀)/i,
+  },
+  {
+    groupAliases: /^(体育|足球|篮球|nba)$/i,
+    contentPatterns: /(体育|\bnba\b|足球|篮球|英超|欧冠|中超|网球|乒乓球|羽毛球|f1|斯诺克)/i,
+  },
+];
+
+/**
+ * Match a channel's live zone/category, title, and anchor name against the user's currently active groups.
+ * Returns null if no confident match is found (caller can keep fallback group).
+ */
+export function matchChannelGroup(
+  info: { category?: string; title?: string; anchorName?: string },
+  availableGroups: string[]
+): string | null {
+  const candidates = availableGroups.filter((g) => g && g !== '全部' && g !== '综合' && g !== '未分组');
+  if (candidates.length === 0) return null;
+
+  const category = (info.category || '').trim();
+  const title = (info.title || '').trim();
+  const anchorName = (info.anchorName || '').trim();
+  const combined = [category, title, anchorName].filter(Boolean).join(' ');
+  if (!combined) return null;
+
+  const catLower = category.toLowerCase();
+  const combinedLower = combined.toLowerCase();
+
+  // Tier 1: Exact or direct substring match between live category and an existing group name
+  if (catLower) {
+    const exact = candidates.find((g) => g.toLowerCase() === catLower);
+    if (exact) return exact;
+    const catContainsGroup = candidates.find(
+      (g) => g.length >= 2 && (catLower.includes(g.toLowerCase()) || g.toLowerCase().includes(catLower))
+    );
+    if (catContainsGroup) return catContainsGroup;
+  }
+
+  // Tier 2: Synonym/keyword rules checked against category first (highest precision), then full text
+  for (const text of category ? [category, combined] : [combined]) {
+    for (const rule of GROUP_SYNONYM_RULES) {
+      if (!rule.contentPatterns.test(text)) continue;
+      const matchedGroup = candidates.find((g) => rule.groupAliases.test(g.trim()));
+      if (matchedGroup) return matchedGroup;
+    }
+  }
+
+  // Tier 3: Substring match of a user's custom group name (length >= 2) inside room title or anchor name
+  const titleHit = candidates.find((g) => g.length >= 2 && combinedLower.includes(g.toLowerCase()));
+  if (titleHit) return titleHit;
+
+  return null;
+}
 
 export function buildCanonicalUrl(platform: PlatformId, roomId: string): string {
   const cleanId = roomId.trim().replace(/^\/+/, '');
