@@ -102,10 +102,13 @@ export function DirectPlayer({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const clickTimerRef = useRef<number | null>(null);
   const hudTimerRef = useRef<number | null>(null);
+  const idleTimerRef = useRef<number | null>(null);
+  const controlsHoveredRef = useRef(false);
   const [useHlsFallback, setUseHlsFallback] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   const [localFullscreen, setLocalFullscreen] = useState(false);
   const isFullscreen = onToggleFullscreen ? Boolean(controlledFullscreen) : localFullscreen;
+  const [controlsIdle, setControlsIdle] = useState(false);
   const [liveBadge, setLiveBadge] = useState<string>('FLV');
   const [videoReady, setVideoReady] = useState(false);
   const [dmPanelOpen, setDmPanelOpen] = useState(false);
@@ -136,6 +139,56 @@ export function DirectPlayer({
     }, 1500);
   }, []);
 
+  const scheduleIdleHide = useCallback(() => {
+    if (idleTimerRef.current !== null) {
+      window.clearTimeout(idleTimerRef.current);
+      idleTimerRef.current = null;
+    }
+    if (!isFullscreen) {
+      setControlsIdle(false);
+      return;
+    }
+    idleTimerRef.current = window.setTimeout(() => {
+      idleTimerRef.current = null;
+      if (!controlsHoveredRef.current) {
+        setControlsIdle(true);
+      }
+    }, 2200);
+  }, [isFullscreen]);
+
+  const wakeControls = useCallback(() => {
+    setControlsIdle(false);
+    scheduleIdleHide();
+  }, [scheduleIdleHide]);
+
+  useEffect(() => {
+    if (!isFullscreen) {
+      if (idleTimerRef.current !== null) {
+        window.clearTimeout(idleTimerRef.current);
+        idleTimerRef.current = null;
+      }
+      controlsHoveredRef.current = false;
+      setControlsIdle(false);
+      return;
+    }
+    controlsHoveredRef.current = false;
+    if (isPaused || dmPanelOpen) {
+      if (idleTimerRef.current !== null) {
+        window.clearTimeout(idleTimerRef.current);
+        idleTimerRef.current = null;
+      }
+      setControlsIdle(false);
+      return;
+    }
+    scheduleIdleHide();
+    return () => {
+      if (idleTimerRef.current !== null) {
+        window.clearTimeout(idleTimerRef.current);
+        idleTimerRef.current = null;
+      }
+    };
+  }, [isFullscreen, isPaused, dmPanelOpen, scheduleIdleHide]);
+
   useEffect(() => {
     return () => {
       if (clickTimerRef.current !== null) {
@@ -143,6 +196,9 @@ export function DirectPlayer({
       }
       if (hudTimerRef.current !== null) {
         window.clearTimeout(hudTimerRef.current);
+      }
+      if (idleTimerRef.current !== null) {
+        window.clearTimeout(idleTimerRef.current);
       }
     };
   }, []);
@@ -582,14 +638,23 @@ export function DirectPlayer({
     return () => document.removeEventListener('mousedown', onDown);
   }, [dmPanelOpen]);
 
+  const isIdleHidden = isFullscreen && controlsIdle && !isPaused && !dmPanelOpen;
+
   return (
     <div
       ref={containerRef}
       className={`direct-player-root ${isPaused ? 'is-paused' : ''} ${isFullscreen ? 'is-fullscreen' : ''} ${
-        dmPanelOpen ? 'dm-menu-open' : ''
-      }`}
+        isIdleHidden ? 'is-idle' : ''
+      } ${dmPanelOpen ? 'dm-menu-open' : ''}`}
       tabIndex={0}
+      onMouseMove={() => {
+        if (isFullscreen) wakeControls();
+      }}
+      onMouseDown={() => {
+        if (isFullscreen) wakeControls();
+      }}
       onWheel={(e) => {
+        if (isFullscreen) wakeControls();
         const target = e.target as HTMLElement | null;
         if (target?.closest('.dm-style-popover, .danmaku-chat-panel')) return;
         if (Math.abs(e.deltaY) < 4) return;
@@ -676,6 +741,18 @@ export function DirectPlayer({
 
       <div
         className="direct-controls-bar"
+        onMouseEnter={() => {
+          controlsHoveredRef.current = true;
+          if (idleTimerRef.current !== null) {
+            window.clearTimeout(idleTimerRef.current);
+            idleTimerRef.current = null;
+          }
+          setControlsIdle(false);
+        }}
+        onMouseLeave={() => {
+          controlsHoveredRef.current = false;
+          if (isFullscreen) scheduleIdleHide();
+        }}
         onClick={(e) => e.stopPropagation()}
         onDoubleClick={(e) => e.stopPropagation()}
       >

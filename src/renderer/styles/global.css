@@ -3320,6 +3320,18 @@ html[data-theme='dark'] .stream-loader-track {
   height: 100vh !important;
 }
 
+/* Auto-hide controls & cursor after mouse idle in fullscreen */
+.direct-player-root.is-fullscreen.is-idle,
+.direct-player-root.is-fullscreen.is-idle .direct-video {
+  cursor: none !important;
+}
+
+.direct-player-root.is-fullscreen.is-idle .direct-controls-bar {
+  opacity: 0 !important;
+  transform: translateY(10px) !important;
+  pointer-events: none !important;
+}
+
 /* Subtle close icon on group tabs — clean at rest, crisp on hover */
 .group-tab.has-close .group-tab-del {
   opacity: 0.38;

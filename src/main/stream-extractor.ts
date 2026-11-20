@@ -673,7 +673,7 @@ async function extractBilibili(
   liveSession: Session
 ): Promise<DirectStreamResult> {
   const referer = `https://live.bilibili.com/${req.roomId}`;
-  const targetQn = req.qualityId || (req.autoHighestQuality !== false ? '10000' : '400');
+  const targetQn = req.qualityId || (req.autoHighestQuality !== false ? '30000' : '400');
 
   // Step 1: Ensure live session cookies (SESSDATA/buvid3/LIVE_BUVID), resolve real long room_id, and fetch WBI keys in parallel.
   // Using liveSession.fetch() uses real Chromium TLS + the full persist:livehub cookie jar (including bili_ticket/_uuid/LIVE_BUVID).
@@ -820,11 +820,22 @@ async function extractBilibili(
     }
   }
 
-  // Rank by highest achieved currentQn first (some Bilibili 原画/4K rooms only deliver high qn via fmp4 or hevc),
-  // then prefer AVC (H.264) for lowest-CPU Chromium MSE decoding, and prefer fmp4 over ts for HLS.
+  // When user explicitly selects a qualityId, prefer codecs that achieved that exact qn (so switching
+  // down to 150/250/400 isn't overridden by HEVC/AV1 falling back to a higher qn).
+  // Otherwise rank by highest achieved currentQn first, then AVC (lowest CPU) and fmp4 over ts.
+  const requestedQnNum = req.qualityId ? Number(req.qualityId) : NaN;
+  const hasExplicitReqQn = Number.isFinite(requestedQnNum) && requestedQnNum > 0;
   const codecPriority = (c: string) => (c === 'avc' ? 0 : c === 'hevc' ? 1 : c === 'av1' ? 2 : 3);
   const sortBestEntry = (entries: CodecEntry[], preferFmp4: boolean) =>
     [...entries].sort((a, b) => {
+      if (hasExplicitReqQn) {
+        const aExact = a.currentQn === requestedQnNum ? 0 : 1;
+        const bExact = b.currentQn === requestedQnNum ? 0 : 1;
+        if (aExact !== bExact) return aExact - bExact;
+        const aDiff = Math.abs(a.currentQn - requestedQnNum);
+        const bDiff = Math.abs(b.currentQn - requestedQnNum);
+        if (aDiff !== bDiff) return aDiff - bDiff;
+      }
       if (b.currentQn !== a.currentQn) return b.currentQn - a.currentQn;
       if (preferFmp4) {
         const fa = a.formatName === 'fmp4' ? 0 : 1;
@@ -836,10 +847,15 @@ async function extractBilibili(
 
   const flvCodec = sortBestEntry(flvEntries, false)[0];
   const hlsCodec = sortBestEntry(hlsEntries, true)[0];
-  // If HLS (fmp4) achieves a strictly higher quality than FLV (e.g. 原画 10000 on fmp4 vs 超清 250 on flv),
-  // promote HLS as primary and omit the downgraded FLV URL so DirectPlayer plays the crisp stream.
+  // If HLS (fmp4) achieves a better match than FLV (e.g. 原画 10000/2K/4K on fmp4 vs 超清 250 on flv),
+  // promote HLS as primary; never override FLV when FLV already matched the user's explicit qualityId.
+  const flvExactMatch = Boolean(hasExplicitReqQn && flvCodec && flvCodec.currentQn === requestedQnNum);
+  const hlsExactMatch = Boolean(hasExplicitReqQn && hlsCodec && hlsCodec.currentQn === requestedQnNum);
   const useHlsAsPrimary = Boolean(
-    hlsCodec && (!flvCodec || hlsCodec.currentQn > flvCodec.currentQn)
+    hlsCodec &&
+      (!flvCodec ||
+        (hlsExactMatch && !flvExactMatch) ||
+        (!flvExactMatch && hlsCodec.currentQn > flvCodec.currentQn))
   );
   const primary = useHlsAsPrimary ? hlsCodec : flvCodec || hlsCodec;
 
@@ -908,7 +924,7 @@ async function extractBilibili(
     id: String(qn),
     label: descMap.get(qn) || `${qn}P`,
     active: qn === primary.currentQn,
-    locked: !hasSessdata && qn > primary.currentQn,
+    locked: !hasSessdata && qn > Math.max(250, primary.currentQn),
   }));
 
   const lines: StreamOptionItem[] = Array.from({ length: maxLines }, (_, i) => {
