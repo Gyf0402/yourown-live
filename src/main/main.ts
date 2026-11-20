@@ -846,20 +846,20 @@ function createMainWindow(initialState: PersistedState): void {
   });
 
   mainWindow.webContents.on('did-fail-load', (_e, code, desc, url) => {
-    console.error('[PureLive] did-fail-load:', code, desc, url);
+    console.error('[YourOwn Live] did-fail-load:', code, desc, url);
     recordDiagnostic('error', 'window', `页面加载失败 (${code}): ${desc}`);
   });
 
   const devServerUrl = process.env.VITE_DEV_SERVER_URL;
   if (devServerUrl) {
     void mainWindow.loadURL(devServerUrl).catch((err) => {
-      console.error('[PureLive] loadURL failed:', err);
+      console.error('[YourOwn Live] loadURL failed:', err);
     });
   } else {
     void mainWindow
       .loadFile(path.join(__dirname, '../../dist/index.html'))
       .catch((err) => {
-        console.error('[PureLive] loadFile failed:', err);
+        console.error('[YourOwn Live] loadFile failed:', err);
       });
   }
 

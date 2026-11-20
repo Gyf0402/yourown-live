@@ -1,3 +1,4 @@
+// YourOwn Live development runner (Vite + Electron)
 import { spawn } from 'node:child_process';
 import http from 'node:http';
 import path from 'node:path';
