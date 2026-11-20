@@ -48,6 +48,13 @@ import {
   recordDiagnostic,
   subscribeDiagnostics,
 } from './diagnostics';
+import {
+  cancelActiveUpdateDownload,
+  checkForAppUpdates,
+  downloadUpdateAsset,
+  installDownloadedUpdate,
+  openSafeExternalUrl,
+} from './updater';
 
 // Enable hardware video decode + Windows HEVC (MediaFoundation) + GPU rasterization + auto-play
 app.commandLine.appendSwitch(
@@ -643,6 +650,7 @@ function validateSavedBounds(saved?: WindowBounds): WindowBounds {
 async function shutdownAndExit(): Promise<void> {
   if (isQuitting) return;
   isQuitting = true;
+  void cancelActiveUpdateDownload();
 
   if (boundsSaveTimer) {
     clearTimeout(boundsSaveTimer);
@@ -1411,6 +1419,32 @@ async function resolveShortLiveInput(
     chrome: process.versions.chrome,
     userDataPath: app.getPath('userData'),
   }));
+
+  ipcMain.handle('livehub:check-updates', async () => {
+    return checkForAppUpdates();
+  });
+
+  ipcMain.handle('livehub:download-update', async (_event, url: string, fileName: string) => {
+    return downloadUpdateAsset(url, fileName, (progress) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('livehub:update-download-progress', progress);
+      }
+    });
+  });
+
+  ipcMain.handle('livehub:cancel-update-download', async () => {
+    await cancelActiveUpdateDownload();
+  });
+
+  ipcMain.handle('livehub:install-downloaded-update', async (_event, filePath: string) => {
+    return installDownloadedUpdate(filePath, () => {
+      void shutdownAndExit();
+    });
+  });
+
+  ipcMain.handle('livehub:open-external-url', async (_event, url: string) => {
+    return openSafeExternalUrl(url);
+  });
 
   createMainWindow(initialState);
   createTray();

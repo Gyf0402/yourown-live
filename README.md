@@ -86,6 +86,8 @@
 - **`YourOwn-Live-*-win-x64-Setup.exe`**：Windows 安装版（支持自定义目录与桌面快捷方式）
 - **`YourOwn-Live-*-win-x64-Portable.zip`**：Windows 绿色免安装版（解压后双击 `YourOwn Live.exe` 即可运行）
 
+> 🔄 **内置检查更新 & 无损升级**：客户端启动后会自动静默检查新版本，也可在「设置中心 → 检查更新」手动检测并在应用内一键下载安装；收藏主播、分组、设置与四平台登录态均独立存储在 `%APPDATA%\yourown-live\`，覆盖安装或解压替换均不会丢失数据。
+
 ---
 
 ## 🛠️ 从源码运行与打包

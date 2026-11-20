@@ -89,6 +89,7 @@ export interface AppSettings {
   channelSortMode?: ChannelSortMode;
   customGroups?: string[];
   hiddenDefaultGroups?: string[];
+  ignoredUpdateVersion?: string;
   splitRatios?: SplitRatios;
   windowBounds?: WindowBounds;
   bossKeyShortcut: string;
@@ -196,6 +197,38 @@ export interface LiveRoomStatus {
   checkedAt: number;
 }
 
+export interface UpdateAssetInfo {
+  name: string;
+  url: string;
+  size: number;
+}
+
+export interface AppUpdateCheckResult {
+  ok: boolean;
+  currentVersion: string;
+  latestVersion?: string;
+  hasUpdate: boolean;
+  releaseName?: string;
+  releaseNotes?: string;
+  publishedAt?: string;
+  releaseUrl: string;
+  installerAsset?: UpdateAssetInfo;
+  portableAsset?: UpdateAssetInfo;
+  isPortableInstall?: boolean;
+  error?: string;
+}
+
+export interface UpdateDownloadProgress {
+  phase: 'idle' | 'downloading' | 'completed' | 'cancelled' | 'error';
+  percent: number;
+  downloadedBytes: number;
+  totalBytes: number;
+  speedBytesPerSec: number;
+  fileName?: string;
+  filePath?: string;
+  error?: string;
+}
+
 export interface LiveHubAPI {
   loadState: () => Promise<PersistedState>;
   saveState: (state: PersistedState) => Promise<void>;
@@ -225,6 +258,14 @@ export interface LiveHubAPI {
   getDiagnostics: () => Promise<DiagnosticLogEntry[]>;
   clearDiagnostics: () => Promise<void>;
   getAppInfo: () => Promise<{ version: string; electron: string; chrome: string; userDataPath: string }>;
+  checkForUpdates: () => Promise<AppUpdateCheckResult>;
+  downloadUpdate: (
+    url: string,
+    fileName: string
+  ) => Promise<{ ok: boolean; filePath?: string; cancelled?: boolean; error?: string }>;
+  cancelUpdateDownload: () => Promise<void>;
+  installDownloadedUpdate: (filePath: string) => Promise<{ ok: boolean; error?: string }>;
+  openExternalUrl: (url: string) => Promise<boolean>;
   onBossKeyTriggered: (callback: (hidden: boolean) => void) => () => void;
   onAuthStatusChanged: (
     callback: (payload: { status: AuthStatusMap; changedPlatform?: PlatformId }) => void
@@ -235,4 +276,5 @@ export interface LiveHubAPI {
   onTrayAction: (callback: (action: 'toggle-mute' | 'open-settings') => void) => () => void;
   onBeforeWindowClose: (callback: () => void) => () => void;
   onWindowFullScreenChanged: (callback: (isFullScreen: boolean) => void) => () => void;
+  onUpdateDownloadProgress: (callback: (progress: UpdateDownloadProgress) => void) => () => void;
 }

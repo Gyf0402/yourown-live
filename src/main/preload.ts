@@ -9,6 +9,7 @@ import type {
   LiveStatusCheckItem,
   PersistedState,
   PlatformId,
+  UpdateDownloadProgress,
 } from '../shared/types';
 
 const api: LiveHubAPI = {
@@ -46,6 +47,13 @@ const api: LiveHubAPI = {
   getDiagnostics: () => ipcRenderer.invoke('livehub:get-diagnostics'),
   clearDiagnostics: () => ipcRenderer.invoke('livehub:clear-diagnostics'),
   getAppInfo: () => ipcRenderer.invoke('livehub:get-app-info'),
+  checkForUpdates: () => ipcRenderer.invoke('livehub:check-updates'),
+  downloadUpdate: (url: string, fileName: string) =>
+    ipcRenderer.invoke('livehub:download-update', url, fileName),
+  cancelUpdateDownload: () => ipcRenderer.invoke('livehub:cancel-update-download'),
+  installDownloadedUpdate: (filePath: string) =>
+    ipcRenderer.invoke('livehub:install-downloaded-update', filePath),
+  openExternalUrl: (url: string) => ipcRenderer.invoke('livehub:open-external-url', url),
   onBossKeyTriggered: (callback: (hidden: boolean) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, hidden: boolean) => {
       callback(hidden);
@@ -124,6 +132,15 @@ const api: LiveHubAPI = {
     ipcRenderer.on('livehub:fullscreen-changed', listener);
     return () => {
       ipcRenderer.removeListener('livehub:fullscreen-changed', listener);
+    };
+  },
+  onUpdateDownloadProgress: (callback: (progress: UpdateDownloadProgress) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, progress: UpdateDownloadProgress) => {
+      callback(progress);
+    };
+    ipcRenderer.on('livehub:update-download-progress', listener);
+    return () => {
+      ipcRenderer.removeListener('livehub:update-download-progress', listener);
     };
   },
 };

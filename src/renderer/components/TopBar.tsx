@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import {
+  ArrowUpCircle,
   EyeOff,
   KeyRound,
   MessageSquare,
@@ -46,6 +47,8 @@ interface TopBarProps {
   onCycleTheme: () => void;
   onBossHide: () => void;
   onOpenLoginModal: () => void;
+  availableUpdateVersion?: string | null;
+  onOpenUpdateModal: () => void;
 }
 
 const LAYOUT_ORDER: LayoutMode[] = ['1x1', '1x2', '2x1', '1+2', '2x2'];
@@ -75,6 +78,8 @@ export function TopBar({
   onCycleTheme,
   onBossHide,
   onOpenLoginModal,
+  availableUpdateVersion,
+  onOpenUpdateModal,
 }: TopBarProps) {
   const loggedInCount = PLATFORM_LIST.filter((p) => authStatus[p.id]?.loggedIn).length;
   const [dmMenuOpen, setDmMenuOpen] = useState(false);
@@ -244,10 +249,21 @@ export function TopBar({
           <span>老板键 ({settings.bossKeyShortcut || 'Alt+X'})</span>
         </button>
 
+        {availableUpdateVersion && (
+          <button
+            className="icon-btn update-available-pill"
+            onClick={onOpenUpdateModal}
+            title={`发现新版本 v${availableUpdateVersion}，点击查看更新日志并一键下载安装`}
+          >
+            <ArrowUpCircle size={14} />
+            <span>新版本 v{availableUpdateVersion}</span>
+          </button>
+        )}
+
         <button
           className={`icon-btn ${loggedInCount > 0 ? 'active' : 'warning active'}`}
           onClick={onOpenLoginModal}
-          title="四平台账号登录、收藏备份与连接诊断"
+          title="四平台账号登录、收藏备份、检查更新与连接诊断"
         >
           <span className={`auth-dot ${loggedInCount > 0 ? 'online' : ''}`} />
           <KeyRound size={14} />

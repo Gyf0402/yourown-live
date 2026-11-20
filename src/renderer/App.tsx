@@ -11,6 +11,7 @@ import {
 } from '../shared/platforms';
 import type {
   AppSettings,
+  AppUpdateCheckResult,
   AuthStatusMap,
   Channel,
   ChannelSortMode,
@@ -29,6 +30,7 @@ import { LoginModal } from './components/LoginModal';
 import { Sidebar } from './components/Sidebar';
 import { SplitGrid } from './components/SplitGrid';
 import { TopBar } from './components/TopBar';
+import { UpdateModal } from './components/UpdateModal';
 
 const DEFAULT_AUTH_STATUS: AuthStatusMap = {
   huya: { loggedIn: false },
@@ -100,6 +102,10 @@ export function App() {
   const [fullscreenSlotIndex, setFullscreenSlotIndex] = useState<number | null>(null);
   const [webviewPreloadPath, setWebviewPreloadPath] = useState('');
   const [loginModalOpen, setLoginModalOpen] = useState(false);
+  const [updateModalOpen, setUpdateModalOpen] = useState(false);
+  const [updateInfo, setUpdateInfo] = useState<AppUpdateCheckResult | null>(null);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const checkingUpdateRef = useRef(false);
   const [hydrated, setHydrated] = useState(false);
   const [splashStage, setSplashStage] = useState<'visible' | 'leaving' | 'gone'>('visible');
   const [liveStatuses, setLiveStatuses] = useState<Record<string, LiveRoomStatus>>({});
@@ -973,6 +979,44 @@ export function App() {
     }));
   }, []);
 
+  const handleCheckUpdate = useCallback(async (): Promise<AppUpdateCheckResult | null> => {
+    if (checkingUpdateRef.current || typeof window.livehub?.checkForUpdates !== 'function') {
+      return null;
+    }
+    checkingUpdateRef.current = true;
+    setCheckingUpdate(true);
+    try {
+      const res = await window.livehub.checkForUpdates();
+      setUpdateInfo(res);
+      return res;
+    } catch {
+      return null;
+    } finally {
+      checkingUpdateRef.current = false;
+      setCheckingUpdate(false);
+    }
+  }, []);
+
+  const handleIgnoreUpdateVersion = useCallback((version: string) => {
+    setSettings((prev) => ({ ...prev, ignoredUpdateVersion: version }));
+  }, []);
+
+  // Silent background update check shortly after launch (never blocks startup or pops up abruptly)
+  useEffect(() => {
+    if (!hydrated || typeof window.livehub?.checkForUpdates !== 'function') return;
+    const timer = window.setTimeout(() => {
+      void handleCheckUpdate();
+    }, 5000);
+    return () => window.clearTimeout(timer);
+  }, [hydrated, handleCheckUpdate]);
+
+  const availableUpdateVersion =
+    updateInfo?.hasUpdate &&
+    updateInfo.latestVersion &&
+    updateInfo.latestVersion !== settings.ignoredUpdateVersion
+      ? updateInfo.latestVersion
+      : null;
+
   // Global keyboard shortcuts: 1-4 solo, M mute active, R reload active, Tab cycle pane, Esc restore/close
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -984,6 +1028,10 @@ export function App() {
       }
 
       if (e.key === 'Escape') {
+        if (updateModalOpen) {
+          setUpdateModalOpen(false);
+          return;
+        }
         if (loginModalOpen) {
           setLoginModalOpen(false);
           return;
@@ -1003,7 +1051,7 @@ export function App() {
         return;
       }
 
-      if (loginModalOpen) return;
+      if (loginModalOpen || updateModalOpen) return;
 
       const visibleCount = LAYOUT_CONFIGS[settingsRef.current.layout].count;
       if (e.key >= '1' && e.key <= '4') {
@@ -1037,7 +1085,7 @@ export function App() {
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [loginModalOpen, fullscreenSlotIndex, maximizedSlotIndex, handleToggleSolo, handleToggleMute]);
+  }, [loginModalOpen, updateModalOpen, fullscreenSlotIndex, maximizedSlotIndex, handleToggleSolo, handleToggleMute]);
 
   return (
     <div
@@ -1106,6 +1154,11 @@ export function App() {
         onCycleTheme={handleCycleTheme}
         onBossHide={() => void window.livehub.toggleBossHide()}
         onOpenLoginModal={() => setLoginModalOpen(true)}
+        availableUpdateVersion={availableUpdateVersion}
+        onOpenUpdateModal={() => {
+          setLoginModalOpen(false);
+          setUpdateModalOpen(true);
+        }}
       />
 
       <div className={`workspace ${settings.sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
@@ -1176,12 +1229,31 @@ export function App() {
           authStatus={authStatus}
           channels={channels}
           customGroups={settings.customGroups ?? []}
+          updateInfo={updateInfo}
+          checkingUpdate={checkingUpdate}
+          onCheckUpdate={handleCheckUpdate}
+          onOpenUpdateModal={() => {
+            setLoginModalOpen(false);
+            setUpdateModalOpen(true);
+          }}
           onClose={() => setLoginModalOpen(false)}
           onUpdateBossKey={handleUpdateBossKey}
           onRefreshAuth={handleRefreshAuth}
           onClearPlatformCookies={handleClearPlatformCookies}
           onReloadAllPanes={handleReloadAllPanes}
           onImportChannels={handleImportChannels}
+        />
+      )}
+
+      {updateModalOpen && updateInfo && (
+        <UpdateModal
+          updateInfo={updateInfo}
+          checking={checkingUpdate}
+          onClose={() => setUpdateModalOpen(false)}
+          onRecheck={async () => {
+            await handleCheckUpdate();
+          }}
+          onIgnoreVersion={handleIgnoreUpdateVersion}
         />
       )}
     </div>

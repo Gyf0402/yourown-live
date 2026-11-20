@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
+  ArrowUpCircle,
   Copy,
   Download,
   ExternalLink,
@@ -12,6 +13,7 @@ import {
 } from 'lucide-react';
 import { PLATFORM_LIST } from '../../shared/platforms';
 import type {
+  AppUpdateCheckResult,
   AuthStatusMap,
   Channel,
   CodecProbeResult,
@@ -24,6 +26,10 @@ interface LoginModalProps {
   authStatus: AuthStatusMap;
   channels: Channel[];
   customGroups: string[];
+  updateInfo: AppUpdateCheckResult | null;
+  checkingUpdate: boolean;
+  onCheckUpdate: () => Promise<AppUpdateCheckResult | null>;
+  onOpenUpdateModal: () => void;
   onClose: () => void;
   onUpdateBossKey: (shortcut: string) => Promise<{ ok: boolean; error?: string }>;
   onRefreshAuth: () => Promise<void>;
@@ -63,6 +69,10 @@ export function LoginModal({
   authStatus,
   channels,
   customGroups,
+  updateInfo,
+  checkingUpdate,
+  onCheckUpdate,
+  onOpenUpdateModal,
   onClose,
   onUpdateBossKey,
   onRefreshAuth,
@@ -327,6 +337,56 @@ export function LoginModal({
               <button className="primary-btn" onClick={() => void handleSaveShortcut()}>
                 应用
               </button>
+            </div>
+
+            <div className="update-settings-row">
+              <div className="update-settings-info">
+                <span className="update-settings-ver">
+                  当前版本：<strong>v{appInfo?.version || updateInfo?.currentVersion || '0.1.5'}</strong>
+                </span>
+                {updateInfo?.hasUpdate && updateInfo.latestVersion ? (
+                  <span className="update-settings-badge has-update">
+                    发现新版本 v{updateInfo.latestVersion}
+                  </span>
+                ) : updateInfo?.ok ? (
+                  <span className="update-settings-badge up-to-date">已是最新版</span>
+                ) : null}
+              </div>
+              <div style={{ display: 'flex', gap: 6 }}>
+                {updateInfo?.hasUpdate && (
+                  <button
+                    type="button"
+                    className="primary-btn"
+                    style={{ height: 29 }}
+                    onClick={onOpenUpdateModal}
+                  >
+                    <ArrowUpCircle size={13} />
+                    <span>查看更新</span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="icon-btn"
+                  style={{ height: 29 }}
+                  disabled={checkingUpdate}
+                  onClick={() => {
+                    void onCheckUpdate().then((res) => {
+                      if (!res) return;
+                      if (!res.ok) {
+                        setStatusMsg(`检查更新失败：${res.error || '网络异常'}`);
+                      } else if (res.hasUpdate && res.latestVersion) {
+                        setStatusMsg(`发现新版本 v${res.latestVersion}！`);
+                        onOpenUpdateModal();
+                      } else {
+                        setStatusMsg(`当前 v${res.currentVersion} 已是最新版本。`);
+                      }
+                    });
+                  }}
+                >
+                  <RefreshCw size={12} className={checkingUpdate ? 'spin-icon' : ''} />
+                  <span>{checkingUpdate ? '检查中...' : '检查更新'}</span>
+                </button>
+              </div>
             </div>
 
             <div className="info-box">
