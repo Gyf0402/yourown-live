@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import type {
   AuthStatusMap,
+  ChannelPlatform,
   DanmakuMessage,
   DanmakuStatusEvent,
   DiagnosticLogEntry,
@@ -29,7 +30,9 @@ const api: LiveHubAPI = {
   getWebviewPreloadPath: () => ipcRenderer.invoke('livehub:get-webview-preload'),
   wakeWebview: (webContentsId: number, width?: number, height?: number) =>
     ipcRenderer.invoke('livehub:wake-webview', webContentsId, width, height),
-  resolveLiveInput: (rawInput: string, fallbackPlatform?: PlatformId) =>
+  registerFreeWebContents: (webContentsId: number) =>
+    ipcRenderer.invoke('livehub:register-free-web', webContentsId),
+  resolveLiveInput: (rawInput: string, fallbackPlatform?: ChannelPlatform) =>
     ipcRenderer.invoke('livehub:resolve-live-input', rawInput, fallbackPlatform),
   resolveStream: (req: DirectStreamRequest) =>
     ipcRenderer.invoke('livehub:resolve-stream', req),

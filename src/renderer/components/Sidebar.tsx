@@ -16,16 +16,20 @@ import {
 } from 'lucide-react';
 import {
   AUTO_GROUP_VALUE,
+  CHANNEL_PLATFORM_LIST,
   PLATFORM_LIST,
-  PLATFORMS,
+  formatWebUrlLabel,
+  getChannelPlatformMeta,
   getFallbackGroup,
   getVisibleGroups,
+  isLivePlatform,
   matchChannelGroup,
   parseLiveInput,
 } from '../../shared/platforms';
 import type {
   AuthStatusMap,
   Channel,
+  ChannelPlatform,
   ChannelSortMode,
   LiveRoomStatus,
   PlatformId,
@@ -93,7 +97,7 @@ export function Sidebar({
 }: SidebarProps) {
   const [rawInput, setRawInput] = useState('');
   const [customName, setCustomName] = useState('');
-  const [selectedPlatform, setSelectedPlatform] = useState<PlatformId | 'auto'>('auto');
+  const [selectedPlatform, setSelectedPlatform] = useState<ChannelPlatform | 'auto'>('auto');
   const [selectedGroup, setSelectedGroup] = useState(AUTO_GROUP_VALUE);
   const [activeGroupFilter, setActiveGroupFilter] = useState('全部');
   const [searchQuery, setSearchQuery] = useState('');
@@ -111,9 +115,15 @@ export function Sidebar({
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<{ id: string; pos: 'before' | 'after' } | null>(null);
 
+  const liveChannelsTotal = useMemo(
+    () => channels.filter((ch) => isLivePlatform(ch.platform)).length,
+    [channels]
+  );
+
   const liveCount = useMemo(
     () =>
       channels.filter((ch) => {
+        if (!isLivePlatform(ch.platform)) return false;
         const st = liveStatuses[ch.id]?.status;
         return st === 'live' || st === 'replay';
       }).length,
@@ -138,8 +148,14 @@ export function Sidebar({
         ? [...channels]
         : [...channels].sort((a, b) => {
             if (Boolean(a.pinned) !== Boolean(b.pinned)) return a.pinned ? -1 : 1;
-            const rankA = STATUS_SORT_RANK[liveStatuses[a.id]?.status ?? 'unknown'] ?? 2;
-            const rankB = STATUS_SORT_RANK[liveStatuses[b.id]?.status ?? 'unknown'] ?? 2;
+            const rankA =
+              a.platform === 'web'
+                ? 2
+                : (STATUS_SORT_RANK[liveStatuses[a.id]?.status ?? 'unknown'] ?? 2);
+            const rankB =
+              b.platform === 'web'
+                ? 2
+                : (STATUS_SORT_RANK[liveStatuses[b.id]?.status ?? 'unknown'] ?? 2);
             if (rankA !== rankB) return rankA - rankB;
             return (indexMap.get(a.id) ?? 0) - (indexMap.get(b.id) ?? 0);
           });
@@ -147,21 +163,26 @@ export function Sidebar({
     return ordered.filter((ch) => {
       if (activeGroupFilter !== '全部' && ch.group !== activeGroupFilter) return false;
       if (onlyLiveFilter) {
-        const st = liveStatuses[ch.id]?.status;
-        if (st !== 'live' && st !== 'replay') return false;
+        if (ch.platform === 'web') {
+          if (activeGroupFilter !== '网页') return false;
+        } else {
+          const st = liveStatuses[ch.id]?.status;
+          if (st !== 'live' && st !== 'replay') return false;
+        }
       }
       if (!q) return true;
       return (
         ch.name.toLowerCase().includes(q) ||
         ch.roomId.toLowerCase().includes(q) ||
-        PLATFORMS[ch.platform].name.includes(q) ||
+        ch.url.toLowerCase().includes(q) ||
+        getChannelPlatformMeta(ch.platform).name.includes(q) ||
         (liveStatuses[ch.id]?.title || '').toLowerCase().includes(q)
       );
     });
   }, [channels, channelSortMode, activeGroupFilter, searchQuery, liveStatuses, onlyLiveFilter]);
 
   const commitAdd = (
-    platform: PlatformId,
+    platform: ChannelPlatform,
     roomId: string,
     url: string,
     suggestedName?: string,
@@ -179,19 +200,25 @@ export function Sidebar({
       return;
     }
 
-    const meta = PLATFORMS[platform];
+    const meta = getChannelPlatformMeta(platform);
     const displayName =
-      customName.trim() || suggestedName || `${meta.shortName} ${roomId}`;
+      customName.trim() ||
+      suggestedName ||
+      (platform === 'web' ? formatWebUrlLabel(url) : `${meta.shortName} ${roomId}`);
     const isAutoGroup = selectedGroup === AUTO_GROUP_VALUE;
     const matchedGroup = isAutoGroup
-      ? matchChannelGroup(
-          {
-            category: suggestedCategory,
-            anchorName: displayName,
-            title: rawInput,
-          },
-          groups
-        ) || fallbackGroup
+      ? platform === 'web'
+        ? selectableGroups.includes('网页')
+          ? '网页'
+          : fallbackGroup
+        : matchChannelGroup(
+            {
+              category: suggestedCategory,
+              anchorName: displayName,
+              title: rawInput,
+            },
+            groups
+          ) || fallbackGroup
       : selectedGroup || fallbackGroup;
 
     const newChannel: Channel = {
@@ -236,7 +263,7 @@ export function Sidebar({
     setEditingGroupTabValue('');
   };
 
-  const resolveAndCommitDouyu = async (raw: string, fallback?: PlatformId) => {
+  const resolveAndCommitDouyu = async (raw: string, fallback?: ChannelPlatform) => {
     setResolving(true);
     setHint('正在解析斗鱼真实房间号...');
     try {
@@ -334,7 +361,7 @@ export function Sidebar({
             >
               自动
             </button>
-            {PLATFORM_LIST.map((p) => (
+            {CHANNEL_PLATFORM_LIST.map((p) => (
               <button
                 key={p.id}
                 type="button"
@@ -345,7 +372,11 @@ export function Sidebar({
                     : undefined
                 }
                 onClick={() => setSelectedPlatform(p.id)}
-                title={`指定添加 ${p.name} 房间号或链接`}
+                title={
+                  p.id === 'web'
+                    ? '添加任意网页（抖音 / B站 / 小红书等，自动复用应用内登录 Cookie）'
+                    : `指定添加 ${p.name} 房间号或链接`
+                }
               >
                 {p.shortName}
               </button>
@@ -363,15 +394,17 @@ export function Sidebar({
               }}
               placeholder={
                 selectedPlatform === 'auto'
-                  ? '粘贴链接/抖音口令/分享短链'
-                  : `输入${PLATFORMS[selectedPlatform].shortName}房间号或链接`
+                  ? '粘贴直播间 / 任意网址 / 抖音口令'
+                  : selectedPlatform === 'web'
+                    ? '输入任意网址，如 douyin.com / bilibili.com'
+                    : `输入${getChannelPlatformMeta(selectedPlatform).shortName}房间号或链接`
               }
             />
             <button
               type="submit"
               className="primary-btn"
               disabled={resolving}
-              title="添加到收藏并播放"
+              title="添加到收藏并打开"
             >
               <Plus size={14} />
               <span>{resolving ? '解析中' : '添加'}</span>
@@ -383,7 +416,9 @@ export function Sidebar({
               className="text-input"
               value={customName}
               onChange={(e) => setCustomName(e.target.value)}
-              placeholder="主播备注名（可选）"
+              placeholder={
+                selectedPlatform === 'web' ? '网站备注名（可选）' : '主播 / 网站备注名（可选）'
+              }
             />
             <select
               className="select-input"
@@ -565,7 +600,7 @@ export function Sidebar({
           >
             <span className={`live-dot ${liveCount > 0 ? 'live' : 'offline'}`} />
             <span>
-              开播 {liveCount}/{channels.length}
+              开播 {liveCount}/{liveChannelsTotal}
             </span>
             {onlyLiveFilter && <span className="live-filter-tag">仅开播</span>}
           </button>
@@ -606,16 +641,17 @@ export function Sidebar({
           <div style={{ padding: 20, textAlign: 'center', color: 'var(--text-muted)', fontSize: 12 }}>
             {onlyLiveFilter
               ? '当前暂无开播中的收藏主播，点击上方按钮可查看全部'
-              : '暂无匹配主播，粘贴虎牙 / 斗鱼 / B站 / 抖音链接即可加入'}
+              : '暂无匹配收藏，粘贴直播间或任意网址（抖音/B站等）即可加入'}
           </div>
         ) : (
           filteredChannels.map((channel, index) => {
-            const meta = PLATFORMS[channel.platform];
+            const meta = getChannelPlatformMeta(channel.platform);
+            const isWeb = channel.platform === 'web';
             const isPlaying = playingChannelIds.has(channel.id);
             const isEditing = editingId === channel.id;
-            const liveInfo = liveStatuses[channel.id];
-            const liveState = liveInfo?.status ?? 'unknown';
-            const isOffline = liveState === 'offline';
+            const liveInfo = isWeb ? undefined : liveStatuses[channel.id];
+            const liveState = isWeb ? 'unknown' : (liveInfo?.status ?? 'unknown');
+            const isOffline = !isWeb && liveState === 'offline';
 
             const startEditing = () => {
               setEditingId(channel.id);
@@ -809,8 +845,10 @@ export function Sidebar({
                     </div>
                   )}
                   <div className="channel-sub">
-                    <span>#{channel.roomId}</span>
-                    {liveInfo?.title && (liveState === 'live' || liveState === 'replay') ? (
+                    <span className={isWeb ? 'channel-web-host' : undefined}>
+                      {isWeb ? formatWebUrlLabel(channel.url) : `#${channel.roomId}`}
+                    </span>
+                    {!isWeb && liveInfo?.title && (liveState === 'live' || liveState === 'replay') ? (
                       <>
                         <span>·</span>
                         <span className="channel-live-title">{liveInfo.title}</span>
@@ -828,7 +866,7 @@ export function Sidebar({
                           <i />
                           <i />
                         </span>
-                        <span>播放中</span>
+                        <span>{isWeb ? '浏览中' : '播放中'}</span>
                       </span>
                     )}
                   </div>

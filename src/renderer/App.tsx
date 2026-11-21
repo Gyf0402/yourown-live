@@ -2,18 +2,21 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   DEFAULT_GROUPS,
   LAYOUT_CONFIGS,
-  PLATFORMS,
   SAMPLE_CHANNELS,
   detectPlatformFromUrl,
+  getChannelPlatformMeta,
   getFallbackGroup,
   getVisibleGroups,
+  isLivePlatform,
   matchChannelGroup,
+  parseLiveInput,
 } from '../shared/platforms';
 import type {
   AppSettings,
   AppUpdateCheckResult,
   AuthStatusMap,
   Channel,
+  ChannelPlatform,
   ChannelSortMode,
   DanmakuArea,
   DanmakuMode,
@@ -82,7 +85,8 @@ const FALLBACK_SETTINGS: AppSettings = {
 const THEME_CYCLE: ThemeMode[] = ['light', 'dark', 'system'];
 
 function isPlaceholderChannelName(ch: Channel): boolean {
-  const shortName = PLATFORMS[ch.platform].shortName;
+  if (ch.platform === 'web') return false;
+  const shortName = getChannelPlatformMeta(ch.platform).shortName;
   const trimmed = ch.name.trim();
   return (
     trimmed === ch.roomId ||
@@ -144,7 +148,7 @@ export function App() {
           if (!prev.autoHighestQuality) return prev;
           let changed = false;
           const nextPanes = prev.panes.map((p) => {
-            if (p.platform && platformsToReload.includes(p.platform) && p.preferredQualityId) {
+            if (isLivePlatform(p.platform) && platformsToReload.includes(p.platform) && p.preferredQualityId) {
               changed = true;
               return { ...p, preferredQualityId: undefined };
             }
@@ -278,7 +282,10 @@ export function App() {
   }, [channels, settings, hydrated]);
 
   const refreshLiveStatuses = useCallback(async (targetList?: Channel[]) => {
-    const list = targetList ?? channelsRef.current;
+    const rawList = targetList ?? channelsRef.current;
+    const list = rawList.filter((c): c is Channel & { platform: PlatformId } =>
+      isLivePlatform(c.platform)
+    );
     if (
       list.length === 0 ||
       typeof window.livehub?.checkLiveStatuses !== 'function'
@@ -389,8 +396,18 @@ export function App() {
   }, [settings.layout, settings.panes]);
 
   const loadUrlInPane = useCallback(
-    (slotIndex: number, url: string, title?: string, channelId: string | null = null) => {
-      const platform = detectPlatformFromUrl(url);
+    (
+      slotIndex: number,
+      url: string,
+      title?: string,
+      channelId: string | null = null,
+      explicitPlatform?: ChannelPlatform | null
+    ) => {
+      const parsed = explicitPlatform ? null : parseLiveInput(url);
+      const platform: ChannelPlatform | null =
+        explicitPlatform ??
+        (parsed?.ok ? parsed.platform : (detectPlatformFromUrl(url) ?? 'web'));
+      const platformMeta = platform ? getChannelPlatformMeta(platform) : null;
       setSettings((prev) => {
         const nextPanes = prev.panes.map((p) =>
           p.slotIndex === slotIndex
@@ -399,7 +416,7 @@ export function App() {
                 url,
                 channelId,
                 platform,
-                title: title || (platform ? PLATFORMS[platform].name : '直播间'),
+                title: title || platformMeta?.name || '直播间',
                 preferredQualityId: undefined,
                 preferredLineId: undefined,
               }
@@ -414,7 +431,7 @@ export function App() {
 
   const loadChannelInPane = useCallback(
     (slotIndex: number, channel: Channel) => {
-      loadUrlInPane(slotIndex, channel.url, channel.name, channel.id);
+      loadUrlInPane(slotIndex, channel.url, channel.name, channel.id, channel.platform);
     },
     [loadUrlInPane]
   );
@@ -771,7 +788,13 @@ export function App() {
       patch: Partial<
         Pick<
           PaneSlot,
-          'volume' | 'fitMode' | 'preferredQualityId' | 'preferredLineId' | 'danmakuEnabled'
+          | 'volume'
+          | 'fitMode'
+          | 'preferredQualityId'
+          | 'preferredLineId'
+          | 'danmakuEnabled'
+          | 'webZoom'
+          | 'webUserAgentMode'
         >
       >
     ) => {
@@ -823,6 +846,8 @@ export function App() {
               title: `画面 ${slotIndex + 1}`,
               preferredQualityId: undefined,
               preferredLineId: undefined,
+              webZoom: undefined,
+              webUserAgentMode: undefined,
             }
           : p
       ),

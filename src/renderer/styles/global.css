@@ -359,7 +359,7 @@ select {
 
 .platform-mode-row {
   display: flex;
-  gap: 3px;
+  gap: 2px;
   padding: 3px;
   border-radius: 99px;
   background: var(--bg-glass-track);
@@ -368,9 +368,12 @@ select {
 
 .platform-mode-pill {
   flex: 1;
+  min-width: 0;
   height: 24px;
-  font-size: 11px;
+  padding: 0 2px;
+  font-size: 10.5px;
   font-weight: 500;
+  white-space: nowrap;
   border-radius: 99px;
   border: 1px solid transparent;
   background: transparent;
@@ -3703,4 +3706,272 @@ html[data-theme='dark'] .update-progress-track {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+/* =========================================================
+ * Free-Web Pane & Responsive Webpage Adaptation
+ * ========================================================= */
+.channel-web-host {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 130px;
+}
+
+.pane-wrapper.is-web-pane {
+  background: #ffffff;
+}
+
+.pane-toolbar.web-docked-bar {
+  position: relative;
+  top: 0;
+  left: 0;
+  right: 0;
+  flex-shrink: 0;
+  min-height: 40px;
+  padding: 5px 8px;
+  border-radius: 0;
+  border: none;
+  outline: none;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+  box-shadow: none;
+  background: rgba(248, 250, 252, 0.96);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  opacity: 1;
+  transform: none;
+  flex-wrap: nowrap;
+  gap: 6px;
+  z-index: 15;
+}
+
+.pane-toolbar.web-docked-bar.is-compact {
+  padding: 4px 6px;
+  gap: 4px;
+}
+
+.pane-toolbar.web-docked-bar.is-ultra-compact {
+  padding: 4px 5px;
+  gap: 3px;
+}
+
+.web-bar-left,
+.web-bar-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.pane-toolbar.web-docked-bar.is-ultra-compact .web-bar-left,
+.pane-toolbar.web-docked-bar.is-ultra-compact .web-bar-right {
+  gap: 3px;
+}
+
+.web-drag-handle {
+  padding: 2px 5px;
+  gap: 4px;
+}
+
+.web-icon-btn {
+  width: 26px;
+  padding: 0;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.web-icon-btn:disabled {
+  opacity: 0.34;
+  pointer-events: none;
+}
+
+.web-address-form {
+  flex: 1;
+  min-width: 90px;
+  display: flex;
+  align-items: center;
+  position: relative;
+}
+
+.web-address-icon {
+  position: absolute;
+  left: 8px;
+  color: var(--text-muted);
+  pointer-events: none;
+  flex-shrink: 0;
+}
+
+.web-url-input {
+  width: 100%;
+  min-width: 0;
+  height: 26px;
+  padding: 0 9px 0 25px;
+  border-radius: 8px;
+  border: 1px solid rgba(0, 0, 0, 0.09);
+  background: rgba(255, 255, 255, 0.95);
+  color: var(--text-primary);
+  font-size: 11.5px;
+  letter-spacing: -0.005em;
+  transition: border-color 0.16s ease, box-shadow 0.16s ease, background 0.16s ease;
+}
+
+.web-url-input:hover {
+  border-color: rgba(0, 0, 0, 0.16);
+}
+
+.web-url-input:focus {
+  outline: none;
+  border-color: rgba(99, 102, 241, 0.55);
+  background: #ffffff;
+  box-shadow: 0 0 0 2.5px rgba(99, 102, 241, 0.16);
+}
+
+.web-url-input::placeholder {
+  color: var(--text-muted);
+}
+
+.web-zoom-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.web-zoom-pill {
+  padding: 0 7px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.web-zoom-pill.is-auto {
+  color: #4f46e5;
+  background: rgba(99, 102, 241, 0.1);
+  border-color: rgba(99, 102, 241, 0.24);
+}
+
+.pane-btn.web-ua-mobile {
+  color: #4f46e5;
+  background: rgba(99, 102, 241, 0.12);
+  border-color: rgba(99, 102, 241, 0.3);
+}
+
+.web-pane-stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: #ffffff;
+}
+
+.pane-webview.is-free-web {
+  background: #ffffff;
+}
+
+.web-loading-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2.5px;
+  background: rgba(99, 102, 241, 0.12);
+  overflow: hidden;
+  z-index: 8;
+  pointer-events: none;
+}
+
+.web-loading-bar-beam {
+  display: block;
+  width: 38%;
+  height: 100%;
+  border-radius: 99px;
+  background: linear-gradient(90deg, transparent, #6366f1 45%, #38bdf8 85%, transparent);
+  animation: web-bar-slide 1.15s ease-in-out infinite;
+}
+
+@keyframes web-bar-slide {
+  0% {
+    transform: translateX(-110%);
+  }
+  100% {
+    transform: translateX(310%);
+  }
+}
+
+.pane-empty-web-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  padding-top: 8px;
+  border-top: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.pane-empty-web-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-right: 2px;
+}
+
+.quick-web-chip {
+  border-color: rgba(99, 102, 241, 0.22);
+  background: rgba(99, 102, 241, 0.07);
+}
+
+.quick-web-chip:hover {
+  border-color: rgba(99, 102, 241, 0.42);
+  background: rgba(99, 102, 241, 0.14);
+}
+
+/* Dark Theme Overrides for Free-Web Pane */
+html[data-theme='dark'] .pane-wrapper.is-web-pane,
+html[data-theme='dark'] .web-pane-stage,
+html[data-theme='dark'] .pane-webview.is-free-web {
+  background: #0e1116;
+}
+
+html[data-theme='dark'] .pane-toolbar.web-docked-bar {
+  background: rgba(20, 24, 33, 0.96);
+  border-bottom-color: rgba(255, 255, 255, 0.09);
+  box-shadow: none;
+}
+
+html[data-theme='dark'] .web-url-input {
+  background: rgba(255, 255, 255, 0.07);
+  border-color: rgba(255, 255, 255, 0.11);
+  color: var(--text-primary);
+}
+
+html[data-theme='dark'] .web-url-input:hover {
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+html[data-theme='dark'] .web-url-input:focus {
+  background: rgba(255, 255, 255, 0.11);
+  border-color: rgba(129, 140, 248, 0.65);
+  box-shadow: 0 0 0 2.5px rgba(129, 140, 248, 0.2);
+}
+
+html[data-theme='dark'] .web-zoom-pill.is-auto,
+html[data-theme='dark'] .pane-btn.web-ua-mobile {
+  color: #a5b4fc;
+  background: rgba(99, 102, 241, 0.2);
+  border-color: rgba(129, 140, 248, 0.38);
+}
+
+html[data-theme='dark'] .pane-empty-web-row {
+  border-top-color: rgba(255, 255, 255, 0.08);
+}
+
+html[data-theme='dark'] .quick-web-chip {
+  background: rgba(99, 102, 241, 0.14);
+  border-color: rgba(129, 140, 248, 0.28);
+}
+
+html[data-theme='dark'] .quick-web-chip:hover {
+  background: rgba(99, 102, 241, 0.24);
+  border-color: rgba(129, 140, 248, 0.48);
 }

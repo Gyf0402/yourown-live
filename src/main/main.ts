@@ -19,14 +19,18 @@ import { pathToFileURL } from 'node:url';
 import zlib from 'node:zlib';
 import {
   buildCanonicalUrl,
+  buildWebRoomId,
   detectPlatformFromUrl,
+  isLivePlatform,
   parseLiveInput,
   PLATFORMS,
   SAMPLE_CHANNELS,
+  suggestWebSiteName,
 } from '../shared/platforms';
 import type {
   AppSettings,
   AuthStatusMap,
+  ChannelPlatform,
   DirectStreamRequest,
   LiveStatusCheckItem,
   PaneSlot,
@@ -85,6 +89,7 @@ let saveQueue: Promise<void> = Promise.resolve();
 let boundsSaveTimer: NodeJS.Timeout | null = null;
 const loginWindows = new Map<PlatformId, BrowserWindow>();
 const extraWindows = new Set<BrowserWindow>();
+const freeWebContentsIds = new Set<number>();
 let authSyncTimer: NodeJS.Timeout | null = null;
 let lastEmittedAuthJson = '';
 const danmakuManager = new DanmakuManager(
@@ -864,6 +869,20 @@ function createMainWindow(initialState: PersistedState): void {
     recordDiagnostic('error', 'window', `页面加载失败 (${code}): ${desc}`);
   });
 
+  // Synchronously tag free-web <webview> instances (no preload script) before first navigation
+  let pendingFreeWebAttach = 0;
+  mainWindow.webContents.on('will-attach-webview', (_event, webPreferences) => {
+    if (!webPreferences.preload) {
+      pendingFreeWebAttach += 1;
+    }
+  });
+  mainWindow.webContents.on('did-attach-webview', (_event, guestContents) => {
+    if (pendingFreeWebAttach > 0) {
+      pendingFreeWebAttach -= 1;
+      freeWebContentsIds.add(guestContents.id);
+    }
+  });
+
   const devServerUrl = process.env.VITE_DEV_SERVER_URL;
   if (devServerUrl) {
     void mainWindow.loadURL(devServerUrl).catch((err) => {
@@ -898,7 +917,14 @@ app.on('web-contents-created', (_event, contents) => {
   });
 
   if (contents.getType() === 'webview') {
-    contents.setUserAgent(DEFAULT_UA);
+    const existingUa = contents.getUserAgent();
+    if (!existingUa || existingUa.includes('Electron/')) {
+      contents.setUserAgent(DEFAULT_UA);
+    }
+
+    contents.once('destroyed', () => {
+      freeWebContentsIds.delete(contents.id);
+    });
 
     // Block custom desktop client protocol launches & prevent offline Douyin room from jumping to plaza
     contents.on('will-navigate', (navEvent, navigationUrl) => {
@@ -906,6 +932,9 @@ app.on('web-contents-created', (_event, contents) => {
         const parsed = new URL(navigationUrl);
         if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
           navEvent.preventDefault();
+          return;
+        }
+        if (freeWebContentsIds.has(contents.id)) {
           return;
         }
         // Prevent Douyin offline room (live.douyin.com/{digits}) from redirecting to live plaza (live.douyin.com/)
@@ -926,11 +955,23 @@ app.on('web-contents-created', (_event, contents) => {
       }
     });
 
-    // Intercept window.open inside webview: allow login/auth popups, block spam/custom schemes
+    // Intercept window.open inside webview: allow login/auth popups, navigate in-place for free-web panes
     contents.setWindowOpenHandler(({ url }) => {
       try {
         const parsed = new URL(url);
         if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+          return { action: 'deny' };
+        }
+        if (freeWebContentsIds.has(contents.id)) {
+          const isThirdPartyOAuth = /open\.weixin\.qq\.com|graph\.qq\.com|ptlogin/i.test(url);
+          if (isThirdPartyOAuth) {
+            const detected =
+              detectPlatformFromUrl(url) ?? detectPlatformFromUrl(contents.getURL()) ?? undefined;
+            openAuthPopupWindow(url, '第三方快捷授权登录', detected);
+            return { action: 'deny' };
+          }
+          // In free-web mode (e.g., Bilibili video cards with target="_blank"), open seamlessly in-place
+          void contents.loadURL(url);
           return { action: 'deny' };
         }
         const isAuthUrl =
@@ -1143,12 +1184,21 @@ app.whenReady().then(async () => {
     }
   );
 
+  ipcMain.handle(
+    'livehub:register-free-web',
+    (_event, webContentsId: number) => {
+      if (typeof webContentsId === 'number' && Number.isFinite(webContentsId)) {
+        freeWebContentsIds.add(webContentsId);
+      }
+    }
+  );
+
 const MOBILE_UA =
   'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
 async function resolveShortLiveInput(
   rawInput: string,
-  fallbackPlatform?: PlatformId
+  fallbackPlatform?: ChannelPlatform
 ): Promise<ResolvedLiveInput> {
   const initial = parseLiveInput(rawInput, fallbackPlatform);
   if (initial.ok) {
@@ -1213,10 +1263,14 @@ async function resolveShortLiveInput(
     }
 
     const finalUrl = currentUrl;
-    // Check visited URLs (preferring specific room URLs; NEVER accept Douyin plaza 'home' as a short-link match!)
+    // Check visited URLs (preferring specific live room URLs first; NEVER accept Douyin plaza 'home' as a short-link match!)
     for (let i = visitedUrls.length - 1; i >= 0; i--) {
       const candidate = parseLiveInput(visitedUrls[i], initial.platformHint);
-      if (candidate.ok && !(candidate.platform === 'douyin' && candidate.roomId === 'home')) {
+      if (
+        candidate.ok &&
+        isLivePlatform(candidate.platform) &&
+        !(candidate.platform === 'douyin' && candidate.roomId === 'home')
+      ) {
         if (candidate.platform === 'douyu') {
           const resolved = await resolveDouyuRealRid(candidate.roomId).catch(() => null);
           const finalRid = resolved?.rid || candidate.roomId;
@@ -1326,10 +1380,32 @@ async function resolveShortLiveInput(
         };
       }
 
+      // If this was a regular Douyin short video / profile share link (not a live room), open as free web!
+      if (/^https?:\/\//i.test(finalUrl) && !/live\.douyin\.com\/?(\?|$)/i.test(finalUrl)) {
+        return {
+          ok: true,
+          platform: 'web',
+          roomId: buildWebRoomId(finalUrl),
+          url: finalUrl,
+          suggestedName: initial.suggestedName || suggestWebSiteName(finalUrl),
+        };
+      }
+
       return {
         ok: false,
         needsPlatform: false,
         reason: '该抖音分享链接已失效或主播已下播未返回房间号，请粘贴 live.douyin.com/房间号',
+      };
+    }
+
+    // Non-live short link target (e.g. b23.tv -> bilibili.com/video/BV...): open seamlessly as free web
+    if (/^https?:\/\//i.test(finalUrl)) {
+      return {
+        ok: true,
+        platform: 'web',
+        roomId: buildWebRoomId(finalUrl),
+        url: finalUrl,
+        suggestedName: initial.suggestedName || suggestWebSiteName(finalUrl),
       };
     }
 
@@ -1351,7 +1427,7 @@ async function resolveShortLiveInput(
 
   ipcMain.handle(
     'livehub:resolve-live-input',
-    async (_event, rawInput: string, fallbackPlatform?: PlatformId) =>
+    async (_event, rawInput: string, fallbackPlatform?: ChannelPlatform) =>
       resolveShortLiveInput(rawInput, fallbackPlatform)
   );
 

@@ -1,4 +1,4 @@
-import type { Channel, LayoutMode, PlatformId } from './types';
+import type { Channel, ChannelPlatform, LayoutMode, PlatformId } from './types';
 
 export interface PlatformMeta {
   id: PlatformId;
@@ -9,6 +9,14 @@ export interface PlatformMeta {
   homeUrl: string;
   loginUrl: string;
   domainPatterns: string[];
+}
+
+export interface ChannelPlatformMeta {
+  id: ChannelPlatform;
+  name: string;
+  shortName: string;
+  color: string;
+  bgTint: string;
 }
 
 export const PLATFORMS: Record<PlatformId, PlatformMeta> = {
@@ -61,6 +69,46 @@ export const PLATFORM_LIST: PlatformMeta[] = [
   PLATFORMS.douyin,
 ];
 
+export const WEB_PLATFORM_META: ChannelPlatformMeta = {
+  id: 'web',
+  name: '自由网页',
+  shortName: '网页',
+  color: '#6366f1',
+  bgTint: 'rgba(99, 102, 241, 0.13)',
+};
+
+export const CHANNEL_PLATFORMS: Record<ChannelPlatform, ChannelPlatformMeta> = {
+  ...PLATFORMS,
+  web: WEB_PLATFORM_META,
+};
+
+export const CHANNEL_PLATFORM_LIST: ChannelPlatformMeta[] = [
+  ...PLATFORM_LIST,
+  WEB_PLATFORM_META,
+];
+
+export function isLivePlatform(
+  platform: ChannelPlatform | null | undefined
+): platform is PlatformId {
+  return (
+    platform === 'huya' ||
+    platform === 'douyu' ||
+    platform === 'bilibili' ||
+    platform === 'douyin'
+  );
+}
+
+export function getChannelPlatformMeta(platform: ChannelPlatform): ChannelPlatformMeta {
+  return CHANNEL_PLATFORMS[platform] ?? WEB_PLATFORM_META;
+}
+
+export const QUICK_WEB_PRESETS: Array<{ name: string; url: string; roomId: string }> = [
+  { name: '抖音', url: 'https://www.douyin.com/', roomId: 'www.douyin.com' },
+  { name: 'B站', url: 'https://www.bilibili.com/', roomId: 'www.bilibili.com' },
+  { name: '小红书', url: 'https://www.xiaohongshu.com/', roomId: 'www.xiaohongshu.com' },
+  { name: '微博', url: 'https://weibo.com/', roomId: 'weibo.com' },
+];
+
 export const LAYOUT_CONFIGS: Record<
   LayoutMode,
   { label: string; count: number; description: string }
@@ -72,7 +120,7 @@ export const LAYOUT_CONFIGS: Record<
   '2x2': { label: '四屏', count: 4, description: '四分屏同看 (2×2)' },
 };
 
-export const DEFAULT_GROUPS = ['全部', 'LOL', '王者', '户外', '娱乐', '综合'];
+export const DEFAULT_GROUPS = ['全部', 'LOL', '王者', '户外', '娱乐', '综合', '网页'];
 export const AUTO_GROUP_VALUE = '__auto__';
 
 export function getVisibleGroups(
@@ -237,7 +285,7 @@ export function buildCanonicalUrl(platform: PlatformId, roomId: string): string 
 export type ParsedLiveResult =
   | {
       ok: true;
-      platform: PlatformId;
+      platform: ChannelPlatform;
       roomId: string;
       url: string;
       suggestedName?: string;
@@ -252,6 +300,100 @@ export type ParsedLiveResult =
       roomId?: string;
       reason: string;
     };
+
+const BARE_DOMAIN_RE =
+  /^(?:www\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:com|cn|net|org|tv|io|me|cc|co|app|dev|xyz|top|vip|gov|edu|hk|tw|jp|uk|de|fr|ai|gg|fm|ly|im|live|video|news|wiki|info|biz|pro|site|online|club|fun)(?::\d{2,5})?(?:[/?#][^\s"'<>]*)?$/i;
+
+const LOCALHOST_RE = /^(?:localhost|127\.0\.0\.1)(?::\d{2,5})?(?:[/?#][^\s"'<>]*)?$/i;
+
+export function normalizeWebUrl(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+
+  const httpMatch = trimmed.match(/https?:\/\/[^\s"'<>，。；！]+/i);
+  let candidate = httpMatch
+    ? httpMatch[0].replace(/[),.;!?，。；！？]+$/, '')
+    : trimmed;
+
+  if (!/^https?:\/\//i.test(candidate)) {
+    if (LOCALHOST_RE.test(candidate)) {
+      candidate = `http://${candidate}`;
+    } else if (BARE_DOMAIN_RE.test(candidate)) {
+      candidate = `https://${candidate}`;
+    } else {
+      return null;
+    }
+  }
+
+  try {
+    const parsed = new URL(candidate);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+    if (!parsed.hostname || (!parsed.hostname.includes('.') && parsed.hostname !== 'localhost')) {
+      return null;
+    }
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+export function buildWebRoomId(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    const host = parsed.host.toLowerCase();
+    const path = parsed.pathname.replace(/\/+$/, '');
+    const search = parsed.search && parsed.search.length <= 48 ? parsed.search : '';
+    const combined = `${host}${path}${search}`;
+    return combined.length > 72 ? combined.slice(0, 72) : combined;
+  } catch {
+    return rawUrl.slice(0, 64);
+  }
+}
+
+export function suggestWebSiteName(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    const host = parsed.hostname.toLowerCase().replace(/^www\./, '');
+    const path = parsed.pathname.toLowerCase();
+    if (host === 'douyin.com' || host.endsWith('.douyin.com')) {
+      if (path.startsWith('/video/')) return '抖音视频';
+      if (path.startsWith('/user/')) return '抖音主页';
+      return '抖音';
+    }
+    if (host === 'bilibili.com' || host.endsWith('.bilibili.com')) {
+      if (path.startsWith('/video/')) return 'B站视频';
+      if (host.startsWith('space.')) return 'B站空间';
+      if (host.startsWith('search.')) return 'B站搜索';
+      return 'B站';
+    }
+    if (host.includes('xiaohongshu.com')) return '小红书';
+    if (host.includes('weibo.com') || host.includes('weibo.cn')) return '微博';
+    if (host.includes('zhihu.com')) return '知乎';
+    if (host.includes('youtube.com') || host === 'youtu.be') return 'YouTube';
+    if (host.includes('twitch.tv')) return 'Twitch';
+    if (host.includes('tieba.baidu.com')) return '贴吧';
+    if (host.includes('douban.com')) return '豆瓣';
+    if (host.includes('nga.cn') || host.includes('ngabbs.com')) return 'NGA';
+    if (host.includes('hupu.com')) return '虎扑';
+    if (host === 'x.com' || host.includes('twitter.com')) return 'X';
+    if (host.includes('github.com')) return 'GitHub';
+    return host;
+  } catch {
+    return '自由网页';
+  }
+}
+
+export function formatWebUrlLabel(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    const host = parsed.hostname.replace(/^www\./, '');
+    const path = parsed.pathname.replace(/\/+$/, '');
+    const text = `${host}${path}`;
+    return text.length > 36 ? `${text.slice(0, 35)}…` : text;
+  } catch {
+    return rawUrl;
+  }
+}
 
 function extractEmbeddedUrl(input: string): string | null {
   const httpMatch = input.match(/https?:\/\/[^\s"'<>，。；！]+/i);
@@ -269,16 +411,35 @@ function extractEmbeddedUrl(input: string): string | null {
 
 export function parseLiveInput(
   rawInput: string,
-  fallbackPlatform?: PlatformId
+  fallbackPlatform?: ChannelPlatform
 ): ParsedLiveResult {
   const trimmed = rawInput.trim();
   if (!trimmed) {
-    return { ok: false, needsPlatform: false, reason: '请输入直播间链接或房间号' };
+    return { ok: false, needsPlatform: false, reason: '请输入直播间链接、房间号或任意网址' };
   }
 
   // Extract share title like 【主播名】 when available
   const shareTitleMatch = trimmed.match(/【([^【】]{1,28})】/);
   const suggestedName = shareTitleMatch ? shareTitleMatch[1].replace(/的(?:斗鱼|虎牙|抖音|B站)?直播间?$/, '').trim() : undefined;
+
+  // 0. Explicit free-web mode: treat any valid URL / bare domain directly as a web bookmark
+  if (fallbackPlatform === 'web') {
+    const normalized = normalizeWebUrl(trimmed);
+    if (!normalized) {
+      return {
+        ok: false,
+        needsPlatform: false,
+        reason: '请输入有效网址，例如 https://www.douyin.com 或 bilibili.com',
+      };
+    }
+    return {
+      ok: true,
+      platform: 'web',
+      roomId: buildWebRoomId(normalized),
+      url: normalized,
+      suggestedName: suggestedName || suggestWebSiteName(normalized),
+    };
+  }
 
   // 1. Check prefixed syntax like "hy:660000", "虎牙 660000", "斗鱼房间号：728", "抖音123456"
   const prefixMatch = trimmed.match(
@@ -302,7 +463,7 @@ export function parseLiveInput(
   }
 
   // 2. Extract URL even when wrapped inside App share text (e.g. "8.97 复制打开抖音... https://v.douyin.com/...")
-  const extractedUrl = extractEmbeddedUrl(trimmed);
+  const extractedUrl = extractEmbeddedUrl(trimmed) ?? normalizeWebUrl(trimmed);
   if (extractedUrl) {
     try {
       const parsed = new URL(extractedUrl);
@@ -313,7 +474,13 @@ export function parseLiveInput(
       if (host.includes('huya.com')) {
         const roomId = segments[0];
         if (!roomId) {
-          return { ok: false, needsPlatform: false, reason: '未能从虎牙链接提取房间号' };
+          return {
+            ok: true,
+            platform: 'web',
+            roomId: buildWebRoomId(extractedUrl),
+            url: extractedUrl,
+            suggestedName: suggestedName || '虎牙首页',
+          };
         }
         return {
           ok: true,
@@ -377,9 +544,11 @@ export function parseLiveInput(
 
         if (!roomId) {
           return {
-            ok: false,
-            needsPlatform: false,
-            reason: '未能从斗鱼链接提取房间号，请粘贴具体直播间链接或直接输入房间号',
+            ok: true,
+            platform: 'web',
+            roomId: buildWebRoomId(extractedUrl),
+            url: extractedUrl,
+            suggestedName: suggestedName || '斗鱼网页',
           };
         }
         return {
@@ -398,6 +567,7 @@ export function parseLiveInput(
           needsShortResolve: true,
           shortUrl: extractedUrl,
           platformHint: 'bilibili',
+          suggestedName,
           reason: '正在解析B站短链接...',
         };
       }
@@ -406,7 +576,13 @@ export function parseLiveInput(
         const first = (segments[0] || '').toLowerCase();
         const roomId = first === 'blanc' || first === 'h5' ? segments[1] : segments[0];
         if (!roomId || !/^\d+$/.test(roomId)) {
-          return { ok: false, needsPlatform: false, reason: '未能从B站直播链接提取数字房间号' };
+          return {
+            ok: true,
+            platform: 'web',
+            roomId: buildWebRoomId(extractedUrl),
+            url: extractedUrl,
+            suggestedName: suggestedName || 'B站直播广场',
+          };
         }
         return {
           ok: true,
@@ -414,6 +590,17 @@ export function parseLiveInput(
           roomId,
           url: buildCanonicalUrl('bilibili', roomId),
           suggestedName,
+        };
+      }
+
+      // Main Bilibili site (www.bilibili.com, m.bilibili.com, space.bilibili.com, videos, etc.) -> free web!
+      if (host === 'bilibili.com' || host.endsWith('.bilibili.com')) {
+        return {
+          ok: true,
+          platform: 'web',
+          roomId: buildWebRoomId(extractedUrl),
+          url: extractedUrl,
+          suggestedName: suggestedName || suggestWebSiteName(extractedUrl),
         };
       }
 
@@ -435,14 +622,15 @@ export function parseLiveInput(
         };
       }
 
-      // Douyin Web URLs: live.douyin.com/{id}, www.douyin.com/follow/live/{id}, www.douyin.com/root/live/{id}, www.douyin.com/live/{id}
+      // Douyin Web URLs:
+      // - live.douyin.com/{id} or www.douyin.com/follow/live/{id} or /root/live/{id} or /live/{id} -> Douyin Live
+      // - www.douyin.com (main feed, /video/..., /discover, /jingxuan, /user/..., etc.) -> Free Web!
       if (host.includes('douyin.com')) {
         const queryRoomId =
           parsed.searchParams.get('web_rid') ||
           parsed.searchParams.get('room_id') ||
           parsed.searchParams.get('roomId');
 
-        let roomId: string | undefined;
         if (host.includes('live.douyin.com')) {
           if (segments[0] === 'webcast' && segments[1] === 'reflow' && segments[2]) {
             return {
@@ -454,48 +642,54 @@ export function parseLiveInput(
               reason: '正在解析抖音直播间地址...',
             };
           }
-          roomId = segments[0] || queryRoomId || 'home';
-        } else {
-          // www.douyin.com/follow/live/12345 or /root/live/12345 or /live/12345 or /user/MS4w...
-          const liveIdx = segments.indexOf('live');
-          if (liveIdx !== -1 && segments[liveIdx + 1]) {
-            roomId = segments[liveIdx + 1];
-          } else if (queryRoomId) {
-            roomId = queryRoomId;
-          } else if (segments[0] === 'user' && segments[1]) {
-            return {
-              ok: true,
-              platform: 'douyin',
-              roomId: segments[1].slice(0, 16),
-              url: `https://www.douyin.com/user/${segments[1]}`,
-              suggestedName,
-            };
-          } else if (segments.length === 0) {
-            roomId = 'home';
-          }
-        }
-
-        if (!roomId) {
+          const roomId = segments[0] || queryRoomId || 'home';
           return {
-            ok: false,
-            needsPlatform: false,
-            reason: '未能从该抖音链接提取直播间号，请直接粘贴 live.douyin.com/房间号 或 v.douyin.com 短链',
+            ok: true,
+            platform: 'douyin',
+            roomId,
+            url: buildCanonicalUrl('douyin', roomId),
+            suggestedName: roomId === 'home' ? suggestedName || '抖音直播广场' : suggestedName,
           };
         }
 
+        const liveIdx = segments.indexOf('live');
+        if (liveIdx !== -1 && segments[liveIdx + 1]) {
+          const roomId = segments[liveIdx + 1];
+          return {
+            ok: true,
+            platform: 'douyin',
+            roomId,
+            url: buildCanonicalUrl('douyin', roomId),
+            suggestedName,
+          };
+        }
+        if (queryRoomId) {
+          return {
+            ok: true,
+            platform: 'douyin',
+            roomId: queryRoomId,
+            url: buildCanonicalUrl('douyin', queryRoomId),
+            suggestedName,
+          };
+        }
+
+        // Main Douyin site / short videos / discover / creator pages -> free web
         return {
           ok: true,
-          platform: 'douyin',
-          roomId,
-          url: buildCanonicalUrl('douyin', roomId),
-          suggestedName: roomId === 'home' ? suggestedName || '抖音直播广场' : suggestedName,
+          platform: 'web',
+          roomId: buildWebRoomId(extractedUrl),
+          url: extractedUrl,
+          suggestedName: suggestedName || suggestWebSiteName(extractedUrl),
         };
       }
 
+      // Any other valid HTTP(S) website -> free web!
       return {
-        ok: false,
-        needsPlatform: false,
-        reason: '暂不支持该域名，仅支持虎牙 / 斗鱼 / B站 / 抖音直播',
+        ok: true,
+        platform: 'web',
+        roomId: buildWebRoomId(extractedUrl),
+        url: extractedUrl,
+        suggestedName: suggestedName || suggestWebSiteName(extractedUrl),
       };
     } catch {
       return { ok: false, needsPlatform: false, reason: '链接格式无效' };
@@ -504,7 +698,7 @@ export function parseLiveInput(
 
   // 3. Bare room ID (allow dots for Douyin custom IDs)
   if (/^[a-zA-Z0-9_.-]{1,40}$/.test(trimmed)) {
-    if (fallbackPlatform) {
+    if (fallbackPlatform && isLivePlatform(fallbackPlatform)) {
       return {
         ok: true,
         platform: fallbackPlatform,

@@ -16,6 +16,7 @@ import type {
   AppUpdateCheckResult,
   AuthStatusMap,
   Channel,
+  ChannelPlatform,
   CodecProbeResult,
   DiagnosticLogEntry,
   PlatformId,
@@ -160,7 +161,7 @@ export function LoginModal({
       const rawGroups = !Array.isArray(parsed) && Array.isArray(parsed?.customGroups)
         ? parsed.customGroups
         : [];
-      const validPlatforms = new Set<PlatformId>(['huya', 'douyu', 'bilibili', 'douyin']);
+      const validPlatforms = new Set<ChannelPlatform>(['huya', 'douyu', 'bilibili', 'douyin', 'web']);
       const validChannels: Channel[] = rawChannels
         .filter(
           (c): c is Channel =>

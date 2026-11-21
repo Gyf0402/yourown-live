@@ -1,22 +1,40 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  ArrowLeft,
+  ArrowRight,
   ArrowUpLeft,
+  ExternalLink,
   Globe,
   GripVertical,
   Headphones,
   KeyRound,
   Maximize2,
   Minimize2,
+  Monitor,
   RefreshCw,
   SlidersHorizontal,
+  Smartphone,
   Volume2,
   VolumeX,
   X,
   Zap,
+  ZoomIn,
+  ZoomOut,
 } from 'lucide-react';
-import { PLATFORM_LIST, PLATFORMS, parseLiveInput } from '../../shared/platforms';
+import {
+  PLATFORM_LIST,
+  PLATFORMS,
+  QUICK_WEB_PRESETS,
+  detectPlatformFromUrl,
+  formatWebUrlLabel,
+  getChannelPlatformMeta,
+  isLivePlatform,
+  normalizeWebUrl,
+  parseLiveInput,
+} from '../../shared/platforms';
 import type {
   Channel,
+  ChannelPlatform,
   DanmakuArea,
   DanmakuMessage,
   DanmakuMode,
@@ -27,10 +45,24 @@ import type {
   PlatformId,
   StreamOptionsInfo,
   VideoFitMode,
+  WebUserAgentMode,
   WebviewPurifyConfig,
 } from '../../shared/types';
 import type { WebviewElement } from '../env';
 import { DirectPlayer } from './DirectPlayer';
+
+const WEB_DESKTOP_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0';
+
+const WEB_MOBILE_UA =
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1';
+
+const FREE_WEB_POLISH_CSS = `
+  ::-webkit-scrollbar { width: 7px; height: 7px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: rgba(128, 128, 128, 0.36); border-radius: 99px; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(128, 128, 128, 0.56); }
+`;
 
 interface LivePaneProps {
   pane: PaneSlot;
@@ -64,14 +96,29 @@ interface LivePaneProps {
   onUpdatePanePrefs: (
     slotIndex: number,
     patch: Partial<
-      Pick<PaneSlot, 'volume' | 'fitMode' | 'preferredQualityId' | 'preferredLineId' | 'danmakuEnabled'>
+      Pick<
+        PaneSlot,
+        | 'volume'
+        | 'fitMode'
+        | 'preferredQualityId'
+        | 'preferredLineId'
+        | 'danmakuEnabled'
+        | 'webZoom'
+        | 'webUserAgentMode'
+      >
     >
   ) => void;
   onToggleMaximize: (slotIndex: number) => void;
   onToggleFullscreen: (slotIndex: number) => void;
   onDetectedCategory?: (channelId: string, category: string, title?: string, anchorName?: string) => void;
   onSelectPane: (slotIndex: number) => void;
-  onLoadUrlInPane: (slotIndex: number, url: string, title?: string, channelId?: string | null) => void;
+  onLoadUrlInPane: (
+    slotIndex: number,
+    url: string,
+    title?: string,
+    channelId?: string | null,
+    explicitPlatform?: ChannelPlatform | null
+  ) => void;
   onLoadChannelInPane: (slotIndex: number, channel: Channel) => void;
   onToggleMute: (slotIndex: number) => void;
   onToggleSolo: (slotIndex: number) => void;
@@ -126,7 +173,9 @@ export const LivePane = memo(function LivePane({
   onSwapPanes,
   onLoginPlatform,
 }: LivePaneProps) {
+  const paneWrapperRef = useRef<HTMLDivElement | null>(null);
   const webviewRef = useRef<WebviewElement | null>(null);
+  const [paneWidth, setPaneWidth] = useState(0);
   const [domReady, setDomReady] = useState(false);
   const [isLoading, setIsLoading] = useState(Boolean(pane.url));
   const [mountReady, setMountReady] = useState(pane.slotIndex === 0);
@@ -135,6 +184,16 @@ export const LivePane = memo(function LivePane({
   const [quickPendingRoomId, setQuickPendingRoomId] = useState<string | null>(null);
   const [quickResolving, setQuickResolving] = useState(false);
   const [quickError, setQuickError] = useState<string | null>(null);
+  const [webStartUrl, setWebStartUrl] = useState(pane.url || '');
+  const [webCurrentUrl, setWebCurrentUrl] = useState(pane.url || '');
+  const [webAddressInput, setWebAddressInput] = useState(pane.url || '');
+  const [webAddressFocused, setWebAddressFocused] = useState(false);
+  const [webCanGoBack, setWebCanGoBack] = useState(false);
+  const [webCanGoForward, setWebCanGoForward] = useState(false);
+  const [webLoadError, setWebLoadError] = useState<{ code: number; desc: string; url: string } | null>(null);
+  const webAddressFocusedRef = useRef(false);
+  webAddressFocusedRef.current = webAddressFocused;
+  const lastAppliedZoomRef = useRef<number | null>(null);
   const [streamOptions, setStreamOptions] = useState<StreamOptionsInfo>({
     qualities: [],
     lines: [],
@@ -172,17 +231,23 @@ export const LivePane = memo(function LivePane({
   const localDanmakuOn = pane.danmakuEnabled ?? danmakuEnabled;
   const paneVolume = pane.volume ?? 1;
   const paneFitMode: VideoFitMode = pane.fitMode ?? 'contain';
+  const webUaMode: WebUserAgentMode = pane.webUserAgentMode ?? 'desktop';
+  const webZoomSetting = pane.webZoom ?? 'auto';
+  const isWebPane = Boolean(pane.url && pane.platform === 'web');
 
-  const platformMeta = pane.platform ? PLATFORMS[pane.platform] : null;
+  const platformMeta = pane.platform ? getChannelPlatformMeta(pane.platform) : null;
 
   const parsedTarget = useMemo(() => {
-    if (!pane.url) return null;
+    if (!pane.url || isWebPane) return null;
     const parsed = parseLiveInput(pane.url, pane.platform ?? undefined);
-    return parsed.ok ? { platform: parsed.platform, roomId: parsed.roomId } : null;
-  }, [pane.url, pane.platform]);
+    return parsed.ok && isLivePlatform(parsed.platform)
+      ? { platform: parsed.platform, roomId: parsed.roomId }
+      : null;
+  }, [pane.url, pane.platform, isWebPane]);
 
   const useDirectStream = Boolean(
     pane.url &&
+      !isWebPane &&
       pane.mode === 'pure' &&
       parsedTarget &&
       parsedTarget.roomId !== 'home' &&
@@ -190,6 +255,53 @@ export const LivePane = memo(function LivePane({
       typeof window !== 'undefined' &&
       typeof window.livehub?.resolveStream === 'function'
   );
+
+  const webCookiePlatform = useMemo(() => {
+    if (!isWebPane) return null;
+    return detectPlatformFromUrl(webCurrentUrl || pane.url || '');
+  }, [isWebPane, webCurrentUrl, pane.url]);
+
+  const effectiveWebZoom = useMemo(() => {
+    if (!isWebPane) return 1;
+    if (typeof webZoomSetting === 'number' && Number.isFinite(webZoomSetting)) {
+      return Math.max(0.5, Math.min(1.5, Math.round(webZoomSetting * 20) / 20));
+    }
+    const w = paneWidth;
+    if (w <= 0) return 1;
+    if (webUaMode === 'mobile') {
+      if (w >= 380) return 1;
+      return Math.max(0.75, Math.round((w / 380) * 20) / 20);
+    }
+    if (w >= 980) return 1;
+    return Math.max(0.65, Math.min(1, Math.round((w / 980) * 20) / 20));
+  }, [isWebPane, webZoomSetting, webUaMode, paneWidth]);
+
+  const effectiveWebZoomRef = useRef(effectiveWebZoom);
+  effectiveWebZoomRef.current = effectiveWebZoom;
+  const effectiveMutedRef = useRef(effectiveMuted);
+  effectiveMutedRef.current = effectiveMuted;
+
+  // Observe pane container width (rAF-throttled) for responsive toolbar & adaptive webpage zoom
+  useEffect(() => {
+    const node = paneWrapperRef.current;
+    if (!node || typeof ResizeObserver === 'undefined') return;
+    let rafId: number | null = null;
+    const updateWidth = () => {
+      rafId = null;
+      const nextW = Math.round(node.clientWidth);
+      setPaneWidth((cur) => (Math.abs(cur - nextW) >= 6 ? nextW : cur));
+    };
+    updateWidth();
+    const ro = new ResizeObserver(() => {
+      if (rafId !== null) return;
+      rafId = window.requestAnimationFrame(updateWidth);
+    });
+    ro.observe(node);
+    return () => {
+      if (rafId !== null) window.cancelAnimationFrame(rafId);
+      ro.disconnect();
+    };
+  }, []);
 
   const showTempHint = useCallback((msg: string, durationMs = 2600) => {
     setPaneHint(msg);
@@ -211,6 +323,14 @@ export const LivePane = memo(function LivePane({
     setIsLoading(Boolean(pane.url));
     setProbing(false);
     setPaneHint(null);
+    setWebStartUrl(pane.url || '');
+    setWebCurrentUrl(pane.url || '');
+    setWebAddressInput(pane.url || '');
+    setWebAddressFocused(false);
+    setWebCanGoBack(false);
+    setWebCanGoForward(false);
+    setWebLoadError(null);
+    lastAppliedZoomRef.current = null;
     setStreamOptions({ qualities: [], lines: [] });
     setDirectStream(null);
     setDirectStats(null);
@@ -463,54 +583,156 @@ export const LivePane = memo(function LivePane({
     pane.slotIndex,
   ]);
 
-  // Attach Electron webview lifecycle & IPC listeners (only when in Web mode)
+  // Attach Electron webview lifecycle & IPC listeners (both live Web mode and Free-Web mode)
   useEffect(() => {
     const el = webviewRef.current;
-    if (useDirectStream || !el || !pane.url || !webviewPreloadPath || !mountReady) return;
+    if (useDirectStream || !el || !pane.url || !mountReady) return;
+    if (!isWebPane && !webviewPreloadPath) return;
+
+    const syncFreeWebNav = () => {
+      if (!isWebPane) return;
+      try {
+        setWebCanGoBack(Boolean(el.canGoBack?.()));
+        setWebCanGoForward(Boolean(el.canGoForward?.()));
+        const curUrl = el.getURL?.();
+        if (curUrl) {
+          setWebCurrentUrl(curUrl);
+          if (!webAddressFocusedRef.current) {
+            setWebAddressInput(curUrl);
+          }
+        }
+      } catch {
+        // Ignore transient navigation errors
+      }
+    };
+
+    const registerFreeWeb = () => {
+      if (!isWebPane || typeof window.livehub?.registerFreeWebContents !== 'function') return;
+      try {
+        const wcId = el.getWebContentsId();
+        if (wcId) {
+          void window.livehub.registerFreeWebContents(wcId);
+        }
+      } catch {
+        // Not ready yet
+      }
+    };
+
+    const applyFreeWebAdaptation = (force = false) => {
+      if (!isWebPane) return;
+      const z = effectiveWebZoomRef.current;
+      if (!force && lastAppliedZoomRef.current !== null && Math.abs(lastAppliedZoomRef.current - z) < 0.005) {
+        return;
+      }
+      try {
+        el.setZoomFactor(z);
+        lastAppliedZoomRef.current = z;
+      } catch {
+        // Ignore
+      }
+    };
 
     const handleStartLoading = () => {
       setIsLoading(true);
+      setWebLoadError(null);
+      registerFreeWeb();
     };
 
     const handleStopLoading = () => {
       setIsLoading(false);
+      syncFreeWebNav();
+    };
+
+    const handleFailLoad = (event: Event) => {
+      setIsLoading(false);
+      if (!isWebPane) return;
+      const failEv = event as CustomEvent & {
+        errorCode?: number;
+        errorDescription?: string;
+        validatedURL?: string;
+        isMainFrame?: boolean;
+      };
+      // Ignore benign aborted loads (-3, e.g. redirects / SPA route changes) and sub-frame failures
+      if (failEv.isMainFrame === false || failEv.errorCode === -3) return;
+      setWebLoadError({
+        code: failEv.errorCode ?? -1,
+        desc: failEv.errorDescription || '页面加载失败',
+        url: failEv.validatedURL || pane.url || '',
+      });
+    };
+
+    const handleFinishLoad = () => {
+      setIsLoading(false);
+      setWebLoadError(null);
+      syncFreeWebNav();
+      applyFreeWebAdaptation(true);
     };
 
     const handleDomReady = () => {
       setDomReady(true);
       setIsLoading(false);
       try {
-        el.setAudioMuted(effectiveMuted);
-        const cfg: WebviewPurifyConfig = {
-          mode: pane.mode,
-          autoHighestQuality,
-          hideGiftEffects,
-          danmakuEnabled,
-        };
-        el.send('livehub:config', cfg);
-        window.setTimeout(() => {
-          try {
-            const rect = el.getBoundingClientRect();
-            void window.livehub.wakeWebview(el.getWebContentsId(), rect.width, rect.height);
-          } catch {
-            // Ignore
-          }
-        }, 1600);
+        el.setAudioMuted(effectiveMutedRef.current);
+        if (isWebPane) {
+          registerFreeWeb();
+          applyFreeWebAdaptation(true);
+          syncFreeWebNav();
+          void el.insertCSS?.(FREE_WEB_POLISH_CSS)?.catch(() => {});
+        } else {
+          const cfg: WebviewPurifyConfig = {
+            mode: pane.mode,
+            autoHighestQuality,
+            hideGiftEffects,
+            danmakuEnabled,
+          };
+          el.send('livehub:config', cfg);
+          window.setTimeout(() => {
+            try {
+              const rect = el.getBoundingClientRect();
+              void window.livehub.wakeWebview(el.getWebContentsId(), rect.width, rect.height);
+            } catch {
+              // Ignore
+            }
+          }, 1600);
+        }
       } catch {
         // Ignore transient webview attach errors
+      }
+    };
+
+    const handleNavigate = (event: Event) => {
+      if (!isWebPane) return;
+      const navEv = event as CustomEvent & { url?: string };
+      if (navEv.url) {
+        setWebCurrentUrl(navEv.url);
+        if (!webAddressFocusedRef.current) {
+          setWebAddressInput(navEv.url);
+        }
+      }
+      syncFreeWebNav();
+      applyFreeWebAdaptation();
+    };
+
+    const handlePageTitleUpdated = (event: Event) => {
+      if (!isWebPane) return;
+      const titleEv = event as CustomEvent & { title?: string };
+      const clean = titleEv.title?.trim();
+      if (clean) {
+        onUpdateTitleRef.current(pane.slotIndex, clean);
       }
     };
 
     const handleMediaPlay = () => {
       setIsLoading(false);
       try {
-        el.setAudioMuted(effectiveMuted);
+        el.setAudioMuted(effectiveMutedRef.current);
       } catch {
         // Ignore
       }
     };
 
     const handleIpcMessage = (event: Event) => {
+      if (isWebPane) return;
       const ipcEvent = event as CustomEvent & { channel?: string; args?: unknown[] };
       if (ipcEvent.channel === 'livehub:meta' && Array.isArray(ipcEvent.args) && ipcEvent.args[0]) {
         const meta = ipcEvent.args[0] as { title?: string; hasVideo?: boolean };
@@ -543,22 +765,53 @@ export const LivePane = memo(function LivePane({
 
     el.addEventListener('did-start-loading', handleStartLoading);
     el.addEventListener('did-stop-loading', handleStopLoading);
-    el.addEventListener('did-finish-load', handleStopLoading);
-    el.addEventListener('did-fail-load', handleStopLoading);
+    el.addEventListener('did-finish-load', handleFinishLoad);
+    el.addEventListener('did-fail-load', handleFailLoad);
     el.addEventListener('dom-ready', handleDomReady);
+    el.addEventListener('did-navigate', handleNavigate);
+    el.addEventListener('did-navigate-in-page', handleNavigate);
+    el.addEventListener('page-title-updated', handlePageTitleUpdated);
     el.addEventListener('media-started-playing', handleMediaPlay);
     el.addEventListener('ipc-message', handleIpcMessage);
 
     return () => {
       el.removeEventListener('did-start-loading', handleStartLoading);
       el.removeEventListener('did-stop-loading', handleStopLoading);
-      el.removeEventListener('did-finish-load', handleStopLoading);
-      el.removeEventListener('did-fail-load', handleStopLoading);
+      el.removeEventListener('did-finish-load', handleFinishLoad);
+      el.removeEventListener('did-fail-load', handleFailLoad);
       el.removeEventListener('dom-ready', handleDomReady);
+      el.removeEventListener('did-navigate', handleNavigate);
+      el.removeEventListener('did-navigate-in-page', handleNavigate);
+      el.removeEventListener('page-title-updated', handlePageTitleUpdated);
       el.removeEventListener('media-started-playing', handleMediaPlay);
       el.removeEventListener('ipc-message', handleIpcMessage);
     };
-  }, [useDirectStream, pane.url, pane.slotIndex, webviewPreloadPath, mountReady]);
+  }, [useDirectStream, isWebPane, pane.url, pane.slotIndex, webviewPreloadPath, mountReady, webUaMode]);
+
+  // Keep adaptive/manual zoom factor synced smoothly (debounced during auto-resize to prevent OOPIF thrashing)
+  useEffect(() => {
+    const el = webviewRef.current;
+    if (!isWebPane || !el || !domReady) return;
+    if (
+      lastAppliedZoomRef.current !== null &&
+      Math.abs(lastAppliedZoomRef.current - effectiveWebZoom) < 0.005
+    ) {
+      return;
+    }
+    const apply = () => {
+      try {
+        el.setZoomFactor(effectiveWebZoom);
+        lastAppliedZoomRef.current = effectiveWebZoom;
+      } catch {
+        // Ignore if guest is navigating
+      }
+    };
+    if (webZoomSetting === 'auto') {
+      const timer = window.setTimeout(apply, 95);
+      return () => window.clearTimeout(timer);
+    }
+    apply();
+  }, [isWebPane, effectiveWebZoom, webZoomSetting, domReady]);
 
   // Keep mute state synced after domReady
   useEffect(() => {
@@ -571,10 +824,10 @@ export const LivePane = memo(function LivePane({
     }
   }, [effectiveMuted, domReady]);
 
-  // Keep purification config synced after domReady
+  // Keep purification config synced after domReady (live webviews only)
   useEffect(() => {
     const el = webviewRef.current;
-    if (!el || !domReady) return;
+    if (isWebPane || !el || !domReady) return;
     try {
       const cfg: WebviewPurifyConfig = {
         mode: pane.mode,
@@ -586,7 +839,7 @@ export const LivePane = memo(function LivePane({
     } catch {
       // Ignore
     }
-  }, [pane.mode, autoHighestQuality, hideGiftEffects, danmakuEnabled, domReady]);
+  }, [isWebPane, pane.mode, autoHighestQuality, hideGiftEffects, danmakuEnabled, domReady]);
 
   // Auto-reload webview when platform login status changes or manual refresh triggered
   useEffect(() => {
@@ -619,8 +872,10 @@ export const LivePane = memo(function LivePane({
             onLoadUrlInPane(
               pane.slotIndex,
               resolved.url,
-              resolved.suggestedName || `${PLATFORMS[resolved.platform].shortName} ${resolved.roomId}`,
-              null
+              resolved.suggestedName ||
+                `${getChannelPlatformMeta(resolved.platform).shortName} ${resolved.roomId}`,
+              null,
+              resolved.platform
             );
             return;
           }
@@ -634,8 +889,12 @@ export const LivePane = memo(function LivePane({
       onLoadUrlInPane(
         pane.slotIndex,
         syncRes.url,
-        syncRes.suggestedName || `${PLATFORMS[syncRes.platform].shortName} ${syncRes.roomId}`,
-        null
+        syncRes.suggestedName ||
+          (syncRes.platform === 'web'
+            ? formatWebUrlLabel(syncRes.url)
+            : `${getChannelPlatformMeta(syncRes.platform).shortName} ${syncRes.roomId}`),
+        null,
+        syncRes.platform
       );
       return;
     }
@@ -652,8 +911,12 @@ export const LivePane = memo(function LivePane({
           onLoadUrlInPane(
             pane.slotIndex,
             resolved.url,
-            resolved.suggestedName || `${PLATFORMS[resolved.platform].shortName} ${resolved.roomId}`,
-            null
+            resolved.suggestedName ||
+              (resolved.platform === 'web'
+                ? formatWebUrlLabel(resolved.url)
+                : `${getChannelPlatformMeta(resolved.platform).shortName} ${resolved.roomId}`),
+            null,
+            resolved.platform
           );
           return;
         }
@@ -690,8 +953,10 @@ export const LivePane = memo(function LivePane({
           onLoadUrlInPane(
             pane.slotIndex,
             resolved.url,
-            resolved.suggestedName || `${PLATFORMS[resolved.platform].shortName} ${resolved.roomId}`,
-            null
+            resolved.suggestedName ||
+              `${getChannelPlatformMeta(resolved.platform).shortName} ${resolved.roomId}`,
+            null,
+            resolved.platform
           );
           return;
         }
@@ -707,8 +972,9 @@ export const LivePane = memo(function LivePane({
       onLoadUrlInPane(
         pane.slotIndex,
         res.url,
-        `${PLATFORMS[res.platform].shortName} ${res.roomId}`,
-        null
+        `${getChannelPlatformMeta(res.platform).shortName} ${res.roomId}`,
+        null,
+        res.platform
       );
     }
   };
@@ -814,7 +1080,7 @@ export const LivePane = memo(function LivePane({
 
   const handleSelectQuality = (labelOrId: string) => {
     const chosen = streamOptions.qualities.find((q) => q.id === labelOrId);
-    if (chosen?.locked && !isPlatformLoggedIn && pane.platform) {
+    if (chosen?.locked && !isPlatformLoggedIn && isLivePlatform(pane.platform)) {
       showTempHint(`「${chosen.label}」需登录${platformMeta?.shortName || ''}账号后解锁，正在打开登录...`);
       onLoginPlatform(pane.platform);
       return;
@@ -919,13 +1185,109 @@ export const LivePane = memo(function LivePane({
     }
   };
 
+  const handleWebAddressSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const raw = webAddressInput.trim();
+    if (!raw) return;
+    const normalized =
+      normalizeWebUrl(raw) ?? `https://www.baidu.com/s?wd=${encodeURIComponent(raw)}`;
+    setWebCurrentUrl(normalized);
+    setWebAddressInput(normalized);
+    const el = webviewRef.current;
+    if (el && domReady) {
+      try {
+        void el.loadURL(normalized);
+      } catch {
+        // Fallback to reloading slot url
+        onLoadUrlInPane(pane.slotIndex, normalized, undefined, pane.channelId, 'web');
+      }
+    } else {
+      onLoadUrlInPane(pane.slotIndex, normalized, undefined, pane.channelId, 'web');
+    }
+    if (document.activeElement instanceof HTMLElement) {
+      document.activeElement.blur();
+    }
+  };
+
+  const handleWebGoBack = () => {
+    const el = webviewRef.current;
+    if (el && domReady && el.canGoBack?.()) {
+      try {
+        el.goBack();
+      } catch {
+        // Ignore
+      }
+    }
+  };
+
+  const handleWebGoForward = () => {
+    const el = webviewRef.current;
+    if (el && domReady && el.canGoForward?.()) {
+      try {
+        el.goForward();
+      } catch {
+        // Ignore
+      }
+    }
+  };
+
+  const handleStepWebZoom = (delta: number) => {
+    const next = Math.max(0.5, Math.min(1.5, Math.round((effectiveWebZoom + delta) * 10) / 10));
+    onUpdatePanePrefs(pane.slotIndex, { webZoom: next });
+  };
+
+  const handleResetOrCycleWebZoom = () => {
+    if (paneWidth > 0 && paneWidth < 520) {
+      // Compact mode: cycle auto -> 75% -> 90% -> 100% -> auto
+      if (webZoomSetting === 'auto') {
+        onUpdatePanePrefs(pane.slotIndex, { webZoom: 0.75 });
+      } else if (webZoomSetting <= 0.78) {
+        onUpdatePanePrefs(pane.slotIndex, { webZoom: 0.9 });
+      } else if (webZoomSetting < 0.98) {
+        onUpdatePanePrefs(pane.slotIndex, { webZoom: 1 });
+      } else {
+        onUpdatePanePrefs(pane.slotIndex, { webZoom: 'auto' });
+      }
+      return;
+    }
+    onUpdatePanePrefs(pane.slotIndex, { webZoom: webZoomSetting === 'auto' ? 1 : 'auto' });
+  };
+
+  const handleToggleWebUaMode = () => {
+    const nextMode: WebUserAgentMode = webUaMode === 'desktop' ? 'mobile' : 'desktop';
+    const currentHref = webCurrentUrl || pane.url || '';
+    if (currentHref) {
+      setWebStartUrl(currentHref);
+    }
+    setDomReady(false);
+    setIsLoading(true);
+    onUpdatePanePrefs(pane.slotIndex, {
+      webUserAgentMode: nextMode,
+      webZoom: 'auto',
+    });
+  };
+
+  const handleOpenWebExternal = () => {
+    const target = webCurrentUrl || pane.url;
+    if (target && typeof window.livehub?.openExternalUrl === 'function') {
+      void window.livehub.openExternalUrl(target);
+    }
+  };
+
+  const compactWebBar = paneWidth > 0 && paneWidth < 680;
+  const ultraCompactWebBar = paneWidth > 0 && paneWidth < 520;
+  const livePlatformForAuth: PlatformId | null = isLivePlatform(pane.platform)
+    ? pane.platform
+    : webCookiePlatform;
+
   return (
     <div
+      ref={paneWrapperRef}
       className={`pane-wrapper ${isActive ? 'active-pane' : ''} ${!pane.url ? 'empty' : ''} ${
-        dragOver ? 'drag-over' : ''
-      } ${isMaximized ? 'is-maximized' : ''} ${isHiddenByMaximize ? 'is-hidden-by-max' : ''} ${
-        isPlayerFullscreen ? 'is-player-fullscreen' : ''
-      }`}
+        isWebPane ? 'is-web-pane' : ''
+      } ${dragOver ? 'drag-over' : ''} ${isMaximized ? 'is-maximized' : ''} ${
+        isHiddenByMaximize ? 'is-hidden-by-max' : ''
+      } ${isPlayerFullscreen ? 'is-player-fullscreen' : ''}`}
       onMouseDown={() => onSelectPane(pane.slotIndex)}
       onDragOver={(e) => {
         e.preventDefault();
@@ -934,213 +1296,417 @@ export const LivePane = memo(function LivePane({
       onDragLeave={() => setDragOver(false)}
       onDrop={handleDrop}
     >
-      <div className={`pane-toolbar ${isSolo || isMaximized ? 'pinned-bar' : ''}`}>
-        <div className="pane-toolbar-left">
-          <div
-            className="pane-drag-handle"
-            draggable={!isMaximized}
-            onDragStart={(e) => {
-              if (isMaximized) return;
-              e.dataTransfer.setData('application/x-livehub-pane', String(pane.slotIndex));
-              e.dataTransfer.effectAllowed = 'move';
-            }}
-            onDoubleClick={(e) => {
-              if (!canMaximize) return;
-              e.stopPropagation();
-              onToggleMaximize(pane.slotIndex);
-            }}
-            title={
-              canMaximize
-                ? '拖拽互换位置，双击标题栏临时放大/还原分屏'
-                : '拖拽与其他分屏互换位置'
-            }
-          >
-            <GripVertical size={13} style={{ color: 'var(--text-muted)', flexShrink: 0 }} />
-            {platformMeta && (
-              <span
-                className="platform-badge"
-                style={{ color: platformMeta.color, background: platformMeta.bgTint }}
+      {isWebPane ? (
+        <div
+          className={`pane-toolbar web-docked-bar ${compactWebBar ? 'is-compact' : ''} ${
+            ultraCompactWebBar ? 'is-ultra-compact' : ''
+          }`}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="web-bar-left">
+            <div
+              className="pane-drag-handle web-drag-handle"
+              draggable={!isMaximized}
+              onDragStart={(e) => {
+                if (isMaximized) return;
+                e.dataTransfer.setData('application/x-livehub-pane', String(pane.slotIndex));
+                e.dataTransfer.effectAllowed = 'move';
+              }}
+              onDoubleClick={(e) => {
+                if (!canMaximize) return;
+                e.stopPropagation();
+                onToggleMaximize(pane.slotIndex);
+              }}
+              title={
+                canMaximize
+                  ? '拖拽与其他分屏互换位置，双击临时放大/还原'
+                  : '拖拽与其他分屏互换位置'
+              }
+            >
+              <GripVertical size={13} style={{ color: 'var(--text-muted)', flexShrink: 0 }} />
+              {!ultraCompactWebBar && platformMeta && (
+                <span
+                  className="platform-badge"
+                  style={{ color: platformMeta.color, background: platformMeta.bgTint }}
+                >
+                  {platformMeta.shortName}
+                </span>
+              )}
+            </div>
+
+            <button
+              className="pane-btn web-icon-btn"
+              onClick={handleWebGoBack}
+              disabled={!webCanGoBack}
+              title="后退"
+            >
+              <ArrowLeft size={12} />
+            </button>
+            <button
+              className="pane-btn web-icon-btn"
+              onClick={handleWebGoForward}
+              disabled={!webCanGoForward}
+              title="前进"
+            >
+              <ArrowRight size={12} />
+            </button>
+            <button
+              className="pane-btn web-icon-btn"
+              onClick={handleReload}
+              title="刷新网页 (R)"
+            >
+              <RefreshCw size={12} className={isLoading ? 'spin-icon' : ''} />
+            </button>
+          </div>
+
+          <form className="web-address-form" onSubmit={handleWebAddressSubmit}>
+            <Globe size={12} className="web-address-icon" />
+            <input
+              className="web-url-input"
+              value={webAddressFocused ? webAddressInput : formatWebUrlLabel(webCurrentUrl || pane.url || '')}
+              onFocus={(e) => {
+                setWebAddressFocused(true);
+                setWebAddressInput(webCurrentUrl || pane.url || '');
+                window.setTimeout(() => e.target.select(), 0);
+              }}
+              onBlur={() => {
+                setWebAddressFocused(false);
+                setWebAddressInput(webCurrentUrl || pane.url || '');
+              }}
+              onChange={(e) => setWebAddressInput(e.target.value)}
+              placeholder="输入网址或关键词回车跳转..."
+              title={webCurrentUrl || pane.url || ''}
+            />
+          </form>
+
+          <div className="web-bar-right">
+            {livePlatformForAuth && !isPlatformLoggedIn && (
+              <button
+                className="pane-btn login-hint"
+                onClick={() => onLoginPlatform(livePlatformForAuth)}
+                title={`点击登录${PLATFORMS[livePlatformForAuth].name}，Cookie 将自动同步至此网页`}
               >
-                {platformMeta.shortName}
-              </span>
+                <KeyRound size={12} />
+                {!compactWebBar && <span>登录同步</span>}
+              </button>
             )}
-            <span className="pane-title">
-              {pane.url ? pane.title : `画面 ${pane.slotIndex + 1}（空闲）`}
-            </span>
+
+            <div className="web-zoom-group">
+              {!ultraCompactWebBar && (
+                <button
+                  className="pane-btn web-icon-btn"
+                  onClick={() => handleStepWebZoom(-0.1)}
+                  disabled={effectiveWebZoom <= 0.5}
+                  title="缩小网页显示比例"
+                >
+                  <ZoomOut size={12} />
+                </button>
+              )}
+              <button
+                className={`pane-btn web-zoom-pill ${webZoomSetting === 'auto' ? 'is-auto' : ''}`}
+                onClick={handleResetOrCycleWebZoom}
+                title={
+                  webZoomSetting === 'auto'
+                    ? `当前已开启宽度自适应缩放 (${Math.round(effectiveWebZoom * 100)}%)，点击切换 100%`
+                    : `当前手动缩放 ${Math.round(effectiveWebZoom * 100)}%，点击恢复宽度自适应`
+                }
+              >
+                <span>
+                  {webZoomSetting === 'auto'
+                    ? `${ultraCompactWebBar ? '' : '适配 '}${Math.round(effectiveWebZoom * 100)}%`
+                    : `${Math.round(effectiveWebZoom * 100)}%`}
+                </span>
+              </button>
+              {!ultraCompactWebBar && (
+                <button
+                  className="pane-btn web-icon-btn"
+                  onClick={() => handleStepWebZoom(0.1)}
+                  disabled={effectiveWebZoom >= 1.5}
+                  title="放大网页显示比例"
+                >
+                  <ZoomIn size={12} />
+                </button>
+              )}
+            </div>
+
+            <button
+              className={`pane-btn ${webUaMode === 'mobile' ? 'web-ua-mobile' : ''}`}
+              onClick={handleToggleWebUaMode}
+              title={
+                webUaMode === 'mobile'
+                  ? '当前：手机版排版（适合窄屏刷B站/微博），点击切回桌面版'
+                  : '当前：桌面版排版，点击切换手机版以适配窄屏'
+              }
+            >
+              {webUaMode === 'mobile' ? <Smartphone size={12} /> : <Monitor size={12} />}
+              {!compactWebBar && <span>{webUaMode === 'mobile' ? '手机' : '桌面'}</span>}
+            </button>
+
+            <button
+              className={`pane-btn ${isSolo ? 'solo-active' : ''}`}
+              onClick={() => onToggleSolo(pane.slotIndex)}
+              title={isSolo ? '取消独听' : `独听此网页（快捷键 ${pane.slotIndex + 1}）`}
+            >
+              <Headphones size={12} />
+              {!compactWebBar && <span>{isSolo ? '独听中' : '独听'}</span>}
+            </button>
+
+            <button
+              className={`pane-btn web-icon-btn ${effectiveMuted ? 'muted-active' : ''}`}
+              onClick={() => onToggleMute(pane.slotIndex)}
+              title={effectiveMuted ? '取消静音 (M)' : '静音此网页 (M)'}
+            >
+              {effectiveMuted ? <VolumeX size={12} /> : <Volume2 size={12} />}
+            </button>
+
+            {canMaximize && (
+              <button
+                className={`pane-btn web-icon-btn ${isMaximized ? 'solo-active' : ''}`}
+                onClick={() => onToggleMaximize(pane.slotIndex)}
+                title={isMaximized ? '还原分屏布局 (Esc)' : '临时单屏放大'}
+              >
+                {isMaximized ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
+              </button>
+            )}
+
+            {pane.slotIndex > 0 && !isMaximized && !ultraCompactWebBar && (
+              <button
+                className="pane-btn web-icon-btn"
+                onClick={() => onSwapPanes(pane.slotIndex, 0)}
+                title="切为主屏（与 1 号画面互换）"
+              >
+                <ArrowUpLeft size={12} />
+              </button>
+            )}
+
+            {!ultraCompactWebBar && (
+              <button
+                className="pane-btn web-icon-btn"
+                onClick={handleOpenWebExternal}
+                title="在系统默认浏览器中打开当前网址"
+              >
+                <ExternalLink size={12} />
+              </button>
+            )}
+
+            <button
+              className="pane-btn web-icon-btn"
+              onClick={() => onClearPane(pane.slotIndex)}
+              title="关闭此画面"
+            >
+              <X size={12} />
+            </button>
           </div>
         </div>
-
-        <div className="pane-toolbar-right" onClick={(e) => e.stopPropagation()}>
-          {channels.length > 0 && (
-            <select
-              className="pane-btn"
-              style={{ maxWidth: 112 }}
-              value={pane.channelId ?? ''}
-              onChange={(e) => {
-                const chosen = channels.find((c) => c.id === e.target.value);
-                if (chosen) onLoadChannelInPane(pane.slotIndex, chosen);
+      ) : (
+        <div className={`pane-toolbar ${isSolo || isMaximized ? 'pinned-bar' : ''}`}>
+          <div className="pane-toolbar-left">
+            <div
+              className="pane-drag-handle"
+              draggable={!isMaximized}
+              onDragStart={(e) => {
+                if (isMaximized) return;
+                e.dataTransfer.setData('application/x-livehub-pane', String(pane.slotIndex));
+                e.dataTransfer.effectAllowed = 'move';
               }}
-              title="快速切换收藏主播"
+              onDoubleClick={(e) => {
+                if (!canMaximize) return;
+                e.stopPropagation();
+                onToggleMaximize(pane.slotIndex);
+              }}
+              title={
+                canMaximize
+                  ? '拖拽互换位置，双击标题栏临时放大/还原分屏'
+                  : '拖拽与其他分屏互换位置'
+              }
             >
-              <option value="" disabled>
-                切换主播
-              </option>
-              {channels.map((ch) => (
-                <option key={ch.id} value={ch.id}>
-                  [{PLATFORMS[ch.platform].shortName}] {ch.name}
-                </option>
-              ))}
-            </select>
-          )}
-
-          {pane.url && (
-            <>
-              {pane.platform && !isPlatformLoggedIn && (
-                <button
-                  className="pane-btn login-hint"
-                  onClick={() => onLoginPlatform(pane.platform!)}
-                  title={`当前未登录${platformMeta?.name || ''}，点击扫码登录解锁蓝光/原画高画质`}
-                >
-                  <KeyRound size={12} />
-                  <span>登录解锁蓝光</span>
-                </button>
-              )}
-
-              {streamOptions.qualities.length > 0 ? (
-                <select
-                  className="pane-btn pane-select"
-                  value={activeQualityValue}
-                  onChange={(e) => handleSelectQuality(e.target.value)}
-                  title="切换直播画质（原画 / 蓝光 / 超清 / 高清）"
-                >
-                  {streamOptions.qualities.map((q) => (
-                    <option key={q.id} value={q.id}>
-                      画质: {q.label}{q.locked ? ' (需登录)' : ''}
-                    </option>
-                  ))}
-                </select>
-              ) : (
-                <button
-                  className="pane-btn"
-                  onClick={() => void handleProbeStreamOptions()}
-                  title="探测当前播放器画质与线路选项"
-                >
-                  <SlidersHorizontal size={12} />
-                  <span>{probing ? '探测中...' : '画质/线路'}</span>
-                </button>
-              )}
-
-              {streamOptions.lines.length > 0 && (
-                <select
-                  className="pane-btn pane-select"
-                  value={activeLineValue}
-                  onChange={(e) => handleSelectLine(e.target.value)}
-                  title="切换 CDN 播放线路"
-                >
-                  {streamOptions.lines.map((l) => (
-                    <option key={l.id} value={l.id}>
-                      线路: {l.label}
-                    </option>
-                  ))}
-                </select>
-              )}
-
-              {(streamOptions.qualities.length > 0 || streamOptions.lines.length > 0) && (
-                <button
-                  className="pane-btn"
-                  onClick={() => void handleProbeStreamOptions()}
-                  title="重新探测画质与线路"
-                >
-                  <SlidersHorizontal size={12} />
-                </button>
-              )}
-
-              {paneHint && (
-                <span className="pane-btn login-hint" style={{ pointerEvents: 'none' }}>
-                  {paneHint}
-                </span>
-              )}
-
-              <button
-                className={`pane-btn ${isSolo ? 'solo-active' : ''}`}
-                onClick={() => onToggleSolo(pane.slotIndex)}
-                title={isSolo ? '取消独听' : `独听（快捷键 ${pane.slotIndex + 1}）`}
-              >
-                <Headphones size={12} />
-                <span>{isSolo ? '独听中' : '独听'}</span>
-              </button>
-
-              <button
-                className={`pane-btn ${effectiveMuted ? 'muted-active' : ''}`}
-                onClick={() => onToggleMute(pane.slotIndex)}
-                title={effectiveMuted ? '取消静音 (M)' : '静音此画面 (M)'}
-              >
-                {effectiveMuted ? <VolumeX size={12} /> : <Volume2 size={12} />}
-              </button>
-
-              {useDirectStream && directStats && (
+              <GripVertical size={13} style={{ color: 'var(--text-muted)', flexShrink: 0 }} />
+              {platformMeta && (
                 <span
-                  className="pane-btn direct-badge"
-                  title={
-                    directStats.resolution
-                      ? `极速直连 ${directStats.protocol} · 分辨率 ${directStats.resolution}`
-                      : `极速直连 ${directStats.protocol}`
-                  }
+                  className="platform-badge"
+                  style={{ color: platformMeta.color, background: platformMeta.bgTint }}
                 >
-                  <Zap size={11} />
-                  <span>
-                    {directStats.protocol}
-                    {directStats.latencySec !== null ? ` ${directStats.latencySec}s` : ''}
-                  </span>
+                  {platformMeta.shortName}
                 </span>
               )}
+              <span className="pane-title">
+                {pane.url ? pane.title : `画面 ${pane.slotIndex + 1}（空闲）`}
+              </span>
+            </div>
+          </div>
 
-              <button
-                className={`pane-btn ${pane.mode === 'full' ? 'mode-full' : ''}`}
-                onClick={() =>
-                  onToggleMode(pane.slotIndex, pane.mode === 'pure' ? 'full' : 'pure')
-                }
-                title="切换极速直连（超低延迟无广告） / 完整网页模式（发弹幕、看重播）"
+          <div className="pane-toolbar-right" onClick={(e) => e.stopPropagation()}>
+            {channels.length > 0 && (
+              <select
+                className="pane-btn"
+                style={{ maxWidth: 112 }}
+                value={pane.channelId ?? ''}
+                onChange={(e) => {
+                  const chosen = channels.find((c) => c.id === e.target.value);
+                  if (chosen) onLoadChannelInPane(pane.slotIndex, chosen);
+                }}
+                title="快速切换收藏主播或网页"
               >
-                {pane.mode === 'pure' ? <Zap size={12} /> : <Globe size={12} />}
-                <span>{pane.mode === 'pure' ? '直连' : '网页'}</span>
-              </button>
+                <option value="" disabled>
+                  切换收藏
+                </option>
+                {channels.map((ch) => (
+                  <option key={ch.id} value={ch.id}>
+                    [{getChannelPlatformMeta(ch.platform).shortName}] {ch.name}
+                  </option>
+                ))}
+              </select>
+            )}
 
-              {canMaximize && (
+            {pane.url && (
+              <>
+                {livePlatformForAuth && !isPlatformLoggedIn && (
+                  <button
+                    className="pane-btn login-hint"
+                    onClick={() => onLoginPlatform(livePlatformForAuth)}
+                    title={`当前未登录${PLATFORMS[livePlatformForAuth].name}，点击扫码登录解锁蓝光/原画高画质`}
+                  >
+                    <KeyRound size={12} />
+                    <span>登录解锁蓝光</span>
+                  </button>
+                )}
+
+                {streamOptions.qualities.length > 0 ? (
+                  <select
+                    className="pane-btn pane-select"
+                    value={activeQualityValue}
+                    onChange={(e) => handleSelectQuality(e.target.value)}
+                    title="切换直播画质（原画 / 蓝光 / 超清 / 高清）"
+                  >
+                    {streamOptions.qualities.map((q) => (
+                      <option key={q.id} value={q.id}>
+                        画质: {q.label}{q.locked ? ' (需登录)' : ''}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <button
+                    className="pane-btn"
+                    onClick={() => void handleProbeStreamOptions()}
+                    title="探测当前播放器画质与线路选项"
+                  >
+                    <SlidersHorizontal size={12} />
+                    <span>{probing ? '探测中...' : '画质/线路'}</span>
+                  </button>
+                )}
+
+                {streamOptions.lines.length > 0 && (
+                  <select
+                    className="pane-btn pane-select"
+                    value={activeLineValue}
+                    onChange={(e) => handleSelectLine(e.target.value)}
+                    title="切换 CDN 播放线路"
+                  >
+                    {streamOptions.lines.map((l) => (
+                      <option key={l.id} value={l.id}>
+                        线路: {l.label}
+                      </option>
+                    ))}
+                  </select>
+                )}
+
+                {(streamOptions.qualities.length > 0 || streamOptions.lines.length > 0) && (
+                  <button
+                    className="pane-btn"
+                    onClick={() => void handleProbeStreamOptions()}
+                    title="重新探测画质与线路"
+                  >
+                    <SlidersHorizontal size={12} />
+                  </button>
+                )}
+
+                {paneHint && (
+                  <span className="pane-btn login-hint" style={{ pointerEvents: 'none' }}>
+                    {paneHint}
+                  </span>
+                )}
+
                 <button
-                  className={`pane-btn ${isMaximized ? 'solo-active' : ''}`}
-                  onClick={() => onToggleMaximize(pane.slotIndex)}
-                  title={isMaximized ? '还原分屏布局 (Esc)' : '临时单屏放大（不破坏当前分屏布局）'}
+                  className={`pane-btn ${isSolo ? 'solo-active' : ''}`}
+                  onClick={() => onToggleSolo(pane.slotIndex)}
+                  title={isSolo ? '取消独听' : `独听（快捷键 ${pane.slotIndex + 1}）`}
                 >
-                  {isMaximized ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
+                  <Headphones size={12} />
+                  <span>{isSolo ? '独听中' : '独听'}</span>
                 </button>
-              )}
 
-              {pane.slotIndex > 0 && !isMaximized && (
+                <button
+                  className={`pane-btn ${effectiveMuted ? 'muted-active' : ''}`}
+                  onClick={() => onToggleMute(pane.slotIndex)}
+                  title={effectiveMuted ? '取消静音 (M)' : '静音此画面 (M)'}
+                >
+                  {effectiveMuted ? <VolumeX size={12} /> : <Volume2 size={12} />}
+                </button>
+
+                {useDirectStream && directStats && (
+                  <span
+                    className="pane-btn direct-badge"
+                    title={
+                      directStats.resolution
+                        ? `极速直连 ${directStats.protocol} · 分辨率 ${directStats.resolution}`
+                        : `极速直连 ${directStats.protocol}`
+                    }
+                  >
+                    <Zap size={11} />
+                    <span>
+                      {directStats.protocol}
+                      {directStats.latencySec !== null ? ` ${directStats.latencySec}s` : ''}
+                    </span>
+                  </span>
+                )}
+
+                <button
+                  className={`pane-btn ${pane.mode === 'full' ? 'mode-full' : ''}`}
+                  onClick={() =>
+                    onToggleMode(pane.slotIndex, pane.mode === 'pure' ? 'full' : 'pure')
+                  }
+                  title="切换极速直连（超低延迟无广告） / 完整网页模式（发弹幕、看重播）"
+                >
+                  {pane.mode === 'pure' ? <Zap size={12} /> : <Globe size={12} />}
+                  <span>{pane.mode === 'pure' ? '直连' : '网页'}</span>
+                </button>
+
+                {canMaximize && (
+                  <button
+                    className={`pane-btn ${isMaximized ? 'solo-active' : ''}`}
+                    onClick={() => onToggleMaximize(pane.slotIndex)}
+                    title={isMaximized ? '还原分屏布局 (Esc)' : '临时单屏放大（不破坏当前分屏布局）'}
+                  >
+                    {isMaximized ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
+                  </button>
+                )}
+
+                {pane.slotIndex > 0 && !isMaximized && (
+                  <button
+                    className="pane-btn"
+                    onClick={() => onSwapPanes(pane.slotIndex, 0)}
+                    title="切为主屏（与 1 号主画面互换）"
+                  >
+                    <ArrowUpLeft size={12} />
+                  </button>
+                )}
+
+                <button className="pane-btn" onClick={handleReload} title="刷新该直播间 (R)">
+                  <RefreshCw size={12} />
+                </button>
+
                 <button
                   className="pane-btn"
-                  onClick={() => onSwapPanes(pane.slotIndex, 0)}
-                  title="切为主屏（与 1 号主画面互换）"
+                  onClick={() => onClearPane(pane.slotIndex)}
+                  title="关闭此画面"
                 >
-                  <ArrowUpLeft size={12} />
+                  <X size={12} />
                 </button>
-              )}
-
-              <button className="pane-btn" onClick={handleReload} title="刷新该直播间 (R)">
-                <RefreshCw size={12} />
-              </button>
-
-              <button
-                className="pane-btn"
-                onClick={() => onClearPane(pane.slotIndex)}
-                title="关闭此画面"
-              >
-                <X size={12} />
-              </button>
-            </>
-          )}
+              </>
+            )}
+          </div>
         </div>
-      </div>
+      )}
 
       {pane.url && useDirectStream ? (
         <div className="direct-stage">
@@ -1358,6 +1924,53 @@ export const LivePane = memo(function LivePane({
             </div>
           )}
         </div>
+      ) : isWebPane && pane.url ? (
+        <div className="web-pane-stage">
+          {mountReady && (
+            <webview
+              key={`web-${pane.slotIndex}-${pane.url}-${webUaMode}`}
+              ref={(node) => {
+                webviewRef.current = node as WebviewElement | null;
+              }}
+              className="pane-webview is-free-web"
+              src={webStartUrl || pane.url}
+              partition="persist:livehub"
+              useragent={webUaMode === 'mobile' ? WEB_MOBILE_UA : WEB_DESKTOP_UA}
+              allowpopups={true}
+            />
+          )}
+          {(isLoading || !mountReady) && (
+            <div className="web-loading-bar" aria-hidden="true">
+              <span className="web-loading-bar-beam" />
+            </div>
+          )}
+          {webLoadError && !isLoading && (
+            <div className="pane-loading-overlay">
+              <div className="direct-status-card">
+                <div className="pane-empty-title">网页暂时无法打开</div>
+                <div className="pane-empty-sub">
+                  {webLoadError.desc} ({webLoadError.code})
+                </div>
+                <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+                  <button
+                    className="primary-btn"
+                    onClick={() => {
+                      setWebLoadError(null);
+                      handleReload();
+                    }}
+                  >
+                    <RefreshCw size={12} />
+                    <span>重新加载</span>
+                  </button>
+                  <button className="icon-btn" onClick={handleOpenWebExternal}>
+                    <ExternalLink size={12} />
+                    <span>浏览器打开</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
       ) : pane.url && webviewPreloadPath ? (
         <>
           {mountReady && (
@@ -1387,7 +2000,7 @@ export const LivePane = memo(function LivePane({
           <div className="pane-empty-card">
             <div className="pane-empty-title">画面 {pane.slotIndex + 1}</div>
             <div className="pane-empty-sub">
-              从左侧点击或拖拽主播到此窗格，或直接粘贴虎牙 / 斗鱼 / B站 / 抖音链接与口令
+              从左侧点击或拖拽主播/网页到此窗格，或直接粘贴直播间链接与任意网址（抖音 / B站等，自动复用登录 Cookie）
             </div>
             <form className="pane-quick-form" onSubmit={(e) => void handleQuickSubmit(e)}>
               <input
@@ -1398,10 +2011,10 @@ export const LivePane = memo(function LivePane({
                   setQuickPendingRoomId(null);
                   setQuickError(null);
                 }}
-                placeholder="粘贴直播间链接 / 抖音分享口令 / hy:660000"
+                placeholder="粘贴直播间链接 / 任意网址 (douyin.com, bilibili.com)"
               />
               <button type="submit" className="primary-btn" disabled={quickResolving}>
-                {quickResolving ? '解析中' : '看播'}
+                {quickResolving ? '解析中' : '打开'}
               </button>
             </form>
             {quickPendingRoomId && (
@@ -1423,7 +2036,7 @@ export const LivePane = memo(function LivePane({
             {channels.length > 0 && (
               <div className="pane-quick-chips">
                 {channels.slice(0, 6).map((ch) => {
-                  const meta = PLATFORMS[ch.platform];
+                  const meta = getChannelPlatformMeta(ch.platform);
                   return (
                     <button
                       key={ch.id}
@@ -1437,6 +2050,23 @@ export const LivePane = memo(function LivePane({
                 })}
               </div>
             )}
+            <div className="pane-empty-web-row">
+              <span className="pane-empty-web-label">边看边刷</span>
+              {QUICK_WEB_PRESETS.map((site) => (
+                <button
+                  key={site.url}
+                  type="button"
+                  className="quick-channel-chip quick-web-chip"
+                  onClick={() =>
+                    onLoadUrlInPane(pane.slotIndex, site.url, site.name, null, 'web')
+                  }
+                  title={`在此窗格打开 ${site.name}（复用已登录 Cookie）`}
+                >
+                  <Globe size={11} style={{ color: '#6366f1' }} />
+                  <span>{site.name}</span>
+                </button>
+              ))}
+            </div>
           </div>
         </div>
       )}

@@ -1,5 +1,9 @@
 export type PlatformId = 'huya' | 'douyu' | 'bilibili' | 'douyin';
 
+export type ChannelPlatform = PlatformId | 'web';
+
+export type WebUserAgentMode = 'desktop' | 'mobile';
+
 export type LayoutMode = '1x1' | '1x2' | '2x1' | '1+2' | '2x2';
 
 export type PaneViewMode = 'pure' | 'full';
@@ -44,7 +48,7 @@ export interface DiagnosticLogEntry {
 
 export interface Channel {
   id: string;
-  platform: PlatformId;
+  platform: ChannelPlatform;
   roomId: string;
   name: string;
   group: string;
@@ -59,7 +63,7 @@ export interface PaneSlot {
   slotIndex: number;
   channelId: string | null;
   url: string | null;
-  platform: PlatformId | null;
+  platform: ChannelPlatform | null;
   title: string;
   muted: boolean;
   mode: PaneViewMode;
@@ -68,6 +72,8 @@ export interface PaneSlot {
   preferredQualityId?: string;
   preferredLineId?: string;
   danmakuEnabled?: boolean;
+  webZoom?: number | 'auto';
+  webUserAgentMode?: WebUserAgentMode;
 }
 
 export interface AppSettings {
@@ -138,7 +144,7 @@ export type AuthStatusMap = Record<PlatformId, PlatformAuthInfo>;
 
 export interface ResolvedLiveInput {
   ok: boolean;
-  platform?: PlatformId;
+  platform?: ChannelPlatform;
   roomId?: string;
   url?: string;
   suggestedName?: string;
@@ -241,7 +247,8 @@ export interface LiveHubAPI {
   clearPlatformCookies: (platform?: PlatformId) => Promise<AuthStatusMap>;
   getWebviewPreloadPath: () => Promise<string>;
   wakeWebview: (webContentsId: number, width?: number, height?: number) => Promise<void>;
-  resolveLiveInput: (rawInput: string, fallbackPlatform?: PlatformId) => Promise<ResolvedLiveInput>;
+  registerFreeWebContents: (webContentsId: number) => Promise<void>;
+  resolveLiveInput: (rawInput: string, fallbackPlatform?: ChannelPlatform) => Promise<ResolvedLiveInput>;
   resolveStream: (req: DirectStreamRequest) => Promise<DirectStreamResult>;
   checkLiveStatuses: (
     items: LiveStatusCheckItem[]

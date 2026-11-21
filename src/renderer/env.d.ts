@@ -13,6 +13,7 @@ declare global {
           src?: string;
           partition?: string;
           preload?: string;
+          useragent?: string;
           allowpopups?: string | boolean;
         },
         HTMLElement
@@ -24,6 +25,16 @@ declare global {
 export interface WebviewElement extends HTMLElement {
   src: string;
   reload: () => void;
+  stop: () => void;
+  goBack: () => void;
+  goForward: () => void;
+  canGoBack: () => boolean;
+  canGoForward: () => boolean;
+  loadURL: (url: string) => Promise<void>;
+  getURL: () => string;
+  setZoomFactor: (factor: number) => void;
+  getZoomFactor: () => number;
+  insertCSS: (css: string) => Promise<string>;
   setAudioMuted: (muted: boolean) => void;
   isAudioMuted: () => boolean;
   send: (channel: string, ...args: unknown[]) => void;

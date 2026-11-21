@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
-import { LAYOUT_CONFIGS } from '../../shared/platforms';
+import { LAYOUT_CONFIGS, detectPlatformFromUrl, isLivePlatform } from '../../shared/platforms';
 import type {
   AppSettings,
   AuthStatusMap,
   Channel,
+  ChannelPlatform,
   DanmakuArea,
   DanmakuMode,
   PaneSlot,
@@ -29,7 +30,13 @@ interface SplitGridProps {
   onToggleFullscreen: (slotIndex: number) => void;
   onDetectedCategory: (channelId: string, category: string, title?: string, anchorName?: string) => void;
   onChangeSplitRatios: (ratios: SplitRatios) => void;
-  onLoadUrlInPane: (slotIndex: number, url: string, title?: string, channelId?: string | null) => void;
+  onLoadUrlInPane: (
+    slotIndex: number,
+    url: string,
+    title?: string,
+    channelId?: string | null,
+    explicitPlatform?: ChannelPlatform | null
+  ) => void;
   onLoadChannelInPane: (slotIndex: number, channel: Channel) => void;
   onToggleMute: (slotIndex: number) => void;
   onToggleSolo: (slotIndex: number) => void;
@@ -38,7 +45,16 @@ interface SplitGridProps {
   onUpdatePanePrefs: (
     slotIndex: number,
     patch: Partial<
-      Pick<PaneSlot, 'volume' | 'fitMode' | 'preferredQualityId' | 'preferredLineId' | 'danmakuEnabled'>
+      Pick<
+        PaneSlot,
+        | 'volume'
+        | 'fitMode'
+        | 'preferredQualityId'
+        | 'preferredLineId'
+        | 'danmakuEnabled'
+        | 'webZoom'
+        | 'webUserAgentMode'
+      >
     >
   ) => void;
   onClearPane: (slotIndex: number) => void;
@@ -173,10 +189,15 @@ export function SplitGrid({
             (settings.soloSlotIndex !== null
               ? settings.soloSlotIndex !== pane.slotIndex
               : pane.muted);
-          const isPlatformLoggedIn = pane.platform
-            ? Boolean(authStatus[pane.platform]?.loggedIn)
+          const authPlatform = isLivePlatform(pane.platform)
+            ? pane.platform
+            : pane.url
+              ? detectPlatformFromUrl(pane.url)
+              : null;
+          const isPlatformLoggedIn = authPlatform
+            ? Boolean(authStatus[authPlatform]?.loggedIn)
             : true;
-          const platformReloadEpoch = pane.platform ? reloadEpochs[pane.platform] : 0;
+          const platformReloadEpoch = authPlatform ? reloadEpochs[authPlatform] : 0;
           const isMaximized = effectiveMaxSlot === pane.slotIndex;
           const isHiddenByMaximize =
             effectiveMaxSlot !== null && effectiveMaxSlot !== pane.slotIndex;
