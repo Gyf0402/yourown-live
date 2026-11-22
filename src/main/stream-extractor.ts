@@ -30,21 +30,45 @@ const HUYA_CDN_LABELS: Record<string, string> = {
 };
 
 const DOUYIN_QUALITY_LABELS: Record<string, string> = {
+  origin_60: '原画 60帧',
   origin: '原画',
   ORIGIN: '原画',
+  uhd_60: '蓝光 60帧',
   uhd: '蓝光超清',
   FULL_HD1: '蓝光',
+  full_hd1: '蓝光',
+  hd_60: '超清 60帧',
   hd: '超清',
   HD1: '超清',
   sd: '高清',
   SD1: '高清',
+  sd1: '高清',
   ld: '标清',
   SD2: '标清',
+  sd2: '标清',
   md: '流畅',
   ao: '仅音频',
 };
 
-const DOUYIN_QUALITY_ORDER = ['origin', 'ORIGIN', 'FULL_HD1', 'uhd', 'HD1', 'hd', 'SD1', 'sd', 'SD2', 'ld', 'md'];
+const DOUYIN_QUALITY_ORDER = [
+  'origin_60',
+  'origin',
+  'ORIGIN',
+  'uhd_60',
+  'FULL_HD1',
+  'full_hd1',
+  'uhd',
+  'hd_60',
+  'HD1',
+  'hd',
+  'SD1',
+  'sd1',
+  'sd',
+  'SD2',
+  'sd2',
+  'ld',
+  'md',
+];
 
 let cachedDouyinTtwid: { value: string; expiresAt: number } | null = null;
 const huyaRidCache = new Map<string, string>();
@@ -709,86 +733,54 @@ async function extractBilibili(
     bilibiliRealRidCache.set(req.roomId, { realRid, uid: infoData.uid });
   }
 
-  // Step 2: Request getRoomPlayInfo with real long room_id, codec=0,1,2 (AVC/HEVC/AV1), WBI signature, and full Chromium session cookies.
-  const playQuery = buildBilibiliWbiQuery(
-    {
-      room_id: realRid,
-      no_playurl: 0,
-      mask: 1,
-      qn: targetQn,
-      platform: 'web',
-      protocol: '0,1',
-      format: '0,1,2',
-      codec: '0,1,2',
-      dolby: 5,
-      panorama: 1,
-      ptype: 8,
-    },
-    wbiKeys
-  );
-
-  const playResp = await sessionFetchWithTimeout(
-    liveSession,
-    `https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo?${playQuery}`,
-    5500
-  ).then((r) => r.json());
-
-  const playData = (playResp as {
-    code?: number;
-    data?: {
-      uid?: number;
-      room_id?: number;
-      live_status?: number;
-      playurl_info?: {
-        playurl?: {
-          g_qn_desc?: Array<{ qn: number; desc: string; eotf?: number }>;
-          stream?: Array<{
-            protocol_name: string;
-            format: Array<{
-              format_name: string;
-              codec: Array<{
-                codec_name: string;
-                current_qn: number;
-                accept_qn: number[];
-                base_url: string;
-                url_info: Array<{ host: string; extra: string }>;
-              }>;
+  type BiliPlayInfoData = {
+    uid?: number;
+    room_id?: number;
+    live_status?: number;
+    playurl_info?: {
+      playurl?: {
+        g_qn_desc?: Array<{ qn: number; desc: string; eotf?: number }>;
+        stream?: Array<{
+          protocol_name: string;
+          format: Array<{
+            format_name: string;
+            codec: Array<{
+              codec_name: string;
+              current_qn: number;
+              accept_qn: number[];
+              base_url: string;
+              url_info: Array<{ host: string; extra: string }>;
             }>;
           }>;
-        };
+        }>;
       };
     };
-  })?.data;
+  };
 
-  const title = infoData?.title;
-  const uid = playData?.uid ?? infoData?.uid ?? cachedRid?.uid;
-  const liveStatus = playData?.live_status ?? infoData?.live_status;
-
-  if (!playData || liveStatus !== 1) {
-    const anchorName = await getBilibiliAnchorName(uid);
-    return {
-      ok: false,
-      platform: 'bilibili',
-      roomId: req.roomId,
-      status: 'offline',
-      title,
-      anchorName,
-      category,
-      referer,
-      qualities: [],
-      lines: [],
-      error: '主播暂未开播',
-    };
-  }
-
-  const playurl = playData.playurl_info?.playurl;
-  const descMap = new Map<number, string>();
-  for (const item of playurl?.g_qn_desc || []) {
-    // Prefer standard SDR label (eotf === 0, e.g. "原画") over HDR variants ("原画/HDR")
-    if (!descMap.has(item.qn) || item.eotf === 0) {
-      descMap.set(item.qn, item.desc);
-    }
-  }
+  const fetchBiliPlayInfo = async (qnVal: string): Promise<BiliPlayInfoData | undefined> => {
+    const playQuery = buildBilibiliWbiQuery(
+      {
+        room_id: realRid,
+        no_playurl: 0,
+        mask: 1,
+        qn: qnVal,
+        platform: 'web',
+        protocol: '0,1',
+        format: '0,1,2',
+        codec: '0,1,2',
+        dolby: 5,
+        panorama: 1,
+        ptype: 8,
+      },
+      wbiKeys
+    );
+    const playResp = await sessionFetchWithTimeout(
+      liveSession,
+      `https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo?${playQuery}`,
+      5500
+    ).then((r) => r.json());
+    return (playResp as { code?: number; data?: BiliPlayInfoData })?.data;
+  };
 
   type CodecEntry = {
     formatName: string;
@@ -797,32 +789,7 @@ async function extractBilibili(
     acceptQn: number[];
     urls: string[];
   };
-  const flvEntries: CodecEntry[] = [];
-  const hlsEntries: CodecEntry[] = [];
 
-  for (const st of playurl?.stream || []) {
-    for (const fmt of st.format || []) {
-      for (const cd of fmt.codec || []) {
-        const sortedUrls = [...(cd.url_info || [])]
-          .sort((a, b) => scoreBilibiliHost(a.host) - scoreBilibiliHost(b.host))
-          .map((u) => `${u.host}${cd.base_url}${u.extra}`);
-        if (sortedUrls.length === 0) continue;
-        const entry: CodecEntry = {
-          formatName: fmt.format_name,
-          codecName: cd.codec_name,
-          currentQn: cd.current_qn,
-          acceptQn: cd.accept_qn || [],
-          urls: sortedUrls,
-        };
-        if (fmt.format_name === 'flv') flvEntries.push(entry);
-        else hlsEntries.push(entry);
-      }
-    }
-  }
-
-  // When user explicitly selects a qualityId, prefer codecs that achieved that exact qn (so switching
-  // down to 150/250/400 isn't overridden by HEVC/AV1 falling back to a higher qn).
-  // Otherwise rank by highest achieved currentQn first, then AVC (lowest CPU) and fmp4 over ts.
   const requestedQnNum = req.qualityId ? Number(req.qualityId) : NaN;
   const hasExplicitReqQn = Number.isFinite(requestedQnNum) && requestedQnNum > 0;
   const codecPriority = (c: string) => (c === 'avc' ? 0 : c === 'hevc' ? 1 : c === 'av1' ? 2 : 3);
@@ -845,19 +812,102 @@ async function extractBilibili(
       return codecPriority(a.codecName) - codecPriority(b.codecName);
     });
 
-  const flvCodec = sortBestEntry(flvEntries, false)[0];
-  const hlsCodec = sortBestEntry(hlsEntries, true)[0];
-  // If HLS (fmp4) achieves a better match than FLV (e.g. 原画 10000/2K/4K on fmp4 vs 超清 250 on flv),
-  // promote HLS as primary; never override FLV when FLV already matched the user's explicit qualityId.
-  const flvExactMatch = Boolean(hasExplicitReqQn && flvCodec && flvCodec.currentQn === requestedQnNum);
-  const hlsExactMatch = Boolean(hasExplicitReqQn && hlsCodec && hlsCodec.currentQn === requestedQnNum);
-  const useHlsAsPrimary = Boolean(
-    hlsCodec &&
-      (!flvCodec ||
-        (hlsExactMatch && !flvExactMatch) ||
-        (!flvExactMatch && hlsCodec.currentQn > flvCodec.currentQn))
-  );
-  const primary = useHlsAsPrimary ? hlsCodec : flvCodec || hlsCodec;
+  const parseBiliStreams = (data: BiliPlayInfoData | undefined) => {
+    const playurl = data?.playurl_info?.playurl;
+    const descMap = new Map<number, string>();
+    for (const item of playurl?.g_qn_desc || []) {
+      if (!descMap.has(item.qn) || item.eotf === 0) {
+        descMap.set(item.qn, item.desc);
+      }
+    }
+    const flvEntries: CodecEntry[] = [];
+    const hlsEntries: CodecEntry[] = [];
+    for (const st of playurl?.stream || []) {
+      for (const fmt of st.format || []) {
+        for (const cd of fmt.codec || []) {
+          const sortedUrls = [...(cd.url_info || [])]
+            .sort((a, b) => scoreBilibiliHost(a.host) - scoreBilibiliHost(b.host))
+            .map((u) => `${u.host}${cd.base_url}${u.extra}`);
+          if (sortedUrls.length === 0) continue;
+          const entry: CodecEntry = {
+            formatName: fmt.format_name,
+            codecName: cd.codec_name,
+            currentQn: cd.current_qn,
+            acceptQn: cd.accept_qn || [],
+            urls: sortedUrls,
+          };
+          if (fmt.format_name === 'flv') flvEntries.push(entry);
+          else hlsEntries.push(entry);
+        }
+      }
+    }
+    const flvCodec = sortBestEntry(flvEntries, false)[0];
+    const hlsCodec = sortBestEntry(hlsEntries, true)[0];
+    const flvExactMatch = Boolean(hasExplicitReqQn && flvCodec && flvCodec.currentQn === requestedQnNum);
+    const hlsExactMatch = Boolean(hasExplicitReqQn && hlsCodec && hlsCodec.currentQn === requestedQnNum);
+    const useHlsAsPrimary = Boolean(
+      hlsCodec &&
+        (!flvCodec ||
+          (hlsExactMatch && !flvExactMatch) ||
+          (!flvExactMatch && hlsCodec.currentQn > flvCodec.currentQn))
+    );
+    const primary = useHlsAsPrimary ? hlsCodec : flvCodec || hlsCodec;
+    const allAcceptQns = Array.from(
+      new Set([...flvEntries, ...hlsEntries].flatMap((e) => e.acceptQn))
+    ).sort((a, b) => b - a);
+    return { descMap, flvEntries, hlsEntries, flvCodec, hlsCodec, useHlsAsPrimary, primary, allAcceptQns };
+  };
+
+  // Step 2: Request getRoomPlayInfo with real long room_id, codec=0,1,2 (AVC/HEVC/AV1), WBI signature, and full Chromium session cookies.
+  let playData = await fetchBiliPlayInfo(targetQn);
+
+  const title = infoData?.title;
+  const uid = playData?.uid ?? infoData?.uid ?? cachedRid?.uid;
+  const liveStatus = playData?.live_status ?? infoData?.live_status;
+
+  if (!playData || liveStatus !== 1) {
+    const anchorName = await getBilibiliAnchorName(uid);
+    return {
+      ok: false,
+      platform: 'bilibili',
+      roomId: req.roomId,
+      status: 'offline',
+      title,
+      anchorName,
+      category,
+      referer,
+      qualities: [],
+      lines: [],
+      error: '主播暂未开播',
+    };
+  }
+
+  let parsedStreams = parseBiliStreams(playData);
+
+  // Guard against Bilibili's classic getRoomPlayInfo fallback bug: requesting qn=30000 on a room whose
+  // accept_qn only goes up to 10000/20000 (or 250/400 when logged out) can silently drop to qn=150/250.
+  // Retry with the exact highest supported qn from accept_qn so we never settle for a blurry fallback!
+  if (!hasExplicitReqQn && req.autoHighestQuality !== false && parsedStreams.primary && parsedStreams.allAcceptQns.length > 0) {
+    const currentQn = parsedStreams.primary.currentQn;
+    const retryCandidates = parsedStreams.allAcceptQns
+      .filter((qn) => qn > currentQn && String(qn) !== targetQn && (hasSessdata || qn <= 400))
+      .slice(0, 2);
+    for (const candidateQn of retryCandidates) {
+      try {
+        const upgradedData = await fetchBiliPlayInfo(String(candidateQn));
+        const upgraded = parseBiliStreams(upgradedData);
+        if (upgraded.primary && upgraded.primary.currentQn > parsedStreams.primary.currentQn) {
+          playData = upgradedData;
+          parsedStreams = upgraded;
+          if (upgraded.primary.currentQn >= candidateQn) break;
+        }
+      } catch {
+        // Keep best stream obtained so far
+      }
+    }
+  }
+
+  const { descMap, flvEntries, hlsEntries, flvCodec, hlsCodec, useHlsAsPrimary, primary } = parsedStreams;
 
   if (!primary) {
     const anchorName = await getBilibiliAnchorName(uid);
@@ -1248,9 +1298,8 @@ async function extractDouyu(
 
   const targetRate = req.qualityId ?? (req.autoHighestQuality !== false ? '0' : '2');
   const targetCdn = req.lineId || '';
-  const body = `${signQuery}&cdn=${encodeURIComponent(targetCdn)}&rate=${encodeURIComponent(targetRate)}&ver=Douyu_223061205&iar=0&ive=0&hevc=0&fa=0`;
 
-  const playRes = await douyuFetchJson<{
+  type DouyuPlayRes = {
     error?: number;
     msg?: string;
     data?: {
@@ -1261,13 +1310,20 @@ async function extractDouyu(
       multirates?: Array<{ name: string; rate: number }>;
       cdnsWithName?: Array<{ name: string; cdn: string }>;
     };
-  }>(`https://www.douyu.com/lapi/live/getH5Play/${rid}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body,
-  });
+  };
+
+  const requestDouyuPlay = (rateVal: string) => {
+    const body = `${signQuery}&cdn=${encodeURIComponent(targetCdn)}&rate=${encodeURIComponent(rateVal)}&ver=Douyu_223061205&iar=0&ive=0&hevc=0&fa=0`;
+    return douyuFetchJson<DouyuPlayRes>(`https://www.douyu.com/lapi/live/getH5Play/${rid}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body,
+    });
+  };
+
+  let playRes = await requestDouyuPlay(targetRate);
 
   if (playRes?.error !== 0 || !playRes.data?.rtmp_url || !playRes.data?.rtmp_live) {
     const isOffline = playRes?.error === -5;
@@ -1286,7 +1342,32 @@ async function extractDouyu(
     };
   }
 
-  const d = playRes.data;
+  // If rate=0 (原画) was restricted and Douyu dropped all the way down to 高清(rate=2),
+  // probe the highest intermediate bitrate (e.g. 蓝光4M / 超清) so we get the sharpest unlocked stream.
+  if (!req.qualityId && req.autoHighestQuality !== false && targetRate === '0') {
+    const initialRates = playRes.data.multirates || [];
+    const curIdx = initialRates.findIndex((m) => m.rate === playRes.data?.rate);
+    if (curIdx > 1) {
+      const candidate = initialRates.slice(0, curIdx).find((m) => m.rate !== 0);
+      if (candidate) {
+        try {
+          const retryRes = await requestDouyuPlay(String(candidate.rate));
+          if (retryRes?.error === 0 && retryRes.data?.rtmp_url && retryRes.data?.rtmp_live) {
+            const retryIdx = (retryRes.data.multirates || initialRates).findIndex(
+              (m) => m.rate === retryRes.data?.rate
+            );
+            if (retryIdx >= 0 && retryIdx < curIdx) {
+              playRes = retryRes;
+            }
+          }
+        } catch {
+          // Keep initial stream
+        }
+      }
+    }
+  }
+
+  const d = playRes.data!;
   const flvUrl = `${d.rtmp_url}/${d.rtmp_live}`;
 
   const multirates = d.multirates || [];
@@ -1430,20 +1511,31 @@ async function extractDouyin(req: DirectStreamRequest): Promise<DirectStreamResu
     };
   }
 
-  // Prefer live_core_sdk_data (which includes true 'origin' stream); fall back to flv_pull_url / hls_pull_url_map
+  // Prefer live_core_sdk_data (which includes true 'origin' / 'uhd_60' stream); fall back to flv_pull_url / hls_pull_url_map
   const flvMap = new Map<string, string>();
   const hlsMap = new Map<string, string>();
+  const bitrateMap = new Map<string, number>();
 
   const sdkRaw = room.stream_url?.live_core_sdk_data?.pull_data?.stream_data;
   if (sdkRaw) {
     try {
       const parsed = JSON.parse(sdkRaw) as {
-        data?: Record<string, { main?: { flv?: string; hls?: string } }>;
+        data?: Record<string, { main?: { flv?: string; hls?: string; sdk_params?: string } }>;
       };
       for (const [key, val] of Object.entries(parsed.data || {})) {
         if (key === 'ao') continue;
         if (val?.main?.flv) flvMap.set(key, val.main.flv);
         if (val?.main?.hls) hlsMap.set(key, val.main.hls);
+        if (val?.main?.sdk_params) {
+          try {
+            const sp = JSON.parse(val.main.sdk_params) as { vbitrate?: number };
+            if (typeof sp.vbitrate === 'number' && Number.isFinite(sp.vbitrate)) {
+              bitrateMap.set(key, sp.vbitrate);
+            }
+          } catch {
+            // Ignore malformed sdk_params
+          }
+        }
       }
     } catch {
       // Ignore malformed SDK stream_data
@@ -1462,7 +1554,10 @@ async function extractDouyin(req: DirectStreamRequest): Promise<DirectStreamResu
   const allKeys = Array.from(new Set([...flvMap.keys(), ...hlsMap.keys()])).sort((a, b) => {
     const ia = DOUYIN_QUALITY_ORDER.indexOf(a);
     const ib = DOUYIN_QUALITY_ORDER.indexOf(b);
-    return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+    const ra = ia === -1 ? 99 : ia;
+    const rb = ib === -1 ? 99 : ib;
+    if (ra !== rb) return ra - rb;
+    return (bitrateMap.get(b) ?? 0) - (bitrateMap.get(a) ?? 0);
   });
 
   if (allKeys.length === 0) {

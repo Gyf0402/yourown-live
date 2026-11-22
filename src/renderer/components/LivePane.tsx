@@ -33,6 +33,7 @@ import {
   parseLiveInput,
 } from '../../shared/platforms';
 import type {
+  AuthStatusMap,
   Channel,
   ChannelPlatform,
   DanmakuArea,
@@ -57,12 +58,178 @@ const WEB_DESKTOP_UA =
 const WEB_MOBILE_UA =
   'Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1';
 
+// React 19 drops boolean `allowpopups={true}` on Electron <webview> (not a standard HTML boolean attr),
+// which silently blocks all `target="_blank"` & `window.open()` clicks (like Bilibili video cards).
+// Passing string `'true'` ensures the DOM attribute is emitted before Chromium attaches the guest view.
+const WEBVIEW_ALLOW_POPUPS = { allowpopups: 'true' } as unknown as { allowpopups: boolean };
+
 const FREE_WEB_POLISH_CSS = `
   ::-webkit-scrollbar { width: 7px; height: 7px; }
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb { background: rgba(128, 128, 128, 0.36); border-radius: 99px; }
   ::-webkit-scrollbar-thumb:hover { background: rgba(128, 128, 128, 0.56); }
 `;
+
+// Lightweight, non-intrusive HD preference helper for Douyin / Bilibili video web pages:
+// scopes strictly to the currently active visible video player, wakes lazy clarity menus if needed,
+// and upgrades default blurry "智能 / 540P / 720P" to the highest free unlocked tier (e.g. 1080P)
+// once per session while skipping VIP/login-locked tiers and never fighting manual user changes.
+const FREE_WEB_HD_SCRIPT = `(() => {
+  try {
+    const host = (location.hostname || '').toLowerCase();
+    const scoreLabel = (txt) => {
+      if (!txt) return -1;
+      if (/vip|会员|大会员|登录|专享|限免|付费|扫码/i.test(txt)) return -1;
+      if (/4k|2160/i.test(txt)) return 500;
+      if (/2k|1440/i.test(txt)) return 400;
+      if (/1080.*60|60.*1080/i.test(txt)) return 350;
+      if (/1080|原画|蓝光/i.test(txt)) return 300;
+      if (/720.*60|60.*720/i.test(txt)) return 220;
+      if (/720|超清/i.test(txt)) return 200;
+      if (/高清/i.test(txt)) return 150;
+      if (/540|480|360|标清|流畅|极速|智能|自动/i.test(txt)) return 50;
+      return -1;
+    };
+
+    const pickBestUnlocked = (items, minScore) => {
+      let bestEl = null;
+      let bestScore = minScore;
+      for (const item of items) {
+        const cls = String(item.className || '').toLowerCase();
+        if (cls.includes('disabled') || cls.includes('lock') || cls.includes('vip') || cls.includes('login')) continue;
+        if (item.querySelector && item.querySelector('.bpx-player-ctrl-quality-badge-bigvip, .bpx-player-ctrl-quality-badge-login')) continue;
+        const txt = (item.textContent || '').replace(/\\s+/g, ' ').trim();
+        if (!txt || txt.length > 24) continue;
+        const sc = scoreLabel(txt);
+        if (sc > bestScore) {
+          bestScore = sc;
+          bestEl = item;
+        }
+      }
+      return bestEl && bestScore >= 200 ? bestEl : null;
+    };
+
+    if (host.includes('douyin.com') && !host.startsWith('live.')) {
+      if (window.__livehubDouyinHdApplied) return;
+      const activeScope =
+        document.querySelector('[data-e2e="feed-active-video"]') ||
+        Array.from(document.querySelectorAll('video'))
+          .find((v) => !v.paused && v.readyState >= 2 && v.offsetParent !== null)
+          ?.closest('.xgplayer, [data-e2e="feed-video"], [class*="player"]') ||
+        document;
+      const clarityRoot =
+        activeScope.querySelector('.xgplayer-clarity, [data-e2e="video-player-clarity"], .gear') ||
+        document.querySelector('[data-e2e="feed-active-video"] .gear');
+      if (!clarityRoot) return;
+      const btnText = (clarityRoot.querySelector('.btn, .gear-btn, span')?.textContent || '').trim();
+      const curScore = scoreLabel(btnText);
+      if (curScore >= 300) {
+        window.__livehubDouyinHdApplied = true;
+        return;
+      }
+      const tryPick = () => {
+        const items = Array.from(clarityRoot.querySelectorAll('.item, li, [role="menuitem"], .virtual > div'));
+        const bestEl = pickBestUnlocked(items, Math.max(curScore, 100));
+        if (bestEl) {
+          bestEl.click();
+          window.__livehubDouyinHdApplied = true;
+          return true;
+        }
+        return false;
+      };
+      if (!tryPick()) {
+        clarityRoot.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+        clarityRoot.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+        setTimeout(() => {
+          tryPick();
+          clarityRoot.dispatchEvent(new MouseEvent('mouseleave', { bubbles: true }));
+        }, 120);
+      }
+    } else if (host.includes('bilibili.com') && location.pathname.startsWith('/video/')) {
+      const key = location.pathname;
+      if (window.__livehubBiliHdPath === key) return;
+      const curEl = document.querySelector('.bpx-player-ctrl-quality-result');
+      const curScore = scoreLabel((curEl?.textContent || '').trim());
+      if (curScore >= 300) {
+        window.__livehubBiliHdPath = key;
+        return;
+      }
+      const items = Array.from(document.querySelectorAll('.bpx-player-ctrl-quality-menu-item'));
+      const bestEl = pickBestUnlocked(items, Math.max(curScore, 100));
+      if (bestEl) {
+        bestEl.click();
+        window.__livehubBiliHdPath = key;
+      }
+    }
+  } catch {}
+})();`;
+
+function adaptUrlForUaMode(
+  rawUrl: string,
+  targetMode: WebUserAgentMode,
+  fallbackUrl?: string | null
+): string {
+  if (!rawUrl) return fallbackUrl || '';
+  try {
+    const parsed = new URL(rawUrl);
+    const host = parsed.hostname.toLowerCase();
+    if (targetMode === 'desktop') {
+      if (host === 'm.bilibili.com') {
+        parsed.hostname = 'www.bilibili.com';
+        return parsed.toString();
+      }
+      if (host === 'm.weibo.cn' || host === 'm.weibo.com') {
+        parsed.hostname = 'weibo.com';
+        return parsed.toString();
+      }
+      if (host === 'm.douyin.com' || host === 'iesdouyin.com') {
+        parsed.hostname = 'www.douyin.com';
+        return parsed.toString();
+      }
+      if (host === 'm.xiaohongshu.com') {
+        parsed.hostname = 'www.xiaohongshu.com';
+        return parsed.toString();
+      }
+      if (host === 'm.zhihu.com') {
+        parsed.hostname = 'www.zhihu.com';
+        return parsed.toString();
+      }
+      if (host === 'm.hupu.com') {
+        parsed.hostname = 'www.hupu.com';
+        return parsed.toString();
+      }
+      if (host === 'm.youtube.com') {
+        parsed.hostname = 'www.youtube.com';
+        return parsed.toString();
+      }
+      if (host.startsWith('m.') && fallbackUrl) {
+        try {
+          const fb = new URL(fallbackUrl);
+          const fbHost = fb.hostname.toLowerCase();
+          const bareMobile = host.slice(2);
+          if (fbHost === bareMobile || fbHost === `www.${bareMobile}`) {
+            parsed.hostname = fb.hostname;
+            return parsed.toString();
+          }
+        } catch {
+          // Ignore malformed fallback URL
+        }
+      }
+    } else {
+      if ((host === 'weibo.com' || host === 'www.weibo.com') && (parsed.pathname === '/' || parsed.pathname === '')) {
+        parsed.hostname = 'm.weibo.cn';
+        return parsed.toString();
+      }
+      if (host === 'www.bilibili.com' && (parsed.pathname === '/' || parsed.pathname === '')) {
+        parsed.hostname = 'm.bilibili.com';
+        return parsed.toString();
+      }
+    }
+  } catch {
+    // Keep rawUrl
+  }
+  return rawUrl;
+}
 
 interface LivePaneProps {
   pane: PaneSlot;
@@ -75,6 +242,8 @@ interface LivePaneProps {
   effectiveMuted: boolean;
   isPlatformLoggedIn: boolean;
   platformReloadEpoch: number;
+  authStatus: AuthStatusMap;
+  reloadEpochs: Record<PlatformId, number>;
   slotReloadTick: number;
   channels: Channel[];
   webviewPreloadPath: string;
@@ -110,6 +279,7 @@ interface LivePaneProps {
   ) => void;
   onToggleMaximize: (slotIndex: number) => void;
   onToggleFullscreen: (slotIndex: number) => void;
+  onWebviewHtmlFullscreenChange: (slotIndex: number, entering: boolean) => void;
   onDetectedCategory?: (channelId: string, category: string, title?: string, anchorName?: string) => void;
   onSelectPane: (slotIndex: number) => void;
   onLoadUrlInPane: (
@@ -140,6 +310,8 @@ export const LivePane = memo(function LivePane({
   effectiveMuted,
   isPlatformLoggedIn,
   platformReloadEpoch,
+  authStatus,
+  reloadEpochs,
   slotReloadTick,
   channels,
   webviewPreloadPath,
@@ -161,6 +333,7 @@ export const LivePane = memo(function LivePane({
   onUpdatePanePrefs,
   onToggleMaximize,
   onToggleFullscreen,
+  onWebviewHtmlFullscreenChange,
   onDetectedCategory,
   onSelectPane,
   onLoadUrlInPane,
@@ -184,7 +357,7 @@ export const LivePane = memo(function LivePane({
   const [quickPendingRoomId, setQuickPendingRoomId] = useState<string | null>(null);
   const [quickResolving, setQuickResolving] = useState(false);
   const [quickError, setQuickError] = useState<string | null>(null);
-  const [webStartUrl, setWebStartUrl] = useState(pane.url || '');
+  const [webUaResume, setWebUaResume] = useState<{ baseUrl: string; targetUrl: string } | null>(null);
   const [webCurrentUrl, setWebCurrentUrl] = useState(pane.url || '');
   const [webAddressInput, setWebAddressInput] = useState(pane.url || '');
   const [webAddressFocused, setWebAddressFocused] = useState(false);
@@ -223,6 +396,8 @@ export const LivePane = memo(function LivePane({
   onUpdateTitleRef.current = onUpdateTitle;
   const onDetectedCategoryRef = useRef(onDetectedCategory);
   onDetectedCategoryRef.current = onDetectedCategory;
+  const onWebviewHtmlFullscreenChangeRef = useRef(onWebviewHtmlFullscreenChange);
+  onWebviewHtmlFullscreenChangeRef.current = onWebviewHtmlFullscreenChange;
   const lastEpochRef = useRef(platformReloadEpoch);
   const lastSlotReloadRef = useRef(slotReloadTick);
 
@@ -261,25 +436,50 @@ export const LivePane = memo(function LivePane({
     return detectPlatformFromUrl(webCurrentUrl || pane.url || '');
   }, [isWebPane, webCurrentUrl, pane.url]);
 
+  const effectivePlatformLoggedIn = isWebPane
+    ? webCookiePlatform
+      ? Boolean(authStatus[webCookiePlatform]?.loggedIn)
+      : true
+    : isPlatformLoggedIn;
+
+  const effectivePlatformReloadEpoch = isWebPane
+    ? webCookiePlatform
+      ? reloadEpochs[webCookiePlatform] ?? 0
+      : 0
+    : platformReloadEpoch;
+
   const effectiveWebZoom = useMemo(() => {
     if (!isWebPane) return 1;
     if (typeof webZoomSetting === 'number' && Number.isFinite(webZoomSetting)) {
-      return Math.max(0.5, Math.min(1.5, Math.round(webZoomSetting * 20) / 20));
+      return Math.max(0.35, Math.min(1.5, Math.round(webZoomSetting * 20) / 20));
     }
     const w = paneWidth;
     if (w <= 0) return 1;
     if (webUaMode === 'mobile') {
-      if (w >= 380) return 1;
-      return Math.max(0.75, Math.round((w / 380) * 20) / 20);
+      if (w >= 390) return 1;
+      return Math.max(0.65, Math.round((w / 390) * 20) / 20);
     }
-    if (w >= 980) return 1;
-    return Math.max(0.65, Math.min(1, Math.round((w / 980) * 20) / 20));
-  }, [isWebPane, webZoomSetting, webUaMode, paneWidth]);
+    // Balance layout fit and text/video crispness:
+    // - Fluid sites (Douyin 720px, Xiaohongshu 780px) stay at 100% native pixels in typical split panes.
+    // - Wide fixed desktop sites (Bilibili / Weibo) target 980px with a 65% readability floor so Chinese
+    //   text never shrinks to blurry 5-7px (users can still manually zoom down to 35% or switch to Mobile).
+    const activeUrl = (
+      webCurrentUrl && /^https?:/i.test(webCurrentUrl) ? webCurrentUrl : pane.url || ''
+    ).toLowerCase();
+    const isDouyinMainSite =
+      activeUrl.includes('douyin.com') && !activeUrl.includes('live.douyin.com');
+    const isXhsSite = activeUrl.includes('xiaohongshu.com');
+    const desktopTargetW = isDouyinMainSite ? 720 : isXhsSite ? 780 : 980;
+    if (w >= desktopTargetW) return 1;
+    return Math.max(0.65, Math.min(1, Math.round((w / desktopTargetW) * 20) / 20));
+  }, [isWebPane, webZoomSetting, webUaMode, paneWidth, webCurrentUrl, pane.url]);
 
   const effectiveWebZoomRef = useRef(effectiveWebZoom);
   effectiveWebZoomRef.current = effectiveWebZoom;
   const effectiveMutedRef = useRef(effectiveMuted);
   effectiveMutedRef.current = effectiveMuted;
+  const autoHighestQualityRef = useRef(autoHighestQuality);
+  autoHighestQualityRef.current = autoHighestQuality;
 
   // Observe pane container width (rAF-throttled) for responsive toolbar & adaptive webpage zoom
   useEffect(() => {
@@ -289,7 +489,9 @@ export const LivePane = memo(function LivePane({
     const updateWidth = () => {
       rafId = null;
       const nextW = Math.round(node.clientWidth);
-      setPaneWidth((cur) => (Math.abs(cur - nextW) >= 6 ? nextW : cur));
+      // Ignore 0px when this pane is hidden via display:none during another pane's maximize
+      if (nextW <= 0) return;
+      setPaneWidth((cur) => (cur === 0 || Math.abs(cur - nextW) >= 4 ? nextW : cur));
     };
     updateWidth();
     const ro = new ResizeObserver(() => {
@@ -323,7 +525,7 @@ export const LivePane = memo(function LivePane({
     setIsLoading(Boolean(pane.url));
     setProbing(false);
     setPaneHint(null);
-    setWebStartUrl(pane.url || '');
+    setWebUaResume(null);
     setWebCurrentUrl(pane.url || '');
     setWebAddressInput(pane.url || '');
     setWebAddressFocused(false);
@@ -589,16 +791,29 @@ export const LivePane = memo(function LivePane({
     if (useDirectStream || !el || !pane.url || !mountReady) return;
     if (!isWebPane && !webviewPreloadPath) return;
 
+    const pendingTimers = new Set<number>();
+    const scheduleTimer = (fn: () => void, ms: number) => {
+      const id = window.setTimeout(() => {
+        pendingTimers.delete(id);
+        fn();
+      }, ms);
+      pendingTimers.add(id);
+      return id;
+    };
+    let inHtmlFullscreen = false;
+
     const syncFreeWebNav = () => {
       if (!isWebPane) return;
       try {
-        setWebCanGoBack(Boolean(el.canGoBack?.()));
-        setWebCanGoForward(Boolean(el.canGoForward?.()));
+        const nextBack = Boolean(el.canGoBack?.());
+        const nextFwd = Boolean(el.canGoForward?.());
+        setWebCanGoBack((cur) => (cur === nextBack ? cur : nextBack));
+        setWebCanGoForward((cur) => (cur === nextFwd ? cur : nextFwd));
         const curUrl = el.getURL?.();
         if (curUrl) {
-          setWebCurrentUrl(curUrl);
+          setWebCurrentUrl((cur) => (cur === curUrl ? cur : curUrl));
           if (!webAddressFocusedRef.current) {
-            setWebAddressInput(curUrl);
+            setWebAddressInput((cur) => (cur === curUrl ? cur : curUrl));
           }
         }
       } catch {
@@ -618,17 +833,24 @@ export const LivePane = memo(function LivePane({
       }
     };
 
-    const applyFreeWebAdaptation = (force = false) => {
+    const applyFreeWebAdaptation = () => {
       if (!isWebPane) return;
       const z = effectiveWebZoomRef.current;
-      if (!force && lastAppliedZoomRef.current !== null && Math.abs(lastAppliedZoomRef.current - z) < 0.005) {
-        return;
-      }
       try {
+        let actualZoom: number | null = null;
+        try {
+          actualZoom = el.getZoomFactor();
+        } catch {
+          actualZoom = null;
+        }
+        if (actualZoom !== null && Math.abs(actualZoom - z) < 0.005) {
+          lastAppliedZoomRef.current = z;
+          return;
+        }
         el.setZoomFactor(z);
         lastAppliedZoomRef.current = z;
       } catch {
-        // Ignore
+        // Ignore if guest is not attached yet
       }
     };
 
@@ -665,7 +887,18 @@ export const LivePane = memo(function LivePane({
       setIsLoading(false);
       setWebLoadError(null);
       syncFreeWebNav();
-      applyFreeWebAdaptation(true);
+      applyFreeWebAdaptation();
+    };
+
+    const tryBoostFreeWebVideoQuality = () => {
+      if (!isWebPane || !autoHighestQualityRef.current) return;
+      try {
+        const href = (el.getURL?.() || pane.url || '').toLowerCase();
+        if (!href.includes('douyin.com') && !href.includes('bilibili.com/video/')) return;
+        void el.executeJavaScript?.(FREE_WEB_HD_SCRIPT)?.catch(() => {});
+      } catch {
+        // Ignore if guest is navigating
+      }
     };
 
     const handleDomReady = () => {
@@ -675,9 +908,10 @@ export const LivePane = memo(function LivePane({
         el.setAudioMuted(effectiveMutedRef.current);
         if (isWebPane) {
           registerFreeWeb();
-          applyFreeWebAdaptation(true);
+          applyFreeWebAdaptation();
           syncFreeWebNav();
           void el.insertCSS?.(FREE_WEB_POLISH_CSS)?.catch(() => {});
+          scheduleTimer(tryBoostFreeWebVideoQuality, 1600);
         } else {
           const cfg: WebviewPurifyConfig = {
             mode: pane.mode,
@@ -686,7 +920,7 @@ export const LivePane = memo(function LivePane({
             danmakuEnabled,
           };
           el.send('livehub:config', cfg);
-          window.setTimeout(() => {
+          scheduleTimer(() => {
             try {
               const rect = el.getBoundingClientRect();
               void window.livehub.wakeWebview(el.getWebContentsId(), rect.width, rect.height);
@@ -704,31 +938,58 @@ export const LivePane = memo(function LivePane({
       if (!isWebPane) return;
       const navEv = event as CustomEvent & { url?: string };
       if (navEv.url) {
-        setWebCurrentUrl(navEv.url);
+        const nextUrl = navEv.url;
+        setWebCurrentUrl((cur) => (cur === nextUrl ? cur : nextUrl));
         if (!webAddressFocusedRef.current) {
-          setWebAddressInput(navEv.url);
+          setWebAddressInput((cur) => (cur === nextUrl ? cur : nextUrl));
         }
       }
       syncFreeWebNav();
+      // Re-verify actual Chromium zoom on document navigation (no-op if already matched)
       applyFreeWebAdaptation();
     };
 
-    const handlePageTitleUpdated = (event: Event) => {
+    const handleNavigateInPage = (event: Event) => {
       if (!isWebPane) return;
-      const titleEv = event as CustomEvent & { title?: string };
-      const clean = titleEv.title?.trim();
-      if (clean) {
-        onUpdateTitleRef.current(pane.slotIndex, clean);
+      const navEv = event as CustomEvent & { url?: string };
+      if (navEv.url) {
+        const nextUrl = navEv.url;
+        setWebCurrentUrl((cur) => (cur === nextUrl ? cur : nextUrl));
+        if (!webAddressFocusedRef.current) {
+          setWebAddressInput((cur) => (cur === nextUrl ? cur : nextUrl));
+        }
       }
+      try {
+        const nextBack = Boolean(el.canGoBack?.());
+        const nextFwd = Boolean(el.canGoForward?.());
+        setWebCanGoBack((cur) => (cur === nextBack ? cur : nextBack));
+        setWebCanGoForward((cur) => (cur === nextFwd ? cur : nextFwd));
+      } catch {
+        // Ignore
+      }
+      scheduleTimer(tryBoostFreeWebVideoQuality, 900);
     };
 
     const handleMediaPlay = () => {
       setIsLoading(false);
       try {
         el.setAudioMuted(effectiveMutedRef.current);
+        if (isWebPane) {
+          scheduleTimer(tryBoostFreeWebVideoQuality, 500);
+        }
       } catch {
         // Ignore
       }
+    };
+
+    const handleEnterHtmlFullscreen = () => {
+      inHtmlFullscreen = true;
+      onWebviewHtmlFullscreenChangeRef.current(pane.slotIndex, true);
+    };
+
+    const handleLeaveHtmlFullscreen = () => {
+      inHtmlFullscreen = false;
+      onWebviewHtmlFullscreenChangeRef.current(pane.slotIndex, false);
     };
 
     const handleIpcMessage = (event: Event) => {
@@ -769,21 +1030,28 @@ export const LivePane = memo(function LivePane({
     el.addEventListener('did-fail-load', handleFailLoad);
     el.addEventListener('dom-ready', handleDomReady);
     el.addEventListener('did-navigate', handleNavigate);
-    el.addEventListener('did-navigate-in-page', handleNavigate);
-    el.addEventListener('page-title-updated', handlePageTitleUpdated);
+    el.addEventListener('did-navigate-in-page', handleNavigateInPage);
     el.addEventListener('media-started-playing', handleMediaPlay);
+    el.addEventListener('enter-html-full-screen', handleEnterHtmlFullscreen);
+    el.addEventListener('leave-html-full-screen', handleLeaveHtmlFullscreen);
     el.addEventListener('ipc-message', handleIpcMessage);
 
     return () => {
+      pendingTimers.forEach((id) => window.clearTimeout(id));
+      pendingTimers.clear();
+      if (inHtmlFullscreen) {
+        onWebviewHtmlFullscreenChangeRef.current(pane.slotIndex, false);
+      }
       el.removeEventListener('did-start-loading', handleStartLoading);
       el.removeEventListener('did-stop-loading', handleStopLoading);
       el.removeEventListener('did-finish-load', handleFinishLoad);
       el.removeEventListener('did-fail-load', handleFailLoad);
       el.removeEventListener('dom-ready', handleDomReady);
       el.removeEventListener('did-navigate', handleNavigate);
-      el.removeEventListener('did-navigate-in-page', handleNavigate);
-      el.removeEventListener('page-title-updated', handlePageTitleUpdated);
+      el.removeEventListener('did-navigate-in-page', handleNavigateInPage);
       el.removeEventListener('media-started-playing', handleMediaPlay);
+      el.removeEventListener('enter-html-full-screen', handleEnterHtmlFullscreen);
+      el.removeEventListener('leave-html-full-screen', handleLeaveHtmlFullscreen);
       el.removeEventListener('ipc-message', handleIpcMessage);
     };
   }, [useDirectStream, isWebPane, pane.url, pane.slotIndex, webviewPreloadPath, mountReady, webUaMode]);
@@ -792,7 +1060,15 @@ export const LivePane = memo(function LivePane({
   useEffect(() => {
     const el = webviewRef.current;
     if (!isWebPane || !el || !domReady) return;
+    let currentActual: number | null = null;
+    try {
+      currentActual = el.getZoomFactor();
+    } catch {
+      currentActual = lastAppliedZoomRef.current;
+    }
     if (
+      currentActual !== null &&
+      Math.abs(currentActual - effectiveWebZoom) < 0.005 &&
       lastAppliedZoomRef.current !== null &&
       Math.abs(lastAppliedZoomRef.current - effectiveWebZoom) < 0.005
     ) {
@@ -842,9 +1118,17 @@ export const LivePane = memo(function LivePane({
   }, [isWebPane, pane.mode, autoHighestQuality, hideGiftEffects, danmakuEnabled, domReady]);
 
   // Auto-reload webview when platform login status changes or manual refresh triggered
+  const lastEpochPlatformRef = useRef<PlatformId | null>(webCookiePlatform);
   useEffect(() => {
-    if (platformReloadEpoch === lastEpochRef.current) return;
-    lastEpochRef.current = platformReloadEpoch;
+    const activePlat = isWebPane ? webCookiePlatform : isLivePlatform(pane.platform) ? pane.platform : null;
+    if (lastEpochPlatformRef.current !== activePlat) {
+      // Switching to a different site in the address bar updates the baseline without spuriously reloading
+      lastEpochPlatformRef.current = activePlat;
+      lastEpochRef.current = effectivePlatformReloadEpoch;
+      return;
+    }
+    if (effectivePlatformReloadEpoch === lastEpochRef.current) return;
+    lastEpochRef.current = effectivePlatformReloadEpoch;
     const el = webviewRef.current;
     if (el && pane.url && domReady) {
       try {
@@ -853,7 +1137,7 @@ export const LivePane = memo(function LivePane({
         // Ignore
       }
     }
-  }, [platformReloadEpoch, pane.url, domReady]);
+  }, [effectivePlatformReloadEpoch, isWebPane, webCookiePlatform, pane.platform, pane.url, domReady]);
 
   const handleQuickSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -997,10 +1281,22 @@ export const LivePane = memo(function LivePane({
     }
     const el = webviewRef.current;
     if (el) {
+      const retryUrl = isWebPane ? webLoadError?.url || webCurrentUrl || pane.url : null;
+      setWebLoadError(null);
       try {
-        el.reload();
+        if (isWebPane && retryUrl && (!domReady || webLoadError)) {
+          void el.loadURL(retryUrl).catch(() => {});
+        } else {
+          el.reload();
+        }
       } catch {
-        // Ignore
+        if (retryUrl) {
+          try {
+            void el.loadURL(retryUrl).catch(() => {});
+          } catch {
+            // Ignore
+          }
+        }
       }
     }
   };
@@ -1196,7 +1492,7 @@ export const LivePane = memo(function LivePane({
     const el = webviewRef.current;
     if (el && domReady) {
       try {
-        void el.loadURL(normalized);
+        void el.loadURL(normalized).catch(() => {});
       } catch {
         // Fallback to reloading slot url
         onLoadUrlInPane(pane.slotIndex, normalized, undefined, pane.channelId, 'web');
@@ -1231,18 +1527,23 @@ export const LivePane = memo(function LivePane({
     }
   };
 
+  const compactWebBar = paneWidth === 0 || paneWidth < 820;
+  const ultraCompactWebBar = paneWidth === 0 || paneWidth < 600;
+  const microCompactWebBar = paneWidth > 0 && paneWidth < 420;
+  const nanoCompactWebBar = paneWidth > 0 && paneWidth < 290;
+
   const handleStepWebZoom = (delta: number) => {
-    const next = Math.max(0.5, Math.min(1.5, Math.round((effectiveWebZoom + delta) * 10) / 10));
+    const next = Math.max(0.35, Math.min(1.5, Math.round((effectiveWebZoom + delta) * 20) / 20));
     onUpdatePanePrefs(pane.slotIndex, { webZoom: next });
   };
 
   const handleResetOrCycleWebZoom = () => {
-    if (paneWidth > 0 && paneWidth < 520) {
-      // Compact mode: cycle auto -> 75% -> 90% -> 100% -> auto
+    if (ultraCompactWebBar) {
+      // Compact mode (step buttons hidden): cycle auto -> 50% -> 75% -> 100% -> auto
       if (webZoomSetting === 'auto') {
+        onUpdatePanePrefs(pane.slotIndex, { webZoom: 0.5 });
+      } else if (webZoomSetting < 0.72) {
         onUpdatePanePrefs(pane.slotIndex, { webZoom: 0.75 });
-      } else if (webZoomSetting <= 0.78) {
-        onUpdatePanePrefs(pane.slotIndex, { webZoom: 0.9 });
       } else if (webZoomSetting < 0.98) {
         onUpdatePanePrefs(pane.slotIndex, { webZoom: 1 });
       } else {
@@ -1256,9 +1557,13 @@ export const LivePane = memo(function LivePane({
   const handleToggleWebUaMode = () => {
     const nextMode: WebUserAgentMode = webUaMode === 'desktop' ? 'mobile' : 'desktop';
     const currentHref = webCurrentUrl || pane.url || '';
-    if (currentHref) {
-      setWebStartUrl(currentHref);
+    const adaptedHref = adaptUrlForUaMode(currentHref, nextMode, pane.url);
+    if (adaptedHref && pane.url) {
+      setWebUaResume({ baseUrl: pane.url, targetUrl: adaptedHref });
+      setWebCurrentUrl(adaptedHref);
+      setWebAddressInput(adaptedHref);
     }
+    lastAppliedZoomRef.current = null;
     setDomReady(false);
     setIsLoading(true);
     onUpdatePanePrefs(pane.slotIndex, {
@@ -1274,8 +1579,11 @@ export const LivePane = memo(function LivePane({
     }
   };
 
-  const compactWebBar = paneWidth > 0 && paneWidth < 680;
-  const ultraCompactWebBar = paneWidth > 0 && paneWidth < 520;
+  const resolvedWebSrc =
+    pane.url && webUaResume && webUaResume.baseUrl === pane.url
+      ? webUaResume.targetUrl
+      : pane.url || '';
+
   const livePlatformForAuth: PlatformId | null = isLivePlatform(pane.platform)
     ? pane.platform
     : webCookiePlatform;
@@ -1300,6 +1608,8 @@ export const LivePane = memo(function LivePane({
         <div
           className={`pane-toolbar web-docked-bar ${compactWebBar ? 'is-compact' : ''} ${
             ultraCompactWebBar ? 'is-ultra-compact' : ''
+          } ${microCompactWebBar ? 'is-micro-compact' : ''} ${
+            nanoCompactWebBar ? 'is-nano-compact' : ''
           }`}
           onClick={(e) => e.stopPropagation()}
         >
@@ -1334,22 +1644,26 @@ export const LivePane = memo(function LivePane({
               )}
             </div>
 
-            <button
-              className="pane-btn web-icon-btn"
-              onClick={handleWebGoBack}
-              disabled={!webCanGoBack}
-              title="后退"
-            >
-              <ArrowLeft size={12} />
-            </button>
-            <button
-              className="pane-btn web-icon-btn"
-              onClick={handleWebGoForward}
-              disabled={!webCanGoForward}
-              title="前进"
-            >
-              <ArrowRight size={12} />
-            </button>
+            {(!nanoCompactWebBar || webCanGoBack) && (
+              <button
+                className="pane-btn web-icon-btn"
+                onClick={handleWebGoBack}
+                disabled={!webCanGoBack}
+                title="后退"
+              >
+                <ArrowLeft size={12} />
+              </button>
+            )}
+            {!microCompactWebBar && (
+              <button
+                className="pane-btn web-icon-btn"
+                onClick={handleWebGoForward}
+                disabled={!webCanGoForward}
+                title="前进"
+              >
+                <ArrowRight size={12} />
+              </button>
+            )}
             <button
               className="pane-btn web-icon-btn"
               onClick={handleReload}
@@ -1380,9 +1694,9 @@ export const LivePane = memo(function LivePane({
           </form>
 
           <div className="web-bar-right">
-            {livePlatformForAuth && !isPlatformLoggedIn && (
+            {livePlatformForAuth && !effectivePlatformLoggedIn && !nanoCompactWebBar && (
               <button
-                className="pane-btn login-hint"
+                className={`pane-btn login-hint ${compactWebBar ? 'web-icon-btn' : ''}`}
                 onClick={() => onLoginPlatform(livePlatformForAuth)}
                 title={`点击登录${PLATFORMS[livePlatformForAuth].name}，Cookie 将自动同步至此网页`}
               >
@@ -1396,7 +1710,7 @@ export const LivePane = memo(function LivePane({
                 <button
                   className="pane-btn web-icon-btn"
                   onClick={() => handleStepWebZoom(-0.1)}
-                  disabled={effectiveWebZoom <= 0.5}
+                  disabled={effectiveWebZoom <= 0.35}
                   title="缩小网页显示比例"
                 >
                   <ZoomOut size={12} />
@@ -1406,9 +1720,13 @@ export const LivePane = memo(function LivePane({
                 className={`pane-btn web-zoom-pill ${webZoomSetting === 'auto' ? 'is-auto' : ''}`}
                 onClick={handleResetOrCycleWebZoom}
                 title={
-                  webZoomSetting === 'auto'
-                    ? `当前已开启宽度自适应缩放 (${Math.round(effectiveWebZoom * 100)}%)，点击切换 100%`
-                    : `当前手动缩放 ${Math.round(effectiveWebZoom * 100)}%，点击恢复宽度自适应`
+                  ultraCompactWebBar
+                    ? webZoomSetting === 'auto'
+                      ? `当前宽度自适应 (${Math.round(effectiveWebZoom * 100)}%)，点击循环切换 50% / 75% / 100% / 自适应`
+                      : `当前手动缩放 ${Math.round(effectiveWebZoom * 100)}%，点击循环切换或恢复自适应`
+                    : webZoomSetting === 'auto'
+                      ? `当前已开启宽度自适应缩放 (${Math.round(effectiveWebZoom * 100)}%)，点击切换 100%`
+                      : `当前手动缩放 ${Math.round(effectiveWebZoom * 100)}%，点击恢复宽度自适应`
                 }
               >
                 <span>
@@ -1430,7 +1748,9 @@ export const LivePane = memo(function LivePane({
             </div>
 
             <button
-              className={`pane-btn ${webUaMode === 'mobile' ? 'web-ua-mobile' : ''}`}
+              className={`pane-btn ${compactWebBar ? 'web-icon-btn' : ''} ${
+                webUaMode === 'mobile' ? 'web-ua-mobile' : ''
+              }`}
               onClick={handleToggleWebUaMode}
               title={
                 webUaMode === 'mobile'
@@ -1442,14 +1762,18 @@ export const LivePane = memo(function LivePane({
               {!compactWebBar && <span>{webUaMode === 'mobile' ? '手机' : '桌面'}</span>}
             </button>
 
-            <button
-              className={`pane-btn ${isSolo ? 'solo-active' : ''}`}
-              onClick={() => onToggleSolo(pane.slotIndex)}
-              title={isSolo ? '取消独听' : `独听此网页（快捷键 ${pane.slotIndex + 1}）`}
-            >
-              <Headphones size={12} />
-              {!compactWebBar && <span>{isSolo ? '独听中' : '独听'}</span>}
-            </button>
+            {!microCompactWebBar && (
+              <button
+                className={`pane-btn ${compactWebBar ? 'web-icon-btn' : ''} ${
+                  isSolo ? 'solo-active' : ''
+                }`}
+                onClick={() => onToggleSolo(pane.slotIndex)}
+                title={isSolo ? '取消独听' : `独听此网页（快捷键 ${pane.slotIndex + 1}）`}
+              >
+                <Headphones size={12} />
+                {!compactWebBar && <span>{isSolo ? '独听中' : '独听'}</span>}
+              </button>
+            )}
 
             <button
               className={`pane-btn web-icon-btn ${effectiveMuted ? 'muted-active' : ''}`}
@@ -1933,10 +2257,10 @@ export const LivePane = memo(function LivePane({
                 webviewRef.current = node as WebviewElement | null;
               }}
               className="pane-webview is-free-web"
-              src={webStartUrl || pane.url}
+              src={resolvedWebSrc}
               partition="persist:livehub"
               useragent={webUaMode === 'mobile' ? WEB_MOBILE_UA : WEB_DESKTOP_UA}
-              allowpopups={true}
+              {...WEBVIEW_ALLOW_POPUPS}
             />
           )}
           {(isLoading || !mountReady) && (
@@ -1983,7 +2307,7 @@ export const LivePane = memo(function LivePane({
               src={pane.url}
               partition="persist:livehub"
               preload={webviewPreloadPath}
-              allowpopups={true}
+              {...WEBVIEW_ALLOW_POPUPS}
             />
           )}
           {(isLoading || !mountReady) && (

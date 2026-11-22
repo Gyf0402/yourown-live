@@ -28,6 +28,7 @@ interface SplitGridProps {
   onSelectPane: (slotIndex: number) => void;
   onToggleMaximize: (slotIndex: number) => void;
   onToggleFullscreen: (slotIndex: number) => void;
+  onWebviewHtmlFullscreenChange: (slotIndex: number, entering: boolean) => void;
   onDetectedCategory: (channelId: string, category: string, title?: string, anchorName?: string) => void;
   onChangeSplitRatios: (ratios: SplitRatios) => void;
   onLoadUrlInPane: (
@@ -86,6 +87,7 @@ export function SplitGrid({
   onSelectPane,
   onToggleMaximize,
   onToggleFullscreen,
+  onWebviewHtmlFullscreenChange,
   onDetectedCategory,
   onChangeSplitRatios,
   onLoadUrlInPane,
@@ -216,6 +218,8 @@ export function SplitGrid({
               effectiveMuted={effectiveMuted}
               isPlatformLoggedIn={isPlatformLoggedIn}
               platformReloadEpoch={platformReloadEpoch}
+              authStatus={authStatus}
+              reloadEpochs={reloadEpochs}
               slotReloadTick={slotReloadTicks[pane.slotIndex] ?? 0}
               channels={channels}
               webviewPreloadPath={webviewPreloadPath}
@@ -237,6 +241,7 @@ export function SplitGrid({
               onUpdatePanePrefs={onUpdatePanePrefs}
               onToggleMaximize={onToggleMaximize}
               onToggleFullscreen={onToggleFullscreen}
+              onWebviewHtmlFullscreenChange={onWebviewHtmlFullscreenChange}
               onDetectedCategory={onDetectedCategory}
               onSelectPane={onSelectPane}
               onLoadUrlInPane={onLoadUrlInPane}

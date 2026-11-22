@@ -921,12 +921,27 @@ export function App() {
   const handleToggleFullscreen = useCallback((slotIndex: number) => {
     setFullscreenSlotIndex((cur) => {
       const next = cur === slotIndex ? null : slotIndex;
+      if (next === null && document.fullscreenElement) {
+        void document.exitFullscreen().catch(() => {});
+      }
       if (typeof window.livehub?.setWindowFullScreen === 'function') {
         void window.livehub.setWindowFullScreen(next !== null);
       }
       return next;
     });
     setActiveSlotIndex(slotIndex);
+  }, []);
+
+  // Sync HTML5 fullscreen initiated inside a <webview> (e.g. Bilibili / Douyin / YouTube player fullscreen)
+  // so the pane expands to true 100vw x 100vh instead of staying clipped inside its split cell.
+  const handleWebviewHtmlFullscreenChange = useCallback((slotIndex: number, entering: boolean) => {
+    setFullscreenSlotIndex((cur) => {
+      if (entering) return slotIndex;
+      return cur === slotIndex ? null : cur;
+    });
+    if (entering) {
+      setActiveSlotIndex(slotIndex);
+    }
   }, []);
 
   const handleChangeSplitRatios = useCallback((splitRatios: SplitRatios) => {
@@ -1068,6 +1083,9 @@ export function App() {
         if (fullscreenSlotIndex !== null) {
           e.preventDefault();
           setFullscreenSlotIndex(null);
+          if (document.fullscreenElement) {
+            void document.exitFullscreen().catch(() => {});
+          }
           if (typeof window.livehub?.setWindowFullScreen === 'function') {
             void window.livehub.setWindowFullScreen(false);
           }
@@ -1231,6 +1249,7 @@ export function App() {
           onSelectPane={setActiveSlotIndex}
           onToggleMaximize={handleToggleMaximize}
           onToggleFullscreen={handleToggleFullscreen}
+          onWebviewHtmlFullscreenChange={handleWebviewHtmlFullscreenChange}
           onDetectedCategory={handleDetectedCategory}
           onChangeSplitRatios={handleChangeSplitRatios}
           onLoadUrlInPane={loadUrlInPane}

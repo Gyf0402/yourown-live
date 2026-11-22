@@ -90,6 +90,7 @@ let boundsSaveTimer: NodeJS.Timeout | null = null;
 const loginWindows = new Map<PlatformId, BrowserWindow>();
 const extraWindows = new Set<BrowserWindow>();
 const freeWebContentsIds = new Set<number>();
+const mobileWebContentsIds = new Set<number>();
 let authSyncTimer: NodeJS.Timeout | null = null;
 let lastEmittedAuthJson = '';
 const danmakuManager = new DanmakuManager(
@@ -313,18 +314,150 @@ function notifyAuthStatusChanged(changedPlatform?: PlatformId): void {
 }
 
 // Ad-source & P2P upload domains/paths (based on douyu-p2p-block, Huya-Ad-Skipper, better-douyin & live telemetry traces)
+// Passing explicit URL patterns lets Chromium filter in C++ inside the Network Service without waking main-process JS
+// on every normal video chunk / image / API request (critical for Douyin / Bilibili smooth playback).
+const AD_AND_BLOAT_FILTER_URLS = [
+  '*://*.va.huya.com/*',
+  '*://*.p2p.huya.com/*',
+  '*://statwup.huya.com/*',
+  '*://ylog.huya.com/*',
+  '*://stat.huya.com/*',
+  '*://ad.huya.com/*',
+  '*://*.ourdvsss.com/live*',
+  '*://api.galaxyclouds.cn/p2p*',
+  '*://*.congyicn.com/*',
+  '*://proxy-tel-s.alicdn.com/f/pcdn*',
+  '*://sdkapi.douyucdn.cn/p2p*',
+  '*://dot.douyu.com/*',
+  '*://rtb.douyu.com/*',
+  '*://wan.douyu.com/*',
+  '*://cm.bilibili.com/*',
+  '*://data.bilibili.com/*',
+  '*://*.hdslb.com/*bili-collect*',
+  '*://*.bilibili.com/*bili-collect*',
+  '*://*.bilibili.com/*reporter-pb/*',
+  '*://ad.toutiao.com/*',
+  '*://analytics.oceanengine.com/*',
+  '*://mon.snssdk.com/*',
+  '*://mon.zijieapi.com/*',
+  '*://is.snssdk.com/ad*',
+  '*://*.snssdk.com/*pangolin-sdk*',
+  '*://*.doubleclick.net/*',
+  '*://*.googlesyndication.com/*',
+  '*://*.googleadservices.com/*',
+  '*://*.google-analytics.com/*',
+  '*://*.googletagmanager.com/*',
+  '*://hm.baidu.com/*',
+  '*://*.cnzz.com/*',
+  '*://pos.baidu.com/*',
+  '*://cpro.baidu.com/*',
+  '*://*.tanx.com/*',
+  '*://*/*.svga',
+  '*://*/*.svga?*',
+  '*://*.huya.com/*sidebarNavGroup/*',
+  '*://*.msstatic.com/*sidebarNavGroup/*',
+  '*://*.huya.com/*anchorpost/*',
+  '*://*.msstatic.com/*anchorpost/*',
+  '*://*.hdslb.com/*bfs/activity-plat/*',
+  '*://activity.hdslb.com/blackboard/*',
+];
+
 const HARD_AD_AND_P2P_RE =
   /(\.va\.huya\.com|\.p2p\.huya\.com|statwup\.huya\.com|ylog\.huya\.com|stat\.huya\.com|ad\.huya\.com|ourdvsss\.com\/live\?msg=getpeer|api\.galaxyclouds\.cn\/p2p|congyicn\.com\/(?:FlashP2PMonitorNew|dist\/yhp2p)|proxy-tel-s\.alicdn\.com\/f\/pcdn|sdkapi\.douyucdn\.cn\/p2p|dot\.douyu\.com|rtb\.douyu\.com|wan\.douyu\.com|cm\.bilibili\.com|data\.bilibili\.com|bili-collect\.js|reporter-pb\/|ad\.toutiao\.com|analytics\.oceanengine\.com|mon\.snssdk\.com|mon\.zijieapi\.com|is\.snssdk\.com\/ad|pangolin-sdk|doubleclick\.net|googlesyndication\.com|googleadservices\.com|google-analytics\.com|googletagmanager\.com|hm\.baidu\.com|cnzz\.com|pos\.baidu\.com|cpro\.baidu\.com|tanx\.com)/i;
 
 const BLOAT_BLOCK_RE =
   /(\.svga(\?|$)|sidebarNavGroup\/|anchorpost\/|bfs\/activity-plat\/|activity\.hdslb\.com\/blackboard\/)/i;
 
+const AUTH_COOKIE_NAMES_BY_PLATFORM: Record<PlatformId, Set<string>> = {
+  huya: new Set(['yyuid', 'udb_uid', 'username']),
+  douyu: new Set(['acf_auth', 'dy_auth', 'acf_uid', 'acf_username']),
+  bilibili: new Set(['SESSDATA', 'DedeUserID']),
+  douyin: new Set(['sessionid', 'sessionid_ss', 'sid_tt', 'uid_tt']),
+};
+
+let mobileHeaderHookWide = false;
+
+function refreshLiveSessionHeaderHooks(force = false): void {
+  const needWide = mobileWebContentsIds.size > 0;
+  if (!force && needWide === mobileHeaderHookWide) return;
+  mobileHeaderHookWide = needWide;
+
+  const liveSession = session.fromPartition(LIVEHUB_PARTITION);
+  const urls = needWide
+    ? ['http://*/*', 'https://*/*']
+    : [
+        'https://api.live.bilibili.com/*',
+        'https://api.bilibili.com/*',
+        'https://www.douyu.com/*',
+      ];
+
+  liveSession.webRequest.onBeforeSendHeaders({ urls }, (details, callback) => {
+    const isMobileWeb =
+      needWide &&
+      typeof details.webContentsId === 'number' &&
+      mobileWebContentsIds.has(details.webContentsId);
+    const needsBiliOrDouyuHeaders =
+      details.url.startsWith('https://api.live.bilibili.com/') ||
+      details.url.startsWith('https://api.bilibili.com/') ||
+      details.url.startsWith('https://www.douyu.com/');
+
+    if (!isMobileWeb && !needsBiliOrDouyuHeaders) {
+      callback({});
+      return;
+    }
+
+    const headers = { ...details.requestHeaders };
+
+    if (isMobileWeb) {
+      for (const key of Object.keys(headers)) {
+        const lower = key.toLowerCase();
+        if (
+          lower === 'sec-ch-ua' ||
+          lower === 'sec-ch-ua-full-version-list' ||
+          lower === 'sec-ch-ua-platform-version'
+        ) {
+          delete headers[key];
+        }
+      }
+      headers['Sec-CH-UA-Mobile'] = '?1';
+      headers['Sec-CH-UA-Platform'] = '"iOS"';
+    }
+
+    if (needsBiliOrDouyuHeaders) {
+      const hasRef = Object.keys(headers).some((k) => k.toLowerCase() === 'referer');
+      const hasOrigin = Object.keys(headers).some((k) => k.toLowerCase() === 'origin');
+      if (details.url.includes('douyu.com')) {
+        if (!hasRef) headers['Referer'] = 'https://www.douyu.com/';
+        if (!hasOrigin) headers['Origin'] = 'https://www.douyu.com';
+      } else {
+        if (!hasRef) headers['Referer'] = 'https://live.bilibili.com/';
+        if (!hasOrigin) headers['Origin'] = 'https://live.bilibili.com';
+      }
+    }
+
+    callback({ requestHeaders: headers });
+  });
+}
+
+function setMobileWebContentsFlag(webContentsId: number, isMobile: boolean): void {
+  const changed = isMobile
+    ? !mobileWebContentsIds.has(webContentsId)
+    : mobileWebContentsIds.has(webContentsId);
+  if (!changed) return;
+  if (isMobile) {
+    mobileWebContentsIds.add(webContentsId);
+  } else {
+    mobileWebContentsIds.delete(webContentsId);
+  }
+  refreshLiveSessionHeaderHooks(false);
+}
+
 function configureLiveSession(): void {
   const liveSession = session.fromPartition(LIVEHUB_PARTITION);
   liveSession.setUserAgent(DEFAULT_UA);
 
-  // Intercept ad sources, P2P upload nodes, telemetry beacons, and heavy promo bloat
-  liveSession.webRequest.onBeforeRequest((details, callback) => {
+  // Intercept only ad sources, P2P upload nodes, telemetry beacons, and heavy promo bloat
+  liveSession.webRequest.onBeforeRequest({ urls: AD_AND_BLOAT_FILTER_URLS }, (details, callback) => {
     if (details.resourceType !== 'mainFrame' && HARD_AD_AND_P2P_RE.test(details.url)) {
       callback({ cancel: true });
       return;
@@ -343,37 +476,22 @@ function configureLiveSession(): void {
     callback({});
   });
 
-  // Ensure liveSession.fetch() calls to Bilibili & Douyu APIs carry matching Referer & Origin headers
-  liveSession.webRequest.onBeforeSendHeaders(
-    {
-      urls: [
-        'https://api.live.bilibili.com/*',
-        'https://api.bilibili.com/*',
-        'https://www.douyu.com/*',
-      ],
-    },
-    (details, callback) => {
-      const headers = { ...details.requestHeaders };
-      const hasRef = Object.keys(headers).some((k) => k.toLowerCase() === 'referer');
-      const hasOrigin = Object.keys(headers).some((k) => k.toLowerCase() === 'origin');
-      if (details.url.includes('douyu.com')) {
-        if (!hasRef) headers['Referer'] = 'https://www.douyu.com/';
-        if (!hasOrigin) headers['Origin'] = 'https://www.douyu.com';
-      } else {
-        if (!hasRef) headers['Referer'] = 'https://live.bilibili.com/';
-        if (!hasOrigin) headers['Origin'] = 'https://live.bilibili.com';
-      }
-      callback({ requestHeaders: headers });
-    }
-  );
+  // Narrow Referer/Origin hook by default; widens automatically only while a mobile-mode webview is open
+  refreshLiveSessionHeaderHooks(true);
 
-  // Explicitly approve fullscreen permissions inside webviews
+  // Explicitly approve fullscreen, media, DRM (mediaKeySystem), pointerLock & copy-link clipboard write inside webviews
   liveSession.setPermissionRequestHandler((_wc, permission, callback) => {
-    callback(permission === 'fullscreen' || permission === 'media' || permission === 'pointerLock');
+    callback(
+      permission === 'fullscreen' ||
+        permission === 'media' ||
+        permission === 'mediaKeySystem' ||
+        permission === 'pointerLock' ||
+        permission === 'clipboard-sanitized-write'
+    );
   });
 
   liveSession.cookies.on('changed', (_event, cookie, cause, removed) => {
-    // Ignore transient overwrite removals during normal cookie rotation so loggedIn never blips false -> true
+    // Ignore transient overwrite removals & non-auth tracking cookie rotations (e.g. Douyin msToken/ttwid)
     if (removed && cause === 'overwrite') return;
     const domain = (cookie.domain || '').toLowerCase();
     let changedPlatform: PlatformId | undefined;
@@ -381,14 +499,19 @@ function configureLiveSession(): void {
     else if (domain.includes('douyu.com')) changedPlatform = 'douyu';
     else if (domain.includes('bilibili.com')) changedPlatform = 'bilibili';
     else if (domain.includes('douyin.com')) changedPlatform = 'douyin';
-    if (changedPlatform) {
+    if (changedPlatform && AUTH_COOKIE_NAMES_BY_PLATFORM[changedPlatform].has(cookie.name)) {
       notifyAuthStatusChanged(changedPlatform);
     }
   });
 }
 
-function openAuthPopupWindow(targetUrl: string, title?: string, platform?: PlatformId): void {
-  if (platform) {
+function openAuthPopupWindow(
+  targetUrl: string,
+  title?: string,
+  platform?: PlatformId,
+  allowDuplicatePopup = false
+): void {
+  if (platform && !allowDuplicatePopup) {
     const existing = loginWindows.get(platform);
     if (existing && !existing.isDestroyed()) {
       existing.show();
@@ -418,7 +541,7 @@ function openAuthPopupWindow(targetUrl: string, title?: string, platform?: Platf
     try {
       const parsed = new URL(url);
       if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
-        openAuthPopupWindow(url, '第三方快捷授权登录');
+        openAuthPopupWindow(url, '第三方快捷授权登录', platform, true);
       }
     } catch {
       // Ignore malformed URLs
@@ -432,16 +555,20 @@ function openAuthPopupWindow(targetUrl: string, title?: string, platform?: Platf
   });
 
   if (platform) {
-    loginWindows.set(platform, popup);
+    if (!allowDuplicatePopup) {
+      loginWindows.set(platform, popup);
+    }
     popup.on('closed', () => {
-      loginWindows.delete(platform);
+      if (!allowDuplicatePopup && loginWindows.get(platform) === popup) {
+        loginWindows.delete(platform);
+      }
       if (!isQuitting) {
         notifyAuthStatusChanged(platform);
       }
     });
   }
 
-  void popup.loadURL(targetUrl);
+  void popup.loadURL(targetUrl).catch(() => {});
 }
 
 function crc32(buf: Buffer): number {
@@ -869,17 +996,29 @@ function createMainWindow(initialState: PersistedState): void {
     recordDiagnostic('error', 'window', `页面加载失败 (${code}): ${desc}`);
   });
 
-  // Synchronously tag free-web <webview> instances (no preload script) before first navigation
-  let pendingFreeWebAttach = 0;
-  mainWindow.webContents.on('will-attach-webview', (_event, webPreferences) => {
-    if (!webPreferences.preload) {
-      pendingFreeWebAttach += 1;
-    }
+  // Synchronously tag free-web <webview> instances (no preload script) in FIFO order before first navigation,
+  // and isolate zoom per webview so split panes of the same origin never overwrite each other's zoom level.
+  const pendingWebviewMeta: Array<{ isFreeWeb: boolean; isMobile: boolean }> = [];
+  mainWindow.webContents.on('will-attach-webview', (_event, webPreferences, params) => {
+    const isFreeWeb = !webPreferences.preload;
+    const isMobile = /iPhone|Mobile/i.test(params?.useragent || '');
+    pendingWebviewMeta.push({ isFreeWeb, isMobile });
   });
   mainWindow.webContents.on('did-attach-webview', (_event, guestContents) => {
-    if (pendingFreeWebAttach > 0) {
-      pendingFreeWebAttach -= 1;
+    const meta = pendingWebviewMeta.shift();
+    try {
+      if (typeof guestContents.setZoomMode === 'function') {
+        guestContents.setZoomMode('isolated');
+      }
+    } catch {
+      // Ignore if unsupported
+    }
+    if (meta?.isFreeWeb) {
       freeWebContentsIds.add(guestContents.id);
+      setMobileWebContentsFlag(
+        guestContents.id,
+        Boolean(meta.isMobile || /iPhone|Mobile/i.test(guestContents.getUserAgent() || ''))
+      );
     }
   });
 
@@ -922,8 +1061,17 @@ app.on('web-contents-created', (_event, contents) => {
       contents.setUserAgent(DEFAULT_UA);
     }
 
+    try {
+      if (typeof contents.setZoomMode === 'function') {
+        contents.setZoomMode('isolated');
+      }
+    } catch {
+      // Ignore if unsupported
+    }
+
     contents.once('destroyed', () => {
       freeWebContentsIds.delete(contents.id);
+      setMobileWebContentsFlag(contents.id, false);
     });
 
     // Block custom desktop client protocol launches & prevent offline Douyin room from jumping to plaza
@@ -956,40 +1104,159 @@ app.on('web-contents-created', (_event, contents) => {
     });
 
     // Intercept window.open inside webview: allow login/auth popups, navigate in-place for free-web panes
-    contents.setWindowOpenHandler(({ url }) => {
+    contents.setWindowOpenHandler((details) => {
+      const { url, referrer } = details;
       try {
         const parsed = new URL(url);
         if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
           return { action: 'deny' };
         }
+        const currentHref = contents.getURL();
+        const loadOpts =
+          referrer && referrer.url
+            ? { httpReferrer: referrer }
+            : currentHref && /^https?:/i.test(currentHref)
+              ? { httpReferrer: currentHref }
+              : undefined;
         if (freeWebContentsIds.has(contents.id)) {
           const isThirdPartyOAuth = /open\.weixin\.qq\.com|graph\.qq\.com|ptlogin/i.test(url);
           if (isThirdPartyOAuth) {
             const detected =
-              detectPlatformFromUrl(url) ?? detectPlatformFromUrl(contents.getURL()) ?? undefined;
-            openAuthPopupWindow(url, '第三方快捷授权登录', detected);
+              detectPlatformFromUrl(url) ?? detectPlatformFromUrl(currentHref) ?? undefined;
+            openAuthPopupWindow(url, '第三方快捷授权登录', detected, true);
             return { action: 'deny' };
           }
-          // In free-web mode (e.g., Bilibili video cards with target="_blank"), open seamlessly in-place
-          void contents.loadURL(url);
+          // In free-web mode (e.g., Bilibili video cards with target="_blank"), open seamlessly in-place with Referer preserved
+          setImmediate(() => {
+            if (!contents.isDestroyed()) {
+              void contents.loadURL(url, loadOpts).catch(() => {});
+            }
+          });
           return { action: 'deny' };
         }
         const isAuthUrl =
           /passport|login|oauth|qr|ptlogin|open\.weixin|graph\.qq|sso/i.test(url);
         if (isAuthUrl) {
           const detected =
-            detectPlatformFromUrl(url) ?? detectPlatformFromUrl(contents.getURL()) ?? undefined;
-          openAuthPopupWindow(url, undefined, detected);
+            detectPlatformFromUrl(url) ?? detectPlatformFromUrl(currentHref) ?? undefined;
+          const isThirdPartyOAuth = /open\.weixin\.qq\.com|graph\.qq\.com|ptlogin/i.test(url);
+          openAuthPopupWindow(url, undefined, detected, isThirdPartyOAuth);
           return { action: 'deny' };
         }
         // Navigate in-place if it's a valid live room link, deny random promo tabs
         if (/huya\.com|douyu\.com|bilibili\.com|douyin\.com/i.test(parsed.hostname)) {
-          void contents.loadURL(url);
+          setImmediate(() => {
+            if (!contents.isDestroyed()) {
+              void contents.loadURL(url, loadOpts).catch(() => {});
+            }
+          });
         }
         return { action: 'deny' };
       } catch {
         return { action: 'deny' };
       }
+    });
+
+    // Native right-click menu for free-web panes (sites with custom menus like Bilibili player preventDefault automatically)
+    contents.on('context-menu', (_ev, params) => {
+      if (!freeWebContentsIds.has(contents.id) || contents.isDestroyed()) return;
+      const template: Electron.MenuItemConstructorOptions[] = [];
+      const hasLink = Boolean(params.linkURL && /^https?:\/\//i.test(params.linkURL));
+      if (hasLink) {
+        template.push(
+          {
+            label: '在当前分屏打开链接',
+            click: () => {
+              if (!contents.isDestroyed()) {
+                const cur = contents.getURL();
+                void contents
+                  .loadURL(
+                    params.linkURL,
+                    cur && /^https?:/i.test(cur) ? { httpReferrer: cur } : undefined
+                  )
+                  .catch(() => {});
+              }
+            },
+          },
+          {
+            label: '在系统浏览器打开链接',
+            click: () => {
+              void openSafeExternalUrl(params.linkURL);
+            },
+          },
+          {
+            label: '复制链接地址',
+            click: () => {
+              void clipboard.writeText(params.linkURL).catch(() => {});
+            },
+          },
+          { type: 'separator' }
+        );
+      }
+
+      if (params.isEditable) {
+        template.push(
+          { label: '剪切', role: 'cut', enabled: params.editFlags.canCut },
+          { label: '复制', role: 'copy', enabled: params.editFlags.canCopy },
+          { label: '粘贴', role: 'paste', enabled: params.editFlags.canPaste },
+          { label: '全选', role: 'selectAll', enabled: params.editFlags.canSelectAll },
+          { type: 'separator' }
+        );
+      } else if (params.selectionText?.trim()) {
+        template.push(
+          { label: '复制选中内容', role: 'copy' },
+          { type: 'separator' }
+        );
+      }
+
+      template.push(
+        {
+          label: '后退',
+          enabled: contents.navigationHistory.canGoBack(),
+          click: () => {
+            if (!contents.isDestroyed() && contents.navigationHistory.canGoBack()) {
+              contents.navigationHistory.goBack();
+            }
+          },
+        },
+        {
+          label: '前进',
+          enabled: contents.navigationHistory.canGoForward(),
+          click: () => {
+            if (!contents.isDestroyed() && contents.navigationHistory.canGoForward()) {
+              contents.navigationHistory.goForward();
+            }
+          },
+        },
+        {
+          label: '刷新页面',
+          click: () => {
+            if (!contents.isDestroyed()) contents.reload();
+          },
+        }
+      );
+
+      const curUrl = contents.getURL();
+      if (curUrl && /^https?:\/\//i.test(curUrl)) {
+        template.push(
+          { type: 'separator' },
+          {
+            label: '复制当前网址',
+            click: () => {
+              void clipboard.writeText(curUrl).catch(() => {});
+            },
+          },
+          {
+            label: '在系统浏览器打开当前页',
+            click: () => {
+              void openSafeExternalUrl(curUrl);
+            },
+          }
+        );
+      }
+
+      const menu = Menu.buildFromTemplate(template);
+      menu.popup({ window: mainWindow ?? undefined });
     });
   }
 });
@@ -1035,7 +1302,12 @@ function configureDirectStreamNetworking(): void {
   const defaultSes = session.defaultSession;
 
   defaultSes.setPermissionRequestHandler((_wc, permission, callback) => {
-    callback(permission === 'fullscreen' || permission === 'media' || permission === 'pointerLock');
+    callback(
+      permission === 'fullscreen' ||
+        permission === 'media' ||
+        permission === 'pointerLock' ||
+        permission === 'clipboard-sanitized-write'
+    );
   });
 
   defaultSes.webRequest.onBeforeSendHeaders(
@@ -1189,6 +1461,17 @@ app.whenReady().then(async () => {
     (_event, webContentsId: number) => {
       if (typeof webContentsId === 'number' && Number.isFinite(webContentsId)) {
         freeWebContentsIds.add(webContentsId);
+        const wc = webContents.fromId(webContentsId);
+        if (wc && !wc.isDestroyed()) {
+          try {
+            if (typeof wc.setZoomMode === 'function') {
+              wc.setZoomMode('isolated');
+            }
+          } catch {
+            // Ignore
+          }
+          setMobileWebContentsFlag(webContentsId, /iPhone|Mobile/i.test(wc.getUserAgent() || ''));
+        }
       }
     }
   );
