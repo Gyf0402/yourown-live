@@ -34,6 +34,7 @@ import type {
   LiveRoomStatus,
   PlatformId,
 } from '../../shared/types';
+import { ConfirmDialog } from './ConfirmDialog';
 
 interface SidebarProps {
   channels: Channel[];
@@ -95,6 +96,7 @@ export function Sidebar({
   onLoginPlatform,
   onOpenLoginModal,
 }: SidebarProps) {
+  const [pendingDeleteGroup, setPendingDeleteGroup] = useState<string | null>(null);
   const [rawInput, setRawInput] = useState('');
   const [customName, setCustomName] = useState('');
   const [selectedPlatform, setSelectedPlatform] = useState<ChannelPlatform | 'auto'>('auto');
@@ -535,9 +537,7 @@ export function Sidebar({
                       title={`删除分组「${g}」（该分组下主播将归入其他分组）`}
                       onClick={(e) => {
                         e.stopPropagation();
-                        onRemoveGroup(g);
-                        if (activeGroupFilter === g) setActiveGroupFilter('全部');
-                        if (selectedGroup === g) setSelectedGroup(AUTO_GROUP_VALUE);
+                        setPendingDeleteGroup(g);
                       }}
                     >
                       <X size={10} />
@@ -973,6 +973,34 @@ export function Sidebar({
           })}
         </div>
       </div>
+
+      {pendingDeleteGroup && (() => {
+        const g = pendingDeleteGroup;
+        const count = channels.filter((c) => c.group === g).length;
+        return (
+          <ConfirmDialog
+            danger
+            title={`删除分组「${g}」？`}
+            description={
+              count > 0 ? (
+                <>
+                  该分组下的 <strong>{count}</strong> 位主播将自动归入其他分组，主播本身不会被删除。
+                </>
+              ) : (
+                '该分组下暂无主播，删除后不可恢复。'
+              )
+            }
+            confirmText="删除分组"
+            onCancel={() => setPendingDeleteGroup(null)}
+            onConfirm={() => {
+              setPendingDeleteGroup(null);
+              onRemoveGroup(g);
+              if (activeGroupFilter === g) setActiveGroupFilter('全部');
+              if (selectedGroup === g) setSelectedGroup(AUTO_GROUP_VALUE);
+            }}
+          />
+        );
+      })()}
     </aside>
   );
 }
