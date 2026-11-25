@@ -591,8 +591,33 @@ function pngChunk(type: string, data: Buffer): Buffer {
   return Buffer.concat([len, typeBuf, data, crc]);
 }
 
-function createTrayIconImage(): Electron.NativeImage {
-  // Draw a crisp 32x32 rounded-square blue-purple prism icon with a white play triangle
+function loadBundledAppIcon(targetSize?: number): Electron.NativeImage | null {
+  const candidates = [
+    path.join(__dirname, '..', '..', 'dist', 'icon.png'),
+    path.join(__dirname, '..', '..', 'public', 'icon.png'),
+    path.join(__dirname, '..', '..', 'build', 'icon.png'),
+  ];
+  for (const candidate of candidates) {
+    if (!existsSync(candidate)) continue;
+    try {
+      const img = nativeImage.createFromPath(candidate);
+      if (!img.isEmpty()) {
+        return targetSize
+          ? img.resize({ width: targetSize, height: targetSize, quality: 'best' })
+          : img;
+      }
+    } catch {
+      // Fall through to next candidate
+    }
+  }
+  return null;
+}
+
+function createTrayIconImage(targetSize = 32): Electron.NativeImage {
+  const bundled = loadBundledAppIcon(targetSize);
+  if (bundled) return bundled;
+
+  // Fallback procedural rounded-square blue-purple prism icon with a white play triangle
   const w = 32;
   const h = 32;
   const raw = Buffer.alloc((w * 4 + 1) * h);
@@ -944,7 +969,7 @@ function createMainWindow(initialState: PersistedState): void {
     minWidth: 980,
     minHeight: 620,
     title: 'YourOwn Live — 打造你的纯净无广告直播看播台',
-    icon: createTrayIconImage(),
+    icon: createTrayIconImage(256),
     backgroundColor: startDark ? '#0e1116' : '#f5f5f7',
     titleBarStyle: 'hidden',
     titleBarOverlay: {

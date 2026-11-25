@@ -1,4 +1,4 @@
-# YourOwn Live
+# <img src="./build/icon.png" width="38" height="38" alt="YourOwn Live" align="absmiddle" /> YourOwn Live
 
 > **打造属于你自己的跨平台直播观看平台** —— 自由订阅爱看的主播，还能**左屏看直播、右屏刷抖音 / B站 / 小红书**，告别各平台繁杂页面、贴片弹窗与 P2P 偷跑带宽，回归**纯净流、无广告、超低延迟**的一站式桌面摸鱼看播体验。
 
@@ -7,6 +7,12 @@
 ![React](https://img.shields.io/badge/React-19-61DAFB?style=flat-square)
 ![TypeScript](https://img.shields.io/badge/TypeScript-5.8-3178C6?style=flat-square)
 ![License](https://img.shields.io/badge/License-MIT-248a3d?style=flat-square)
+
+<br />
+
+![YourOwn Live 实机演示：左屏看直播 + 右屏刷抖音 + 1/2 键一键独听 + Alt+X 老板键隐身](./docs/screenshots/demo-preview.gif)
+
+<sub>🎬 <b>12 秒实机演示</b>：左屏纯净直连看直播 · 右屏丝滑刷抖音 · 按 <code>1</code> / <code>2</code> 键一键独听不串音 · <code>Alt+X</code> 老板键瞬间隐身静音并秒切工作界面</sub>
 
 ---
 

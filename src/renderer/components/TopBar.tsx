@@ -27,6 +27,7 @@ import type {
   ThemeMode,
 } from '../../shared/types';
 import { DANMAKU_AREA_OPTIONS, DanmakuSettingsPopover } from './DanmakuSettingsPopover';
+import appIconUrl from '../assets/app-icon.png';
 
 interface TopBarProps {
   settings: AppSettings;
@@ -129,7 +130,7 @@ export function TopBar({
 
         <div className="brand">
           <span className="brand-prism" aria-hidden="true">
-            <span className="brand-prism-core" />
+            <img className="brand-icon-img" src={appIconUrl} alt="" draggable={false} />
           </span>
           <span className="brand-name">YourOwn Live</span>
           <span className="brand-chip">PURE</span>

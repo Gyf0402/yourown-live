@@ -34,6 +34,7 @@ import { Sidebar } from './components/Sidebar';
 import { SplitGrid } from './components/SplitGrid';
 import { TopBar } from './components/TopBar';
 import { UpdateModal } from './components/UpdateModal';
+import appIconUrl from './assets/app-icon.png';
 
 const DEFAULT_AUTH_STATUS: AuthStatusMap = {
   huya: { loggedIn: false },
@@ -1152,7 +1153,9 @@ export function App() {
           aria-hidden="true"
         >
           <div className="boot-emblem">
-            <div className="boot-prism" />
+            <div className="boot-prism">
+              <img className="boot-icon-img" src={appIconUrl} alt="YourOwn Live" draggable={false} />
+            </div>
             <div className="boot-title">YourOwn Live</div>
             <div className="boot-sub">自由选择爱看的主播 · 纯净流无广告看播台</div>
           </div>

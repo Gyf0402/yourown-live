@@ -1,3 +1,4 @@
+/// <reference types="vite/client" />
 import type { DetailedHTMLProps, HTMLAttributes } from 'react';
 import type { LiveHubAPI } from '../shared/types';
 
