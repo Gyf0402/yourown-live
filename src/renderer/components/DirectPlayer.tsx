@@ -137,6 +137,7 @@ export function DirectPlayer({
   const [controlsIdle, setControlsIdle] = useState(false);
   const [liveBadge, setLiveBadge] = useState<string>('FLV');
   const [videoReady, setVideoReady] = useState(false);
+  const lastStreamKeyRef = useRef(streamKey);
   const [dmPanelOpen, setDmPanelOpen] = useState(false);
   const [composerOpen, setComposerOpen] = useState(false);
   const [composerText, setComposerText] = useState('');
@@ -347,7 +348,26 @@ export function DirectPlayer({
     [onChangeVolume, onToggleMute, showHud]
   );
 
+  const captureFreezePoster = useCallback(() => {
+    const v = videoRef.current;
+    if (!v || v.videoWidth <= 0 || v.videoHeight <= 0) return;
+    try {
+      const snap = document.createElement('canvas');
+      snap.width = v.videoWidth;
+      snap.height = v.videoHeight;
+      const sctx = snap.getContext('2d');
+      if (sctx) {
+        sctx.drawImage(v, 0, 0, snap.width, snap.height);
+        v.poster = snap.toDataURL('image/jpeg', 0.85);
+      }
+    } catch {
+      // Ignore frame capture errors
+    }
+  }, []);
+
   useEffect(() => {
+    const isSameStream = Boolean(streamKey) && lastStreamKeyRef.current === streamKey;
+    lastStreamKeyRef.current = streamKey;
     userPausedRef.current = false;
     pausedAtRef.current = null;
     if (pauseSuspendTimerRef.current !== null) {
@@ -357,11 +377,17 @@ export function DirectPlayer({
     setPauseSuspended(false);
     setUseHlsFallback(false);
     setIsPaused(false);
-    setVideoReady(false);
-    if (videoRef.current) {
-      videoRef.current.removeAttribute('poster');
+    if (isSameStream) {
+      // Same-room seamless reconnect (e.g. CDN periodic EOF / token refresh):
+      // Keep last decoded frame frozen on poster and keep videoReady=true so the screen NEVER flashes black!
+      captureFreezePoster();
+    } else {
+      setVideoReady(false);
+      if (videoRef.current) {
+        videoRef.current.removeAttribute('poster');
+      }
     }
-  }, [flvUrl, hlsUrl, reloadToken]);
+  }, [streamKey, flvUrl, hlsUrl, reloadToken, captureFreezePoster]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -439,25 +465,11 @@ export function DirectPlayer({
       pauseSuspendTimerRef.current = window.setTimeout(() => {
         pauseSuspendTimerRef.current = null;
         if (!userPausedRef.current) return;
-        const v = videoRef.current;
-        if (v && v.videoWidth > 0 && v.videoHeight > 0) {
-          try {
-            const snap = document.createElement('canvas');
-            snap.width = v.videoWidth;
-            snap.height = v.videoHeight;
-            const sctx = snap.getContext('2d');
-            if (sctx) {
-              sctx.drawImage(v, 0, 0, snap.width, snap.height);
-              v.poster = snap.toDataURL('image/jpeg', 0.85);
-            }
-          } catch {
-            // Ignore frame capture errors
-          }
-        }
+        captureFreezePoster();
         setPauseSuspended(true);
       }, 10_000);
     }
-  }, []);
+  }, [captureFreezePoster]);
 
   const toggleFullscreen = useCallback(() => {
     if (onToggleFullscreen) {
@@ -510,6 +522,8 @@ export function DirectPlayer({
     const triggerSeamlessReconnect = (reason: string) => {
       if (disposed || reconnectTriggered || userPausedRef.current) return;
       reconnectTriggered = true;
+      // Preserve last live frame on poster immediately so reconnect transition never flashes black
+      captureFreezePoster();
       if (onAutoReconnectRef.current) {
         onAutoReconnectRef.current(reason);
       } else {
@@ -658,7 +672,15 @@ export function DirectPlayer({
 
         flvPlayer.on(mpegts.Events.ERROR, (errType: string, errDetail: string) => {
           if (disposed) return;
+          // After healthy long playback, an FLV error is usually a CDN edge reset or expired signed URL.
+          // NEVER fall back to the stale hlsUrl captured 30-60 minutes ago (which is also expired -> 403 loop)!
+          // Instead fetch a fresh signed FLV URL immediately for zero-black-screen seamless resume.
+          if (healthyTicks >= 4 && !userPausedRef.current) {
+            triggerSeamlessReconnect('flv-error');
+            return;
+          }
           if (hlsUrl && !useHlsFallback) {
+            captureFreezePoster();
             setUseHlsFallback(true);
             return;
           }
@@ -691,7 +713,14 @@ export function DirectPlayer({
       });
       hlsPlayer.on(Hls.Events.ERROR, (_event, data) => {
         if (disposed || !data.fatal) return;
-        if (recoverTries < 4) {
+        const httpCode = (data as { response?: { code?: number } }).response?.code;
+        // Expired signed HLS URL (HTTP 401/403/404/410, e.g. Bilibili ~1h token expiry):
+        // Do NOT waste 4-8s retrying the same dead URL — immediately fetch a fresh signed URL!
+        if (httpCode === 401 || httpCode === 403 || httpCode === 404 || httpCode === 410) {
+          triggerSeamlessReconnect('hls-expired');
+          return;
+        }
+        if (recoverTries < 2) {
           recoverTries += 1;
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
             hlsPlayer?.startLoad();
@@ -701,6 +730,10 @@ export function DirectPlayer({
             hlsPlayer?.recoverMediaError();
             return;
           }
+        }
+        if (healthyTicks >= 4 && !userPausedRef.current) {
+          triggerSeamlessReconnect('hls-error');
+          return;
         }
         onErrorRef.current?.(`HLS 播放中断 (${data.details || data.type})`);
       });
@@ -769,12 +802,12 @@ export function DirectPlayer({
             if (v.playbackRate !== 1) {
               v.playbackRate = 1;
             }
-            // Only jump if there is an actual disjoint buffer gap (v.buffered.length > 1) and a playable range ahead;
-            // on a normal single-range network pause, NEVER seek (seeking triggers mpegts flush!) — just wait for packets.
-            if (stalledTicks === 4 && hasBuffer && v.buffered.length > 1) {
+            // Jump quickly if there is an actual disjoint buffer gap (v.buffered.length > 1) and a playable range ahead;
+            // on a normal single-range network pause, NEVER seek (seeking triggers mpegts flush!) — wait briefly then reconnect cleanly.
+            if (stalledTicks === 2 && hasBuffer && v.buffered.length > 1) {
               jumpToLiveEdgeAndPlay(v);
-            } else if (stalledTicks >= 10) {
-              // Hard stall (~15s completely frozen): TCP socket stalled or signed URL expired -> reconnect cleanly
+            } else if (stalledTicks >= 6) {
+              // Hard stall (~9s completely frozen): TCP socket stalled or signed URL expired -> reconnect cleanly
               triggerSeamlessReconnect('stall-watchdog');
               return;
             }

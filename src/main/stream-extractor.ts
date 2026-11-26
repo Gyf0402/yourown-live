@@ -404,21 +404,30 @@ async function extractHuya(req: DirectStreamRequest): Promise<DirectStreamResult
   const selectedCdn =
     (req.lineId && cdnList.find((c) => c.sCdnType === req.lineId)) || cdnList[0];
 
+  // For PC/gaming rooms with >= 4M Blu-ray tiers, Huya's mobile API appends '-imgplus' which caps
+  // origin streams at 8Mbps instead of true 10~20Mbps PC origin. For low-bitrate/mobile rooms
+  // (no >= 4000 rate tier), keep '-imgplus' so their 60fps boosted stream is preserved.
+  const hasHighBitrateTier = rateArray.some((r) => r.iBitRate >= 4000);
+  const effectiveStreamName =
+    selectedQualityId === '0' && hasHighBitrateTier
+      ? selectedCdn.sStreamName.replace(/-imgplus$/, '')
+      : selectedCdn.sStreamName;
+
   const flvAnti = buildHuyaAntiCode(
-    selectedCdn.sStreamName,
+    effectiveStreamName,
     selectedCdn.sFlvAntiCode,
     selectedQualityId
   );
-  const flvUrl = `${selectedCdn.sFlvUrl.replace(/^http:/, 'https:')}/${selectedCdn.sStreamName}.${selectedCdn.sFlvUrlSuffix}?${flvAnti}`;
+  const flvUrl = `${selectedCdn.sFlvUrl.replace(/^http:/, 'https:')}/${effectiveStreamName}.${selectedCdn.sFlvUrlSuffix}?${flvAnti}`;
 
   let hlsUrl: string | undefined;
   if (selectedCdn.sHlsUrl && selectedCdn.sHlsUrlSuffix && selectedCdn.sHlsAntiCode) {
     const hlsAnti = buildHuyaAntiCode(
-      selectedCdn.sStreamName,
+      effectiveStreamName,
       selectedCdn.sHlsAntiCode,
       selectedQualityId
     );
-    hlsUrl = `${selectedCdn.sHlsUrl.replace(/^http:/, 'https:')}/${selectedCdn.sStreamName}.${selectedCdn.sHlsUrlSuffix}?${hlsAnti}`;
+    hlsUrl = `${selectedCdn.sHlsUrl.replace(/^http:/, 'https:')}/${effectiveStreamName}.${selectedCdn.sHlsUrlSuffix}?${hlsAnti}`;
   }
 
   const qualities: StreamOptionItem[] = rawQualities.map((q) => ({
@@ -873,9 +882,12 @@ async function extractBilibili(
     const hlsCodec = sortBestEntry(hlsEntries, true)[0];
     const flvExactMatch = Boolean(hasExplicitReqQn && flvCodec && flvCodec.currentQn === requestedQnNum);
     const hlsExactMatch = Boolean(hasExplicitReqQn && hlsCodec && hlsCodec.currentQn === requestedQnNum);
+    // mpegts.js cannot decode non-AVC FLV (HEVC/AV1), so prefer HLS-fMP4 whenever FLV is non-AVC
+    const flvUnsupportedCodec = Boolean(flvCodec && flvCodec.codecName !== 'avc');
     const useHlsAsPrimary = Boolean(
       hlsCodec &&
         (!flvCodec ||
+          (flvUnsupportedCodec && hlsCodec.currentQn >= flvCodec.currentQn) ||
           (hlsExactMatch && !flvExactMatch) ||
           (!flvExactMatch && hlsCodec.currentQn > flvCodec.currentQn))
     );
@@ -1375,13 +1387,16 @@ async function extractDouyu(
   }
 
   // If rate=0 (原画) was restricted and Douyu dropped all the way down to 高清(rate=2),
-  // probe the highest intermediate bitrate (e.g. 蓝光4M / 超清) so we get the sharpest unlocked stream.
+  // probe intermediate bitrates from highest to lowest (e.g. 蓝光8M -> 蓝光4M -> 超清) until we unlock the sharpest stream.
   if (!req.qualityId && req.autoHighestQuality !== false && targetRate === '0') {
     const initialRates = playRes.data.multirates || [];
     const curIdx = initialRates.findIndex((m) => m.rate === playRes.data?.rate);
     if (curIdx > 1) {
-      const candidate = initialRates.slice(0, curIdx).find((m) => m.rate !== 0);
-      if (candidate) {
+      const candidates = initialRates
+        .slice(0, curIdx)
+        .filter((m) => m.rate !== 0)
+        .slice(0, 3);
+      for (const candidate of candidates) {
         try {
           const retryRes = await requestDouyuPlay(String(candidate.rate));
           if (retryRes?.error === 0 && retryRes.data?.rtmp_url && retryRes.data?.rtmp_live) {
@@ -1390,10 +1405,11 @@ async function extractDouyu(
             );
             if (retryIdx >= 0 && retryIdx < curIdx) {
               playRes = retryRes;
+              break;
             }
           }
         } catch {
-          // Keep initial stream
+          // Try next intermediate tier
         }
       }
     }
@@ -1474,6 +1490,17 @@ async function extractDouyin(req: DirectStreamRequest): Promise<DirectStreamResu
           live_core_sdk_data?: {
             pull_data?: {
               stream_data?: string;
+              options?: {
+                qualities?: Array<{
+                  name?: string;
+                  sdk_key?: string;
+                  level?: number;
+                  resolution?: string;
+                  v_bit_rate?: number;
+                  fps?: number;
+                  disable?: number;
+                }>;
+              };
             };
           };
         };
@@ -1543,30 +1570,83 @@ async function extractDouyin(req: DirectStreamRequest): Promise<DirectStreamResu
     };
   }
 
-  // Prefer live_core_sdk_data (which includes true 'origin' / 'uhd_60' stream); fall back to flv_pull_url / hls_pull_url_map
-  const flvMap = new Map<string, string>();
+  // Prefer live_core_sdk_data (which includes true 'origin' / 'uhd' / official level order & backup CDN);
+  // fall back to flv_pull_url / hls_pull_url_map
+  type DouyinNode = { flv?: string; hls?: string; sdk_params?: string };
+  const flvMainMap = new Map<string, string>();
+  const flvBackupMap = new Map<string, string>();
   const hlsMap = new Map<string, string>();
   const bitrateMap = new Map<string, number>();
+  const levelMap = new Map<string, number>();
+  const labelMap = new Map<string, string>();
+  const h265OnlySet = new Set<string>();
+
+  const toHttps = (u?: string) => (u ? u.replace(/^http:\/\//i, 'https://') : undefined);
+  const parseSdkParams = (raw?: string): { vbitrate?: number; VCodec?: string; resolution?: string; fps?: number } => {
+    if (!raw) return {};
+    try {
+      return JSON.parse(raw) as { vbitrate?: number; VCodec?: string; resolution?: string; fps?: number };
+    } catch {
+      return {};
+    }
+  };
+  const isHevcCodec = (vcodec?: string) => Boolean(vcodec && /265|hevc|bytevc1/i.test(vcodec));
+
+  const optionQualities = room.stream_url?.live_core_sdk_data?.pull_data?.options?.qualities || [];
+  const optionEnabledKeys = new Set<string>();
+  for (const q of optionQualities) {
+    if (!q.sdk_key || q.sdk_key === 'ao' || q.disable === 1) continue;
+    optionEnabledKeys.add(q.sdk_key);
+    if (typeof q.level === 'number' && Number.isFinite(q.level)) {
+      levelMap.set(q.sdk_key, q.level);
+    }
+    if (typeof q.v_bit_rate === 'number' && Number.isFinite(q.v_bit_rate) && q.v_bit_rate > 0) {
+      bitrateMap.set(q.sdk_key, q.v_bit_rate);
+    }
+    if (q.name?.trim()) {
+      const fpsTag = q.fps && q.fps >= 50 && !/60|帧/.test(q.name) ? ' 60帧' : '';
+      labelMap.set(q.sdk_key, `${q.name.trim()}${fpsTag}`);
+    }
+  }
 
   const sdkRaw = room.stream_url?.live_core_sdk_data?.pull_data?.stream_data;
   if (sdkRaw) {
     try {
       const parsed = JSON.parse(sdkRaw) as {
-        data?: Record<string, { main?: { flv?: string; hls?: string; sdk_params?: string } }>;
+        data?: Record<string, { main?: DouyinNode; backup?: DouyinNode }>;
       };
       for (const [key, val] of Object.entries(parsed.data || {})) {
         if (key === 'ao') continue;
-        if (val?.main?.flv) flvMap.set(key, val.main.flv);
-        if (val?.main?.hls) hlsMap.set(key, val.main.hls);
-        if (val?.main?.sdk_params) {
-          try {
-            const sp = JSON.parse(val.main.sdk_params) as { vbitrate?: number };
-            if (typeof sp.vbitrate === 'number' && Number.isFinite(sp.vbitrate)) {
-              bitrateMap.set(key, sp.vbitrate);
-            }
-          } catch {
-            // Ignore malformed sdk_params
-          }
+        // Skip hidden ultra-low 360p 'md' tier when Douyin's own options.qualities excludes it
+        if (key === 'md' && optionEnabledKeys.size > 0 && !optionEnabledKeys.has('md')) continue;
+
+        const mainSp = parseSdkParams(val?.main?.sdk_params);
+        const bakSp = parseSdkParams(val?.backup?.sdk_params);
+        const mainHevc = isHevcCodec(mainSp.VCodec);
+        const bakHevc = isHevcCodec(bakSp.VCodec);
+
+        let primaryFlv = toHttps(val?.main?.flv);
+        let secondaryFlv = toHttps(val?.backup?.flv);
+        // mpegts.js requires H.264 for FLV: if main is HEVC and backup is H.264, swap them!
+        if (mainHevc && !bakHevc && secondaryFlv) {
+          const tmp = primaryFlv;
+          primaryFlv = secondaryFlv;
+          secondaryFlv = tmp;
+        } else if (mainHevc && (!secondaryFlv || bakHevc)) {
+          h265OnlySet.add(key);
+        }
+
+        if (primaryFlv) flvMainMap.set(key, primaryFlv);
+        if (secondaryFlv && secondaryFlv !== primaryFlv) flvBackupMap.set(key, secondaryFlv);
+        const hlsCandidate = toHttps(val?.main?.hls || val?.backup?.hls);
+        if (hlsCandidate) hlsMap.set(key, hlsCandidate);
+
+        if (
+          !bitrateMap.has(key) &&
+          typeof mainSp.vbitrate === 'number' &&
+          Number.isFinite(mainSp.vbitrate)
+        ) {
+          bitrateMap.set(key, mainSp.vbitrate);
         }
       }
     } catch {
@@ -1574,22 +1654,31 @@ async function extractDouyin(req: DirectStreamRequest): Promise<DirectStreamResu
     }
   }
 
-  if (flvMap.size === 0 && hlsMap.size === 0) {
+  if (flvMainMap.size === 0 && hlsMap.size === 0) {
     for (const [k, v] of Object.entries(room.stream_url?.flv_pull_url || {})) {
-      if (v) flvMap.set(k, v);
+      if (v) flvMainMap.set(k, toHttps(v) || v);
     }
     for (const [k, v] of Object.entries(room.stream_url?.hls_pull_url_map || {})) {
-      if (v) hlsMap.set(k, v);
+      if (v) hlsMap.set(k, toHttps(v) || v);
     }
   }
 
-  const allKeys = Array.from(new Set([...flvMap.keys(), ...hlsMap.keys()])).sort((a, b) => {
+  const allKeys = Array.from(new Set([...flvMainMap.keys(), ...hlsMap.keys()])).sort((a, b) => {
+    // 1. Prefer Douyin's official options.qualities level descending (handles new 2K/4K/60fps keys automatically!)
+    const la = levelMap.get(a);
+    const lb = levelMap.get(b);
+    if (la !== undefined && lb !== undefined && la !== lb) return lb - la;
+    // 2. Fallback to bitrate descending when levels aren't both present
+    const ba = bitrateMap.get(a) ?? 0;
+    const bb = bitrateMap.get(b) ?? 0;
+    if (la === undefined && lb === undefined && ba !== bb) return bb - ba;
+    // 3. Final deterministic order via DOUYIN_QUALITY_ORDER
     const ia = DOUYIN_QUALITY_ORDER.indexOf(a);
     const ib = DOUYIN_QUALITY_ORDER.indexOf(b);
     const ra = ia === -1 ? 99 : ia;
     const rb = ib === -1 ? 99 : ib;
     if (ra !== rb) return ra - rb;
-    return (bitrateMap.get(b) ?? 0) - (bitrateMap.get(a) ?? 0);
+    return bb - ba;
   });
 
   if (allKeys.length === 0) {
@@ -1614,22 +1703,38 @@ async function extractDouyin(req: DirectStreamRequest): Promise<DirectStreamResu
         ? allKeys[0]
         : (allKeys[1] ?? allKeys[0]);
 
-  const rawFlv = flvMap.get(selectedKey);
+  const rawFlvMain = flvMainMap.get(selectedKey);
+  const rawFlvBackup = flvBackupMap.get(selectedKey);
   const rawHls = hlsMap.get(selectedKey);
-  const preferHls = req.lineId === 'hls';
+  const forceHlsForHevc = h265OnlySet.has(selectedKey) && Boolean(rawHls);
+  const preferHls = req.lineId === 'hls' || forceHlsForHevc;
+  const preferBackupFlv = req.lineId === 'flv-backup' && Boolean(rawFlvBackup);
+
+  const selectedFlv = preferHls
+    ? undefined
+    : preferBackupFlv
+      ? rawFlvBackup
+      : rawFlvMain || rawFlvBackup;
 
   const qualities: StreamOptionItem[] = allKeys.map((k) => ({
     id: k,
-    label: DOUYIN_QUALITY_LABELS[k] || k,
+    label: labelMap.get(k) || DOUYIN_QUALITY_LABELS[k] || k,
     active: k === selectedKey,
   }));
 
   const lines: StreamOptionItem[] = [];
-  if (rawFlv) {
-    lines.push({ id: 'flv', label: '极速 FLV', active: !preferHls });
+  if (rawFlvMain && !forceHlsForHevc) {
+    lines.push({ id: 'flv', label: '极速 FLV 主线', active: !preferHls && !preferBackupFlv });
+  }
+  if (rawFlvBackup && !forceHlsForHevc) {
+    lines.push({ id: 'flv-backup', label: '极速 FLV 备线', active: !preferHls && preferBackupFlv });
   }
   if (rawHls) {
-    lines.push({ id: 'hls', label: '稳定 HLS', active: preferHls || !rawFlv });
+    lines.push({
+      id: 'hls',
+      label: forceHlsForHevc ? 'HEVC HLS' : '稳定 HLS',
+      active: preferHls || !selectedFlv,
+    });
   }
 
   return {
@@ -1640,7 +1745,7 @@ async function extractDouyin(req: DirectStreamRequest): Promise<DirectStreamResu
     title,
     anchorName,
     category,
-    flvUrl: preferHls ? undefined : rawFlv,
+    flvUrl: selectedFlv,
     hlsUrl: rawHls,
     referer: 'https://live.douyin.com/',
     qualities,

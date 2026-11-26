@@ -450,7 +450,10 @@ function findQualityTrigger(scopes: ParentNode[]): HTMLElement | null {
     '.player-videotype',
     '.quality-wrap',
     '.xgplayer-definition',
+    '.xgplayer-clarity',
+    '.gear',
     '[data-e2e="quality-btn"]',
+    '[class*="clarity"]',
     '[class*="rate-"]',
     '[class*="quality"]',
   ];
@@ -668,7 +671,7 @@ async function discoverGroups(): Promise<{
     huya: ['.player-videotype-list li', '#player-videotype-list li'],
     douyu: ['[class*="rate"] ul li', '[class*="menu-"] li'],
     bilibili: ['.quality-wrap .list-it', '.quality-panel .item', '.quality-list li'],
-    douyin: ['.xgplayer-definition ul li', '[data-e2e="quality-list"] li'],
+    douyin: ['.xgplayer-definition ul li', '[data-e2e="quality-list"] li', '.gear .item', '[class*="clarity"] [class*="item"]'],
   };
 
   const lineSelectorsByPlatform: Record<PlatformId, string[]> = {
@@ -1044,6 +1047,20 @@ function applyConfigAttributes(forceResize = false): void {
   }
 }
 
+function scoreWebviewQualityLabel(label: string): number {
+  if (/4k|2160/i.test(label)) return 600;
+  if (/2k|1440/i.test(label)) return 550;
+  if (/杜比|真彩|hdr/i.test(label)) return 520;
+  if (/原画/i.test(label)) return 500;
+  if (/蓝光.*(20|16|10|8)m|蓝光.*60/i.test(label)) return 460;
+  if (/蓝光|1080/i.test(label)) return 400;
+  if (/超清|720.*60/i.test(label)) return 300;
+  if (/高清|720/i.test(label)) return 200;
+  if (/标清|540|480/i.test(label)) return 100;
+  if (/流畅|极速|360/i.test(label)) return 50;
+  return 150;
+}
+
 async function tryAutoHighestQuality(): Promise<void> {
   if (!currentConfig.autoHighestQuality) return;
   const href = window.location.href;
@@ -1053,10 +1070,12 @@ async function tryAutoHighestQuality(): Promise<void> {
   if (!qualityGroup || qualityGroup.items.length === 0) return;
 
   const unlocked = qualityGroup.items.filter((i) => !i.option.locked);
-  const preferred =
-    unlocked.find((i) => /原画|4K|真彩/.test(i.option.label)) ||
-    unlocked.find((i) => /蓝光/.test(i.option.label)) ||
-    unlocked[0];
+  if (unlocked.length === 0) return;
+
+  // Score every unlocked tier explicitly so ascending menus (e.g. Douyin/Bilibili) NEVER pick 标清/流畅!
+  const preferred = [...unlocked].sort(
+    (a, b) => scoreWebviewQualityLabel(b.option.label) - scoreWebviewQualityLabel(a.option.label)
+  )[0];
 
   if (preferred && !preferred.option.active) {
     await selectStreamOption('quality', preferred.option.id);

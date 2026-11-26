@@ -109,21 +109,24 @@ const FREE_WEB_HD_SCRIPT = `(() => {
     };
 
     if (host.includes('douyin.com') && !host.startsWith('live.')) {
-      if (window.__livehubDouyinHdApplied) return;
+      const activeVideo = Array.from(document.querySelectorAll('video'))
+        .find((v) => !v.paused && v.readyState >= 2 && v.offsetParent !== null);
       const activeScope =
         document.querySelector('[data-e2e="feed-active-video"]') ||
-        Array.from(document.querySelectorAll('video'))
-          .find((v) => !v.paused && v.readyState >= 2 && v.offsetParent !== null)
-          ?.closest('.xgplayer, [data-e2e="feed-video"], [class*="player"]') ||
+        activeVideo?.closest('.xgplayer, [data-e2e="feed-video"], [class*="player"]') ||
         document;
       const clarityRoot =
-        activeScope.querySelector('.xgplayer-clarity, [data-e2e="video-player-clarity"], .gear') ||
+        activeScope.querySelector('.xgplayer-clarity, .xgplayer-definition, [data-e2e="video-player-clarity"], .gear') ||
         document.querySelector('[data-e2e="feed-active-video"] .gear');
       if (!clarityRoot) return;
+      // Track per-video-src so swiping to a new Douyin feed video upgrades blurry "智能/540P/720P" again
+      // without fighting manual user overrides on the same video
+      const videoKey = activeVideo?.currentSrc || activeVideo?.src || location.pathname;
+      if (window.__livehubDouyinHdKey === videoKey) return;
       const btnText = (clarityRoot.querySelector('.btn, .gear-btn, span')?.textContent || '').trim();
       const curScore = scoreLabel(btnText);
       if (curScore >= 300) {
-        window.__livehubDouyinHdApplied = true;
+        window.__livehubDouyinHdKey = videoKey;
         return;
       }
       const tryPick = () => {
@@ -131,7 +134,7 @@ const FREE_WEB_HD_SCRIPT = `(() => {
         const bestEl = pickBestUnlocked(items, Math.max(curScore, 100));
         if (bestEl) {
           bestEl.click();
-          window.__livehubDouyinHdApplied = true;
+          window.__livehubDouyinHdKey = videoKey;
           return true;
         }
         return false;
@@ -142,7 +145,7 @@ const FREE_WEB_HD_SCRIPT = `(() => {
         setTimeout(() => {
           tryPick();
           clarityRoot.dispatchEvent(new MouseEvent('mouseleave', { bubbles: true }));
-        }, 120);
+        }, 160);
       }
     } else if (host.includes('bilibili.com') && location.pathname.startsWith('/video/')) {
       const key = location.pathname;
@@ -2143,7 +2146,10 @@ export const LivePane = memo(function LivePane({
                 if (retryTimerRef.current !== null) return;
                 playingSinceRef.current = null;
                 const now = Date.now();
-                // Routine long-playback FLV EOF on a stable line does NOT count as a line failure unless it happens repeatedly
+                // Routine long-playback CDN EOF or signed URL expiry on a previously stable stream
+                // should refresh the current fast line immediately without falsely blaming the CDN line
+                const isRoutineRefresh =
+                  reason === 'flv-eof' || reason === 'flv-error' || reason === 'hls-expired';
                 const isHardDisconnect =
                   reason === 'early-eof' || reason === 'startup-timeout' || reason === 'stall-watchdog';
                 recentFailTimestampsRef.current = [
@@ -2180,8 +2186,12 @@ export const LivePane = memo(function LivePane({
                   return;
                 }
                 autoRetryCountRef.current += 1;
-                const delayMs = reason === 'flv-eof' ? 250 : Math.min(4500, autoRetryCountRef.current * 900);
-                showTempHint(reason === 'flv-eof' ? '连接自动续播中...' : '流连接刷新中，自动续播...');
+                const delayMs = isRoutineRefresh
+                  ? 120
+                  : Math.min(4500, autoRetryCountRef.current * 900);
+                if (!isRoutineRefresh) {
+                  showTempHint('流连接刷新中，自动续播...');
+                }
                 retryTimerRef.current = window.setTimeout(() => {
                   retryTimerRef.current = null;
                   silentReconnectRef.current = true;
