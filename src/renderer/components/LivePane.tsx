@@ -37,7 +37,6 @@ import type {
   Channel,
   ChannelPlatform,
   DanmakuArea,
-  DanmakuMessage,
   DanmakuMode,
   DanmakuStatusEvent,
   DirectStreamResult,
@@ -238,6 +237,8 @@ interface LivePaneProps {
   isMaximized: boolean;
   canMaximize: boolean;
   isHiddenByMaximize: boolean;
+  isObscured?: boolean;
+  bossHidden?: boolean;
   isPlayerFullscreen: boolean;
   effectiveMuted: boolean;
   isPlatformLoggedIn: boolean;
@@ -306,6 +307,8 @@ export const LivePane = memo(function LivePane({
   isMaximized,
   canMaximize,
   isHiddenByMaximize,
+  isObscured = false,
+  bossHidden = false,
   isPlayerFullscreen,
   effectiveMuted,
   isPlatformLoggedIn,
@@ -383,8 +386,9 @@ export const LivePane = memo(function LivePane({
     resolution?: string;
   } | null>(null);
   const [directPlayError, setDirectPlayError] = useState<string | null>(null);
-  const [danmakuBatch, setDanmakuBatch] = useState<DanmakuMessage[]>([]);
   const [danmakuStatus, setDanmakuStatus] = useState<DanmakuStatusEvent | null>(null);
+  const [hiddenSuspended, setHiddenSuspended] = useState(false);
+  const hiddenSuspendedRef = useRef(false);
   const autoRetryCountRef = useRef(0);
   const recentFailTimestampsRef = useRef<number[]>([]);
   const triedLinesRef = useRef<Set<string>>(new Set());
@@ -537,8 +541,9 @@ export const LivePane = memo(function LivePane({
     setDirectStream(null);
     setDirectStats(null);
     setDirectPlayError(null);
-    setDanmakuBatch([]);
     setDanmakuStatus(null);
+    hiddenSuspendedRef.current = false;
+    setHiddenSuspended(false);
     autoRetryCountRef.current = 0;
     recentFailTimestampsRef.current = [];
     triedLinesRef.current = new Set();
@@ -587,33 +592,70 @@ export const LivePane = memo(function LivePane({
     }
   }, [slotReloadTick, pane.url, useDirectStream]);
 
-  // Subscribe to native main-process WebSocket danmaku batches & status for this slot
+  // Gracefully suspend invisible + muted streams after an 8s grace period (saves 100% bandwidth & decode
+  // during long single-pane maximize / fullscreen / boss-key hide while keeping brief switches instant
+  // and NEVER cutting audio for unmuted background listening).
+  const shouldSuspendHidden = Boolean(
+    useDirectStream && isObscured && (effectiveMuted || bossHidden)
+  );
+  useEffect(() => {
+    if (!shouldSuspendHidden) {
+      if (hiddenSuspendedRef.current) {
+        hiddenSuspendedRef.current = false;
+        setHiddenSuspended(false);
+        silentReconnectRef.current = true;
+        setDirectPlayError(null);
+        setDirectReloadTick((n) => n + 1);
+      }
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      hiddenSuspendedRef.current = true;
+      setHiddenSuspended(true);
+    }, 8000);
+    return () => window.clearTimeout(timer);
+  }, [shouldSuspendHidden]);
+
+  // Shallow-compare stats updates so LivePane does not re-render when badge text is unchanged
+  const handleDirectStats = useCallback(
+    (next: { protocol: 'FLV' | 'HLS'; latencySec: number | null; resolution?: string }) => {
+      const roundedLatency = next.latencySec !== null ? Math.round(next.latencySec) : null;
+      setDirectStats((prev) => {
+        if (
+          prev &&
+          prev.protocol === next.protocol &&
+          prev.latencySec === roundedLatency &&
+          prev.resolution === next.resolution
+        ) {
+          return prev;
+        }
+        return {
+          protocol: next.protocol,
+          latencySec: roundedLatency,
+          resolution: next.resolution,
+        };
+      });
+    },
+    []
+  );
+
+  // Manage native main-process WebSocket danmaku lifecycle & status for this slot
+  // (DanmakuOverlay subscribes directly to batch IPC so danmaku bursts never re-render LivePane!)
   useEffect(() => {
     if (
       !useDirectStream ||
       !localDanmakuOn ||
       !directStream?.ok ||
       !parsedTarget ||
+      hiddenSuspended ||
       typeof window.livehub?.startDanmaku !== 'function'
     ) {
-      setDanmakuBatch([]);
       setDanmakuStatus(null);
       if (typeof window.livehub?.stopDanmaku === 'function') {
         void window.livehub.stopDanmaku(pane.slotIndex);
       }
       return;
     }
-
-    const unsubBatch = window.livehub.onDanmakuBatch((batch) => {
-      const mine = batch.filter((m) => m.slotIndex === pane.slotIndex);
-      if (mine.length > 0) {
-        // Keep recent rolling window so rapid IPC bursts never overwrite unconsumed batches under React 19 batching
-        setDanmakuBatch((prev) => {
-          const merged = [...prev, ...mine];
-          return merged.length > 60 ? merged.slice(merged.length - 60) : merged;
-        });
-      }
-    });
 
     const unsubStatus =
       typeof window.livehub.onDanmakuStatus === 'function'
@@ -627,9 +669,7 @@ export const LivePane = memo(function LivePane({
     void window.livehub.startDanmaku(pane.slotIndex, parsedTarget.platform, parsedTarget.roomId);
 
     return () => {
-      unsubBatch();
       unsubStatus();
-      setDanmakuBatch([]);
       setDanmakuStatus(null);
       void window.livehub.stopDanmaku(pane.slotIndex);
     };
@@ -637,6 +677,7 @@ export const LivePane = memo(function LivePane({
     useDirectStream,
     localDanmakuOn,
     directStream?.ok,
+    hiddenSuspended,
     parsedTarget?.platform,
     parsedTarget?.roomId,
     pane.slotIndex,
@@ -665,7 +706,7 @@ export const LivePane = memo(function LivePane({
 
   // Direct low-latency FLV/HLS stream extraction when in Pure (Direct) mode
   useEffect(() => {
-    if (!useDirectStream || !parsedTarget) return;
+    if (!useDirectStream || !parsedTarget || hiddenSuspendedRef.current) return;
     let cancelled = false;
     const isSilent = silentReconnectRef.current;
     silentReconnectRef.current = false;
@@ -2036,12 +2077,18 @@ export const LivePane = memo(function LivePane({
         <div className="direct-stage">
           {directStream?.ok && !directPlayError ? (
             <DirectPlayer
+              slotIndex={pane.slotIndex}
+              platform={parsedTarget?.platform}
+              roomId={parsedTarget?.roomId}
+              isPlatformLoggedIn={isPlatformLoggedIn}
               streamKey={parsedTarget ? `${parsedTarget.platform}:${parsedTarget.roomId}` : pane.url || ''}
               flvUrl={directStream.flvUrl}
               hlsUrl={directStream.hlsUrl}
               muted={effectiveMuted}
               volume={paneVolume}
               fitMode={paneFitMode}
+              isObscured={isObscured}
+              suspended={hiddenSuspended}
               reloadToken={directStreamSeq}
               danmakuEnabled={localDanmakuOn}
               danmakuArea={danmakuArea}
@@ -2050,8 +2097,9 @@ export const LivePane = memo(function LivePane({
               danmakuSpeed={danmakuSpeed}
               danmakuMode={danmakuMode}
               danmakuBlockKeywords={danmakuBlockKeywords}
-              danmakuBatch={danmakuBatch}
               danmakuStatus={danmakuStatus}
+              onLoginPlatform={onLoginPlatform}
+              onSwitchToWebMode={() => onToggleMode(pane.slotIndex, 'full')}
               onReconnectDanmaku={() => {
                 if (parsedTarget && typeof window.livehub?.startDanmaku === 'function') {
                   void window.livehub.startDanmaku(
@@ -2082,6 +2130,16 @@ export const LivePane = memo(function LivePane({
               isFullscreen={isPlayerFullscreen}
               onToggleFullscreen={() => onToggleFullscreen(pane.slotIndex)}
               onAutoReconnect={(reason) => {
+                if (reason === 'resume-from-pause') {
+                  if (retryTimerRef.current !== null) {
+                    window.clearTimeout(retryTimerRef.current);
+                    retryTimerRef.current = null;
+                  }
+                  silentReconnectRef.current = true;
+                  setDirectPlayError(null);
+                  setDirectReloadTick((n) => n + 1);
+                  return;
+                }
                 if (retryTimerRef.current !== null) return;
                 playingSinceRef.current = null;
                 const now = Date.now();
@@ -2149,7 +2207,7 @@ export const LivePane = memo(function LivePane({
                   triedLinesRef.current = new Set();
                 }
               }}
-              onStats={setDirectStats}
+              onStats={handleDirectStats}
               onError={(reason) => {
                 playingSinceRef.current = null;
                 const now = Date.now();

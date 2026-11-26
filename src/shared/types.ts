@@ -187,6 +187,13 @@ export interface DanmakuMessage {
   ts: number;
 }
 
+export interface SendDanmakuResult {
+  ok: boolean;
+  error?: string;
+  needsLogin?: boolean;
+  unsupportedPlatform?: boolean;
+}
+
 export type LiveStatusState = 'live' | 'replay' | 'offline' | 'unknown';
 
 export interface LiveStatusCheckItem {
@@ -260,6 +267,11 @@ export interface LiveHubAPI {
     forceReconnect?: boolean
   ) => Promise<{ ok: boolean; error?: string }>;
   stopDanmaku: (slotIndex: number) => Promise<void>;
+  sendDanmaku: (
+    platform: PlatformId,
+    roomId: string,
+    text: string
+  ) => Promise<SendDanmakuResult>;
   setWindowTheme: (isDark: boolean) => Promise<void>;
   copyScreenshot: (dataUrl: string) => Promise<boolean>;
   getDiagnostics: () => Promise<DiagnosticLogEntry[]>;

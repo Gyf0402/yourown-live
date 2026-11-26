@@ -115,6 +115,10 @@ export function App() {
   const [splashStage, setSplashStage] = useState<'visible' | 'leaving' | 'gone'>('visible');
   const [liveStatuses, setLiveStatuses] = useState<Record<string, LiveRoomStatus>>({});
   const [checkingStatuses, setCheckingStatuses] = useState(false);
+  const [bossHidden, setBossHidden] = useState(false);
+  const bossHiddenRef = useRef(false);
+  bossHiddenRef.current = bossHidden;
+  const lastStatusCheckAtRef = useRef(0);
   const muteBeforeBossRef = useRef<boolean | null>(null);
   const prevAuthRef = useRef<AuthStatusMap>(DEFAULT_AUTH_STATUS);
   const authHydratedRef = useRef(false);
@@ -210,6 +214,7 @@ export function App() {
     });
 
     const unlistenBoss = window.livehub.onBossKeyTriggered((hidden) => {
+      setBossHidden(hidden);
       setSettings((prev) => {
         if (hidden) {
           muteBeforeBossRef.current = prev.globalMuted;
@@ -296,6 +301,7 @@ export function App() {
     if (!targetList && checkingStatusesRef.current) return;
     if (!targetList) {
       checkingStatusesRef.current = true;
+      lastStatusCheckAtRef.current = Date.now();
       setCheckingStatuses(true);
     }
     try {
@@ -377,15 +383,40 @@ export function App() {
     };
   }, [hydrated]);
 
-  // Auto-check all channels on startup and every 60s
+  // Auto-check all channels on startup and every 60s (pauses when window is hidden or sidebar is collapsed)
   useEffect(() => {
     if (!hydrated) return;
     void refreshLiveStatuses();
     const timer = window.setInterval(() => {
+      if (document.hidden || bossHiddenRef.current || settingsRef.current.sidebarCollapsed) {
+        return;
+      }
       void refreshLiveStatuses();
     }, 60_000);
-    return () => window.clearInterval(timer);
+    const onVisibility = () => {
+      if (
+        !document.hidden &&
+        !bossHiddenRef.current &&
+        !settingsRef.current.sidebarCollapsed &&
+        Date.now() - lastStatusCheckAtRef.current >= 45_000
+      ) {
+        void refreshLiveStatuses();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
   }, [hydrated, refreshLiveStatuses]);
+
+  // Refresh immediately when sidebar is reopened or boss-key returns after a pause
+  useEffect(() => {
+    if (!hydrated || bossHidden || settings.sidebarCollapsed || document.hidden) return;
+    if (Date.now() - lastStatusCheckAtRef.current >= 45_000) {
+      void refreshLiveStatuses();
+    }
+  }, [hydrated, bossHidden, settings.sidebarCollapsed, refreshLiveStatuses]);
 
   const playingChannelIds = useMemo(() => {
     const visibleCount = LAYOUT_CONFIGS[settings.layout].count;
@@ -1241,6 +1272,7 @@ export function App() {
 
         <SplitGrid
           settings={settings}
+          bossHidden={bossHidden}
           authStatus={authStatus}
           reloadEpochs={reloadEpochs}
           slotReloadTicks={slotReloadTicks}

@@ -725,15 +725,7 @@ export function Sidebar({
                   const rect = e.currentTarget.getBoundingClientRect();
                   const pos: 'before' | 'after' =
                     e.clientY < rect.top + rect.height / 2 ? 'before' : 'after';
-                  const draggedCh = channels.find((c) => c.id === draggingId);
                   onReorderChannels(draggingId, channel.id, pos);
-                  if (channelSortMode === 'live' && draggedCh) {
-                    const fromRank = STATUS_SORT_RANK[liveStatuses[draggedCh.id]?.status ?? 'unknown'] ?? 2;
-                    const toRank = STATUS_SORT_RANK[liveStatuses[channel.id]?.status ?? 'unknown'] ?? 2;
-                    if (Boolean(draggedCh.pinned) !== Boolean(channel.pinned) || fromRank !== toRank) {
-                      setHint('已记住自定义优先级（当前为「开播序」，点上方切「自定义」可无视开播状态自由排）');
-                    }
-                  }
                   setDraggingId(null);
                   setDropTarget(null);
                 }}

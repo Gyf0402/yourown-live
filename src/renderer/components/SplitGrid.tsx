@@ -17,6 +17,7 @@ import { LivePane } from './LivePane';
 
 interface SplitGridProps {
   settings: AppSettings;
+  bossHidden: boolean;
   authStatus: AuthStatusMap;
   reloadEpochs: Record<PlatformId, number>;
   slotReloadTicks: number[];
@@ -76,6 +77,7 @@ function getLayoutClassName(layout: AppSettings['layout']): string {
 
 export function SplitGrid({
   settings,
+  bossHidden,
   authStatus,
   reloadEpochs,
   slotReloadTicks,
@@ -204,6 +206,9 @@ export function SplitGrid({
           const isHiddenByMaximize =
             effectiveMaxSlot !== null && effectiveMaxSlot !== pane.slotIndex;
           const isPlayerFullscreen = fullscreenSlotIndex === pane.slotIndex;
+          const isHiddenByFullscreen =
+            fullscreenSlotIndex !== null && fullscreenSlotIndex !== pane.slotIndex;
+          const isObscured = bossHidden || isHiddenByMaximize || isHiddenByFullscreen;
 
           return (
             <LivePane
@@ -214,6 +219,8 @@ export function SplitGrid({
               isMaximized={isMaximized}
               canMaximize={canMaximize}
               isHiddenByMaximize={isHiddenByMaximize}
+              isObscured={isObscured}
+              bossHidden={bossHidden}
               isPlayerFullscreen={isPlayerFullscreen}
               effectiveMuted={effectiveMuted}
               isPlatformLoggedIn={isPlatformLoggedIn}

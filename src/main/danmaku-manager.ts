@@ -1,8 +1,18 @@
 import crypto from 'node:crypto';
+import { promisify } from 'node:util';
 import zlib from 'node:zlib';
 import { BrowserWindow, type Session } from 'electron';
+
+const inflateAsync = promisify(zlib.inflate);
+const brotliDecompressAsync = promisify(zlib.brotliDecompress);
+const gunzipAsync = promisify(zlib.gunzip);
 import WebSocket from 'ws';
-import type { DanmakuMessage, DanmakuStatusEvent, PlatformId } from '../shared/types';
+import type {
+  DanmakuMessage,
+  DanmakuStatusEvent,
+  PlatformId,
+  SendDanmakuResult,
+} from '../shared/types';
 import { recordDiagnostic } from './diagnostics';
 import { resolveDouyuRealRid } from './stream-extractor';
 
@@ -364,11 +374,11 @@ function destroyDouyinSigner(): void {
   }
 }
 
-function touchDouyinSignerIdle(): void {
+function touchDouyinSignerIdle(delayMs = 12_000): void {
   if (signerIdleTimer) clearTimeout(signerIdleTimer);
   signerIdleTimer = setTimeout(() => {
     destroyDouyinSigner();
-  }, 60_000);
+  }, delayMs);
 }
 
 async function ensureDouyinSdkInfo(): Promise<{ ttwid: string; sdkCode: string }> {
@@ -530,6 +540,7 @@ interface ActiveSlotDanmaku {
 
 export class DanmakuManager {
   private slots = new Map<number, ActiveSlotDanmaku>();
+  private biliRealRidCache = new Map<string, number>();
   private seq = 0;
   private msgSeq = 0;
   private pendingBatch: DanmakuMessage[] = [];
@@ -611,7 +622,7 @@ export class DanmakuManager {
     // Reclaim Douyin signer window quickly if no Douyin slots remain
     const hasDouyin = Array.from(this.slots.values()).some((s) => s.platform === 'douyin');
     if (!hasDouyin && signerWin && !signerWin.isDestroyed()) {
-      touchDouyinSignerIdle();
+      touchDouyinSignerIdle(3_000);
     }
   }
 
@@ -891,6 +902,9 @@ export class DanmakuManager {
         : '';
 
     const realRid = Number(roomInfo?.data?.room_id || entry.roomId);
+    if (Number.isFinite(realRid) && realRid > 0) {
+      this.biliRealRidCache.set(entry.roomId, realRid);
+    }
     const qs = wbiSignQuery({ id: realRid, type: 0 }, wbi.imgKey, wbi.subKey);
     const dmInfo = (await biliFetchJson(
       `https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo?${qs}`,
@@ -921,9 +935,13 @@ export class DanmakuManager {
       return Buffer.concat([head, body]);
     };
 
-    const unpack = (buf: Buffer) => {
+    const isEntryActive = () =>
+      !entry.stopped && entry.ws === ws && this.slots.get(entry.slotIndex)?.token === entry.token;
+
+    const unpack = async (buf: Buffer): Promise<void> => {
       let off = 0;
       while (off + 16 <= buf.length) {
+        if (!isEntryActive()) return;
         const plen = buf.readUInt32BE(off);
         const hlen = buf.readUInt16BE(off + 4);
         const ver = buf.readUInt16BE(off + 6);
@@ -934,13 +952,15 @@ export class DanmakuManager {
         if (op === 5) {
           if (ver === 2) {
             try {
-              unpack(zlib.inflateSync(body));
+              const inflated = await inflateAsync(body);
+              if (isEntryActive()) await unpack(inflated);
             } catch {
               // Ignore malformed deflate
             }
           } else if (ver === 3) {
             try {
-              unpack(zlib.brotliDecompressSync(body));
+              const decompressed = await brotliDecompressAsync(body);
+              if (isEntryActive()) await unpack(decompressed);
             } catch {
               // Ignore malformed brotli
             }
@@ -992,7 +1012,7 @@ export class DanmakuManager {
     entry.ws = ws;
 
     ws.on('open', () => {
-      if (entry.stopped || entry.ws !== ws || this.slots.get(entry.slotIndex)?.token !== entry.token) return;
+      if (!isEntryActive()) return;
       entry.retries = 0;
       this.notifyStatus(entry.slotIndex, 'connected', 'bilibili');
       recordDiagnostic(
@@ -1020,8 +1040,8 @@ export class DanmakuManager {
     });
 
     ws.on('message', (data) => {
-      if (entry.stopped || entry.ws !== ws || this.slots.get(entry.slotIndex)?.token !== entry.token) return;
-      unpack(Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer));
+      if (!isEntryActive()) return;
+      void unpack(Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer));
     });
     ws.on('close', () => this.scheduleReconnect(entry));
     ws.on('error', () => {});
@@ -1075,54 +1095,59 @@ export class DanmakuManager {
     ws.on('message', (data) => {
       if (entry.stopped || entry.ws !== ws || this.slots.get(entry.slotIndex)?.token !== entry.token) return;
       const buf = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
-      try {
-        const cf = tarsReadFields(buf);
-        const cmdType = Number(cf.get(0) ?? -1);
-        const vData = cf.get(1);
-        if ((cmdType === 7 || cmdType === 22) && Buffer.isBuffer(vData)) {
-          const pf = tarsReadFields(vData);
-          const uri = Number(pf.get(1) ?? 0);
-          let payload = pf.get(2);
-          const protocolType = Number(pf.get(4) ?? 0);
-          if (uri === 1400 && Buffer.isBuffer(payload)) {
-            if (protocolType === 1) {
-              try {
-                payload = zlib.inflateSync(payload);
-              } catch {
-                // Ignore
-              }
-            }
-            const notice = tarsReadFields(payload);
-            const userBuf = notice.get(0);
-            const content = notice.get(3);
-            const formatBuf = notice.get(6);
-            let nick = '';
-            if (Buffer.isBuffer(userBuf)) {
-              try {
-                nick = String(tarsReadFields(userBuf).get(2) || '');
-              } catch {
-                nick = '';
-              }
-            }
-            let color: string | undefined;
-            if (Buffer.isBuffer(formatBuf)) {
-              try {
-                const fontColor = Number(tarsReadFields(formatBuf).get(0) ?? -1);
-                if (fontColor > 0 && fontColor !== 16777215) {
-                  color = `#${fontColor.toString(16).padStart(6, '0')}`;
+      void (async () => {
+        try {
+          const cf = tarsReadFields(buf);
+          const cmdType = Number(cf.get(0) ?? -1);
+          const vData = cf.get(1);
+          if ((cmdType === 7 || cmdType === 22) && Buffer.isBuffer(vData)) {
+            const pf = tarsReadFields(vData);
+            const uri = Number(pf.get(1) ?? 0);
+            let payload = pf.get(2);
+            const protocolType = Number(pf.get(4) ?? 0);
+            if (uri === 1400 && Buffer.isBuffer(payload)) {
+              if (protocolType === 1) {
+                try {
+                  payload = await inflateAsync(payload);
+                } catch {
+                  // Ignore
                 }
-              } catch {
-                color = undefined;
+                if (entry.stopped || entry.ws !== ws || this.slots.get(entry.slotIndex)?.token !== entry.token) {
+                  return;
+                }
               }
-            }
-            if (typeof content === 'string' && content && nick !== '系统消息') {
-              this.enqueue(entry.slotIndex, 'huya', nick, content, color);
+              const notice = tarsReadFields(payload);
+              const userBuf = notice.get(0);
+              const content = notice.get(3);
+              const formatBuf = notice.get(6);
+              let nick = '';
+              if (Buffer.isBuffer(userBuf)) {
+                try {
+                  nick = String(tarsReadFields(userBuf).get(2) || '');
+                } catch {
+                  nick = '';
+                }
+              }
+              let color: string | undefined;
+              if (Buffer.isBuffer(formatBuf)) {
+                try {
+                  const fontColor = Number(tarsReadFields(formatBuf).get(0) ?? -1);
+                  if (fontColor > 0 && fontColor !== 16777215) {
+                    color = `#${fontColor.toString(16).padStart(6, '0')}`;
+                  }
+                } catch {
+                  color = undefined;
+                }
+              }
+              if (typeof content === 'string' && content && nick !== '系统消息') {
+                this.enqueue(entry.slotIndex, 'huya', nick, content, color);
+              }
             }
           }
+        } catch {
+          // Ignore malformed Tars frame
         }
-      } catch {
-        // Ignore malformed Tars frame
-      }
+      })();
     });
 
     ws.on('close', () => this.scheduleReconnect(entry));
@@ -1208,62 +1233,242 @@ export class DanmakuManager {
     ws.on('message', (data) => {
       if (entry.stopped || entry.ws !== ws || this.slots.get(entry.slotIndex)?.token !== entry.token) return;
       const buf = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
-      try {
-        const frameFields = parseProtoFields(buf);
-        const logId = frameFields.find((f) => f.fieldNum === 2)?.val ?? 0n;
-        const rawPayload = frameFields.find((f) => f.fieldNum === 8)?.buf;
-        if (!rawPayload) return;
-
-        let unzipped = rawPayload;
+      void (async () => {
         try {
-          unzipped = zlib.gunzipSync(rawPayload);
-        } catch {
-          // Payload may be uncompressed
-        }
+          const frameFields = parseProtoFields(buf);
+          const logId = frameFields.find((f) => f.fieldNum === 2)?.val ?? 0n;
+          const rawPayload = frameFields.find((f) => f.fieldNum === 8)?.buf;
+          if (!rawPayload) return;
 
-        const respFields = parseProtoFields(unzipped);
-        const internalExt = respFields.find((f) => f.fieldNum === 5)?.buf;
-        const needAck = respFields.find((f) => f.fieldNum === 9)?.val;
-        if (needAck && needAck !== 0n && internalExt && ws.readyState === WebSocket.OPEN) {
-          const ack = Buffer.concat([
-            encodeProtoVarint(2, logId),
-            encodeProtoBytes(7, Buffer.from('ack')),
-            encodeProtoBytes(8, internalExt),
-          ]);
-          try {
-            ws.send(ack);
-          } catch {
-            // Ignore
+          let unzipped = rawPayload;
+          // Only attempt gunzip when magic header matches gzip (0x1f 0x8b) to avoid wasted decompression errors
+          if (rawPayload.length >= 2 && rawPayload[0] === 0x1f && rawPayload[1] === 0x8b) {
+            try {
+              unzipped = await gunzipAsync(rawPayload);
+            } catch {
+              // Payload may be uncompressed
+            }
+            if (entry.stopped || entry.ws !== ws || this.slots.get(entry.slotIndex)?.token !== entry.token) {
+              return;
+            }
           }
-        }
 
-        for (const f of respFields) {
-          if (f.fieldNum === 1 && f.buf) {
-            const mf = parseProtoFields(f.buf);
-            const method = mf.find((x) => x.fieldNum === 1)?.buf?.toString('utf-8') || '';
-            const payload = mf.find((x) => x.fieldNum === 2)?.buf;
-            if (method === 'WebcastChatMessage' && payload) {
-              const cf = parseProtoFields(payload);
-              const userBuf = cf.find((x) => x.fieldNum === 2)?.buf;
-              const content = cf.find((x) => x.fieldNum === 3)?.buf?.toString('utf-8') || '';
-              let nick = '';
-              if (userBuf) {
-                nick =
-                  parseProtoFields(userBuf).find((x) => x.fieldNum === 3)?.buf?.toString('utf-8') ||
-                  '';
-              }
-              if (content) {
-                this.enqueue(entry.slotIndex, 'douyin', nick, content);
+          const respFields = parseProtoFields(unzipped);
+          const internalExt = respFields.find((f) => f.fieldNum === 5)?.buf;
+          const needAck = respFields.find((f) => f.fieldNum === 9)?.val;
+          if (needAck && needAck !== 0n && internalExt && ws.readyState === WebSocket.OPEN) {
+            const ack = Buffer.concat([
+              encodeProtoVarint(2, logId),
+              encodeProtoBytes(7, Buffer.from('ack')),
+              encodeProtoBytes(8, internalExt),
+            ]);
+            try {
+              ws.send(ack);
+            } catch {
+              // Ignore
+            }
+          }
+
+          for (const f of respFields) {
+            if (f.fieldNum === 1 && f.buf) {
+              const mf = parseProtoFields(f.buf);
+              const method = mf.find((x) => x.fieldNum === 1)?.buf?.toString('utf-8') || '';
+              const payload = mf.find((x) => x.fieldNum === 2)?.buf;
+              if (method === 'WebcastChatMessage' && payload) {
+                const cf = parseProtoFields(payload);
+                const userBuf = cf.find((x) => x.fieldNum === 2)?.buf;
+                const content = cf.find((x) => x.fieldNum === 3)?.buf?.toString('utf-8') || '';
+                let nick = '';
+                if (userBuf) {
+                  nick =
+                    parseProtoFields(userBuf).find((x) => x.fieldNum === 3)?.buf?.toString('utf-8') ||
+                    '';
+                }
+                if (content) {
+                  this.enqueue(entry.slotIndex, 'douyin', nick, content);
+                }
               }
             }
           }
+        } catch {
+          // Ignore malformed Protobuf frame
         }
-      } catch {
-        // Ignore malformed Protobuf frame
-      }
+      })();
     });
 
     ws.on('close', () => this.scheduleReconnect(entry));
     ws.on('error', () => {});
+  }
+
+  // ==================== Direct Danmaku Sending ====================
+  public async sendDanmaku(
+    platform: PlatformId,
+    roomId: string,
+    rawText: string
+  ): Promise<SendDanmakuResult> {
+    const text = String(rawText || '').replace(/\s+/g, ' ').trim();
+    if (!text) {
+      return { ok: false, error: '弹幕内容不能为空' };
+    }
+    if (platform !== 'bilibili') {
+      return {
+        ok: false,
+        unsupportedPlatform: true,
+        error: '直连发弹幕暂仅支持 B站，当前平台可一键切网页发送',
+      };
+    }
+    if (text.length > 40) {
+      return { ok: false, error: '单条弹幕长度不能超过 40 字' };
+    }
+
+    const liveSession = this.getSession?.();
+    if (!liveSession) {
+      return { ok: false, error: '会话未就绪，请重试' };
+    }
+
+    try {
+      const cookies = await liveSession.cookies.get({ domain: 'bilibili.com' });
+      const dedup = new Map<string, string>();
+      for (const c of cookies) {
+        if (!c.name || !c.value) continue;
+        if (!dedup.has(c.name) || (c.domain || '').startsWith('.')) {
+          dedup.set(c.name, c.value);
+        }
+      }
+      const sessdata = dedup.get('SESSDATA') || '';
+      const biliJct = dedup.get('bili_jct') || '';
+      if (!sessdata || !biliJct) {
+        return {
+          ok: false,
+          needsLogin: true,
+          error: '请先登录 B站账号后再发送弹幕',
+        };
+      }
+
+      // Resolve real long room_id (short IDs like 6 must be mapped before calling /msg/send)
+      let realRid = this.biliRealRidCache.get(roomId) ?? 0;
+      if (!realRid) {
+        try {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 4500);
+          try {
+            const infoResp = await liveSession.fetch(
+              `https://api.live.bilibili.com/room/v1/Room/get_info?room_id=${encodeURIComponent(roomId)}`,
+              { credentials: 'include', signal: controller.signal }
+            );
+            const infoJson = (await infoResp.json()) as { data?: { room_id?: number } };
+            if (infoJson?.data?.room_id) {
+              realRid = Number(infoJson.data.room_id);
+              this.biliRealRidCache.set(roomId, realRid);
+            }
+          } finally {
+            clearTimeout(timer);
+          }
+        } catch {
+          // Fall back to raw roomId if numeric
+        }
+      }
+      if (!realRid) {
+        realRid = Number(roomId);
+      }
+      if (!Number.isFinite(realRid) || realRid <= 0) {
+        return { ok: false, error: '无效的 B站房间号' };
+      }
+
+      const wbi = await getBiliWbiInfo().catch(() => null);
+      const sendUrl =
+        wbi && wbi.imgKey && wbi.subKey
+          ? `https://api.live.bilibili.com/msg/send?${wbiSignQuery(
+              { web_location: '444.8' },
+              wbi.imgKey,
+              wbi.subKey
+            )}`
+          : 'https://api.live.bilibili.com/msg/send';
+
+      const buildFormData = () => {
+        const fd = new FormData();
+        fd.append('bubble', '0');
+        fd.append('msg', text);
+        fd.append('color', '16777215');
+        fd.append('mode', '1');
+        fd.append('room_type', '0');
+        fd.append('jumpfrom', '0');
+        fd.append('reply_mid', '0');
+        fd.append('reply_attr', '0');
+        fd.append('replay_dmid', '');
+        fd.append('statistics', JSON.stringify({ appId: 100, platform: 5 }));
+        fd.append('reply_type', '0');
+        fd.append('reply_uname', '');
+        fd.append('data_extend', JSON.stringify({ trackid: '-99998' }));
+        fd.append('fontsize', '25');
+        fd.append('rnd', String(Math.floor(Date.now() / 1000)));
+        fd.append('roomid', String(realRid));
+        fd.append('csrf', biliJct);
+        fd.append('csrf_token', biliJct);
+        return fd;
+      };
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 6500);
+      let respJson: { code?: number; message?: string; msg?: string } | null = null;
+      try {
+        try {
+          // NOTE: Do NOT pass forbidden Fetch headers (Referer/Origin) directly into session.fetch,
+          // otherwise Chromium aborts with net::ERR_BLOCKED_BY_CLIENT. main.ts injects Referer/Origin
+          // for api.live.bilibili.com via liveSession.webRequest.onBeforeSendHeaders automatically.
+          const resp = await liveSession.fetch(sendUrl, {
+            method: 'POST',
+            credentials: 'include',
+            signal: controller.signal,
+            body: buildFormData(),
+          });
+          respJson = (await resp.json()) as { code?: number; message?: string; msg?: string };
+        } catch {
+          const cookieHeader = Array.from(dedup.entries())
+            .map(([k, v]) => `${k}=${v}`)
+            .join('; ');
+          const resp = await fetchWithTimeout(
+            sendUrl,
+            {
+              method: 'POST',
+              headers: {
+                'User-Agent': DESKTOP_UA,
+                Referer: `https://live.bilibili.com/${realRid}`,
+                Origin: 'https://live.bilibili.com',
+                Cookie: cookieHeader,
+              },
+              body: buildFormData(),
+            },
+            6500
+          );
+          respJson = (await resp.json()) as { code?: number; message?: string; msg?: string };
+        }
+      } finally {
+        clearTimeout(timer);
+      }
+
+      const code = respJson?.code;
+      const msg = (respJson?.msg || respJson?.message || '').trim();
+      if (code === 0) {
+        if (msg === 'f' || msg === 'k' || msg === 'fire') {
+          return { ok: false, error: '弹幕包含直播间屏蔽词，未能上屏' };
+        }
+        if (msg && msg !== 'ok' && msg !== '0') {
+          return { ok: false, error: msg };
+        }
+        recordDiagnostic('info', 'danmaku', `[bilibili#${realRid}] 直连发送弹幕成功`);
+        return { ok: true };
+      }
+      if (code === -101 || code === -111) {
+        return { ok: false, needsLogin: true, error: 'B站登录态已过期，请重新扫码登录' };
+      }
+      const errText = msg || `发送失败 (code=${code ?? 'unknown'})`;
+      recordDiagnostic('warn', 'danmaku', `[bilibili#${realRid}] 发送弹幕失败：${errText}`);
+      return { ok: false, error: errText };
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : '网络异常，发送失败';
+      recordDiagnostic('warn', 'danmaku', `[bilibili#${roomId}] 发送弹幕异常：${errMsg}`);
+      return { ok: false, error: errMsg };
+    }
   }
 }

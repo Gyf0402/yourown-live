@@ -45,6 +45,8 @@ const api: LiveHubAPI = {
     forceReconnect?: boolean
   ) => ipcRenderer.invoke('livehub:start-danmaku', slotIndex, platform, roomId, forceReconnect),
   stopDanmaku: (slotIndex: number) => ipcRenderer.invoke('livehub:stop-danmaku', slotIndex),
+  sendDanmaku: (platform: PlatformId, roomId: string, text: string) =>
+    ipcRenderer.invoke('livehub:send-danmaku', platform, roomId, text),
   setWindowTheme: (isDark: boolean) => ipcRenderer.invoke('livehub:set-window-theme', isDark),
   copyScreenshot: (dataUrl: string) => ipcRenderer.invoke('livehub:copy-screenshot', dataUrl),
   getDiagnostics: () => ipcRenderer.invoke('livehub:get-diagnostics'),

@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Camera,
+  Globe,
+  KeyRound,
   Maximize2,
   MessageSquare,
   MessageSquareOff,
@@ -9,29 +11,38 @@ import {
   Play,
   RefreshCw,
   Scan,
+  Send,
   SlidersHorizontal,
   Volume2,
   VolumeX,
+  X,
 } from 'lucide-react';
 import Hls from 'hls.js';
 import mpegts from 'mpegts.js';
 import type {
   DanmakuArea,
-  DanmakuMessage,
   DanmakuMode,
   DanmakuStatusEvent,
+  PlatformId,
+  SendDanmakuResult,
   VideoFitMode,
 } from '../../shared/types';
 import { DanmakuOverlay } from './DanmakuOverlay';
 import { DanmakuSettingsPopover } from './DanmakuSettingsPopover';
 
 interface DirectPlayerProps {
+  slotIndex: number;
+  platform?: PlatformId;
+  roomId?: string;
+  isPlatformLoggedIn?: boolean;
   streamKey?: string;
   flvUrl?: string;
   hlsUrl?: string;
   muted: boolean;
   volume?: number;
   fitMode?: VideoFitMode;
+  isObscured?: boolean;
+  suspended?: boolean;
   reloadToken: number;
   danmakuEnabled?: boolean;
   danmakuArea?: DanmakuArea;
@@ -40,8 +51,9 @@ interface DirectPlayerProps {
   danmakuSpeed?: number;
   danmakuMode?: DanmakuMode;
   danmakuBlockKeywords?: string[];
-  danmakuBatch?: DanmakuMessage[];
   danmakuStatus?: DanmakuStatusEvent | null;
+  onLoginPlatform?: (platform: PlatformId) => void;
+  onSwitchToWebMode?: () => void;
   onReconnectDanmaku?: () => void;
   onChangeVolume?: (volume: number) => void;
   onToggleFitMode?: () => void;
@@ -63,12 +75,18 @@ interface DirectPlayerProps {
 }
 
 export function DirectPlayer({
+  slotIndex,
+  platform,
+  roomId,
+  isPlatformLoggedIn = false,
   streamKey = '',
   flvUrl,
   hlsUrl,
   muted,
   volume: controlledVolume = 1,
   fitMode = 'contain',
+  isObscured = false,
+  suspended = false,
   reloadToken,
   danmakuEnabled = true,
   danmakuArea = 'half',
@@ -77,8 +95,9 @@ export function DirectPlayer({
   danmakuSpeed = 1,
   danmakuMode = 'scroll',
   danmakuBlockKeywords = [],
-  danmakuBatch = [],
   danmakuStatus = null,
+  onLoginPlatform,
+  onSwitchToWebMode,
   onReconnectDanmaku,
   onChangeVolume,
   onToggleFitMode,
@@ -106,14 +125,28 @@ export function DirectPlayer({
   const controlsHoveredRef = useRef(false);
   const [useHlsFallback, setUseHlsFallback] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
+  const [pauseSuspended, setPauseSuspended] = useState(false);
+  const pauseSuspendedRef = useRef(false);
+  pauseSuspendedRef.current = pauseSuspended;
+  const pauseSuspendTimerRef = useRef<number | null>(null);
+  const pausedAtRef = useRef<number | null>(null);
+  const isObscuredRef = useRef(isObscured);
+  isObscuredRef.current = isObscured;
   const [localFullscreen, setLocalFullscreen] = useState(false);
   const isFullscreen = onToggleFullscreen ? Boolean(controlledFullscreen) : localFullscreen;
   const [controlsIdle, setControlsIdle] = useState(false);
   const [liveBadge, setLiveBadge] = useState<string>('FLV');
   const [videoReady, setVideoReady] = useState(false);
   const [dmPanelOpen, setDmPanelOpen] = useState(false);
+  const [composerOpen, setComposerOpen] = useState(false);
+  const [composerText, setComposerText] = useState('');
+  const [composerSending, setComposerSending] = useState(false);
+  const [composerCooldown, setComposerCooldown] = useState(false);
   const [hudToast, setHudToast] = useState<string | null>(null);
   const dmPanelRef = useRef<HTMLDivElement | null>(null);
+  const composerRef = useRef<HTMLDivElement | null>(null);
+  const composerInputRef = useRef<HTMLInputElement | null>(null);
+  const cooldownTimerRef = useRef<number | null>(null);
 
   const volume = Math.max(0, Math.min(1, Number.isFinite(controlledVolume) ? controlledVolume : 1));
   const mutedRef = useRef(muted);
@@ -172,7 +205,7 @@ export function DirectPlayer({
       return;
     }
     controlsHoveredRef.current = false;
-    if (isPaused || dmPanelOpen) {
+    if (isPaused || dmPanelOpen || composerOpen) {
       if (idleTimerRef.current !== null) {
         window.clearTimeout(idleTimerRef.current);
         idleTimerRef.current = null;
@@ -187,7 +220,7 @@ export function DirectPlayer({
         idleTimerRef.current = null;
       }
     };
-  }, [isFullscreen, isPaused, dmPanelOpen, scheduleIdleHide]);
+  }, [isFullscreen, isPaused, dmPanelOpen, composerOpen, scheduleIdleHide]);
 
   useEffect(() => {
     return () => {
@@ -200,8 +233,81 @@ export function DirectPlayer({
       if (idleTimerRef.current !== null) {
         window.clearTimeout(idleTimerRef.current);
       }
+      if (pauseSuspendTimerRef.current !== null) {
+        window.clearTimeout(pauseSuspendTimerRef.current);
+      }
+      if (cooldownTimerRef.current !== null) {
+        window.clearTimeout(cooldownTimerRef.current);
+      }
     };
   }, []);
+
+  const handleSendDanmaku = useCallback(
+    async (rawText: string): Promise<SendDanmakuResult> => {
+      const clean = rawText.replace(/\s+/g, ' ').trim();
+      if (!clean) {
+        return { ok: false, error: '请输入弹幕内容' };
+      }
+      if (!platform || !roomId || typeof window.livehub?.sendDanmaku !== 'function') {
+        return { ok: false, error: '当前直播间暂无法发送弹幕' };
+      }
+      const res = await window.livehub.sendDanmaku(platform, roomId, clean);
+      if (res.ok) {
+        showHud('弹幕已发送');
+      } else if (res.error) {
+        showHud(res.error);
+      }
+      return res;
+    },
+    [platform, roomId, showHud]
+  );
+
+  const submitFloatingComposer = useCallback(
+    async (e?: React.FormEvent) => {
+      e?.preventDefault();
+      if (composerSending || composerCooldown) return;
+      const clean = composerText.replace(/\s+/g, ' ').trim();
+      if (!clean) return;
+      setComposerSending(true);
+      try {
+        const res = await handleSendDanmaku(clean);
+        if (res.ok) {
+          setComposerText('');
+          setComposerCooldown(true);
+          if (cooldownTimerRef.current !== null) {
+            window.clearTimeout(cooldownTimerRef.current);
+          }
+          cooldownTimerRef.current = window.setTimeout(() => {
+            cooldownTimerRef.current = null;
+            setComposerCooldown(false);
+          }, 1500);
+        }
+      } finally {
+        setComposerSending(false);
+        window.setTimeout(() => composerInputRef.current?.focus(), 0);
+      }
+    },
+    [composerSending, composerCooldown, composerText, handleSendDanmaku]
+  );
+
+  useEffect(() => {
+    setComposerText('');
+  }, [streamKey]);
+
+  useEffect(() => {
+    if (!composerOpen) return;
+    window.setTimeout(() => composerInputRef.current?.focus(), 0);
+    const onDown = (e: MouseEvent) => {
+      if (composerRef.current && !composerRef.current.contains(e.target as Node)) {
+        const target = e.target as HTMLElement | null;
+        if (!target?.closest('[data-dm-composer-toggle="1"]')) {
+          setComposerOpen(false);
+        }
+      }
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [composerOpen]);
 
   const handleScreenshot = useCallback(async () => {
     const video = videoRef.current;
@@ -243,9 +349,18 @@ export function DirectPlayer({
 
   useEffect(() => {
     userPausedRef.current = false;
+    pausedAtRef.current = null;
+    if (pauseSuspendTimerRef.current !== null) {
+      window.clearTimeout(pauseSuspendTimerRef.current);
+      pauseSuspendTimerRef.current = null;
+    }
+    setPauseSuspended(false);
     setUseHlsFallback(false);
     setIsPaused(false);
     setVideoReady(false);
+    if (videoRef.current) {
+      videoRef.current.removeAttribute('poster');
+    }
   }, [flvUrl, hlsUrl, reloadToken]);
 
   useEffect(() => {
@@ -272,7 +387,22 @@ export function DirectPlayer({
     const video = videoRef.current;
     if (!video) return;
     if (video.paused || userPausedRef.current) {
+      if (pauseSuspendTimerRef.current !== null) {
+        window.clearTimeout(pauseSuspendTimerRef.current);
+        pauseSuspendTimerRef.current = null;
+      }
+      const wasSuspended = pauseSuspendedRef.current;
+      const pausedMs = pausedAtRef.current ? Date.now() - pausedAtRef.current : 0;
       userPausedRef.current = false;
+      pausedAtRef.current = null;
+      setIsPaused(false);
+      if (wasSuspended) {
+        setPauseSuspended(false);
+        if (pausedMs > 60_000) {
+          onAutoReconnectRef.current?.('resume-from-pause');
+        }
+        return;
+      }
       // Jump to live edge on resume so latency does not accumulate while paused
       if (video.buffered && video.buffered.length > 0) {
         try {
@@ -295,12 +425,37 @@ export function DirectPlayer({
       video.muted = mutedRef.current;
       video.volume = volumeRef.current;
       void video.play().catch(() => {});
-      setIsPaused(false);
     } else {
       userPausedRef.current = true;
+      pausedAtRef.current = Date.now();
       video.playbackRate = 1;
       video.pause();
       setIsPaused(true);
+      // After 10s paused, capture current frame as poster and unload live stream so it stops
+      // downloading full bitrate in background while keeping the exact paused frame visible
+      if (pauseSuspendTimerRef.current !== null) {
+        window.clearTimeout(pauseSuspendTimerRef.current);
+      }
+      pauseSuspendTimerRef.current = window.setTimeout(() => {
+        pauseSuspendTimerRef.current = null;
+        if (!userPausedRef.current) return;
+        const v = videoRef.current;
+        if (v && v.videoWidth > 0 && v.videoHeight > 0) {
+          try {
+            const snap = document.createElement('canvas');
+            snap.width = v.videoWidth;
+            snap.height = v.videoHeight;
+            const sctx = snap.getContext('2d');
+            if (sctx) {
+              sctx.drawImage(v, 0, 0, snap.width, snap.height);
+              v.poster = snap.toDataURL('image/jpeg', 0.85);
+            }
+          } catch {
+            // Ignore frame capture errors
+          }
+        }
+        setPauseSuspended(true);
+      }, 10_000);
     }
   }, []);
 
@@ -324,6 +479,9 @@ export function DirectPlayer({
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
+    if (suspended || pauseSuspended) {
+      return;
+    }
 
     const shouldUseFlv = Boolean(flvUrl) && !useHlsFallback && mpegts.isSupported();
     const activeProtocol: 'FLV' | 'HLS' = shouldUseFlv ? 'FLV' : 'HLS';
@@ -394,6 +552,9 @@ export function DirectPlayer({
         stalledTicks = 0;
         if (!userPausedRef.current) {
           setIsPaused(false);
+        }
+        if (video.poster) {
+          video.removeAttribute('poster');
         }
         setVideoReady(true);
         video.muted = mutedRef.current;
@@ -466,9 +627,9 @@ export function DirectPlayer({
             // Disable aggressive hard-seek latency chasing so a stable stream never jumps/skips frames
             liveBufferLatencyChasing: false,
             autoCleanupSourceBuffer: true,
-            // Keep >= 60s backward buffer so SourceBuffer.remove never slices into an active 10-16s GOP
-            autoCleanupMaxBackwardDuration: 90,
-            autoCleanupMinBackwardDuration: 60,
+            // Keep 25-45s backward buffer: safely larger than 10-16s GOPs while halving MSE RAM usage
+            autoCleanupMaxBackwardDuration: 45,
+            autoCleanupMinBackwardDuration: 25,
           }
         );
 
@@ -512,7 +673,7 @@ export function DirectPlayer({
       }
     } else if (Hls.isSupported()) {
       hlsPlayer = new Hls({
-        enableWorker: false,
+        enableWorker: true,
         lowLatencyMode: false,
         startFragPrefetch: true,
         liveSyncDurationCount: 3,
@@ -594,7 +755,7 @@ export function DirectPlayer({
 
       // Watchdog for long playback: detect unexpected pause or truly frozen frames while user did NOT pause.
       // Never falsely trigger stall reconnect while the window or pane is hidden (minimized / boss-key / maximize-hidden).
-      const isPaneHidden = document.hidden || v.offsetParent === null;
+      const isPaneHidden = document.hidden || Boolean(isObscuredRef.current) || v.offsetParent === null;
       if (!userPausedRef.current && !isPaneHidden) {
         if (v.paused && hasBuffer && v.readyState >= 2) {
           void v.play().catch(() => {});
@@ -653,14 +814,15 @@ export function DirectPlayer({
           onPlayingRef.current?.();
         }
       }
+      if (isPaneHidden) return;
+
       const resolution =
         v.videoWidth && v.videoHeight ? `${v.videoWidth}×${v.videoHeight}` : undefined;
       const resTag = v.videoHeight ? `${Math.min(v.videoWidth, v.videoHeight)}P` : '';
-      setLiveBadge(
-        [resTag, activeProtocol, latencySec !== null ? `${latencySec}s` : '']
-          .filter(Boolean)
-          .join(' · ')
-      );
+      const nextBadge = [resTag, activeProtocol, latencySec !== null ? `${latencySec}s` : '']
+        .filter(Boolean)
+        .join(' · ');
+      setLiveBadge((prev) => (prev === nextBadge ? prev : nextBadge));
       onStatsRef.current?.({ protocol: activeProtocol, latencySec, resolution });
     }, 1500);
 
@@ -699,7 +861,7 @@ export function DirectPlayer({
         // Ignore
       }
     };
-  }, [flvUrl, hlsUrl, useHlsFallback, reloadToken]);
+  }, [flvUrl, hlsUrl, useHlsFallback, reloadToken, suspended, pauseSuspended]);
 
   useEffect(() => {
     if (!dmPanelOpen) return;
@@ -712,14 +874,15 @@ export function DirectPlayer({
     return () => document.removeEventListener('mousedown', onDown);
   }, [dmPanelOpen]);
 
-  const isIdleHidden = isFullscreen && controlsIdle && !isPaused && !dmPanelOpen;
+  const isIdleHidden = isFullscreen && controlsIdle && !isPaused && !dmPanelOpen && !composerOpen;
+  const canDirectSend = platform === 'bilibili';
 
   return (
     <div
       ref={containerRef}
       className={`direct-player-root ${isPaused ? 'is-paused' : ''} ${isFullscreen ? 'is-fullscreen' : ''} ${
         isIdleHidden ? 'is-idle' : ''
-      } ${dmPanelOpen ? 'dm-menu-open' : ''}`}
+      } ${dmPanelOpen || composerOpen ? 'dm-menu-open' : ''}`}
       tabIndex={0}
       onMouseMove={() => {
         if (isFullscreen) wakeControls();
@@ -738,12 +901,24 @@ export function DirectPlayer({
       onKeyDown={(e) => {
         const target = e.target as HTMLElement | null;
         const tag = target?.tagName?.toLowerCase();
+        if (e.key === 'Escape' && composerOpen) {
+          e.stopPropagation();
+          setComposerOpen(false);
+          containerRef.current?.focus();
+          return;
+        }
         if (e.key === 'Escape' && dmPanelOpen) {
           e.stopPropagation();
           setDmPanelOpen(false);
           return;
         }
         if (tag === 'input' || tag === 'textarea' || tag === 'select' || target?.isContentEditable) {
+          return;
+        }
+        if (e.key === 'Enter' && platform) {
+          e.preventDefault();
+          e.stopPropagation();
+          setComposerOpen(true);
           return;
         }
         if (e.code === 'Space') {
@@ -789,17 +964,125 @@ export function DirectPlayer({
       />
 
       <DanmakuOverlay
+        slotIndex={slotIndex}
+        platform={platform}
+        isPlatformLoggedIn={isPlatformLoggedIn}
         streamKey={streamKey}
-        incomingBatch={danmakuBatch}
-        enabled={danmakuEnabled}
+        enabled={danmakuEnabled && !suspended}
         paused={isPaused}
+        isObscured={isObscured}
         area={danmakuArea}
         opacity={danmakuOpacity}
         fontSize={danmakuFontSize}
         speed={danmakuSpeed}
         mode={danmakuMode}
         blockKeywords={danmakuBlockKeywords}
+        onSendDanmaku={handleSendDanmaku}
+        onLoginPlatform={onLoginPlatform}
+        onSwitchToWebMode={onSwitchToWebMode}
       />
+
+      {composerOpen && platform && (
+        <div
+          ref={composerRef}
+          className="direct-dm-composer"
+          onClick={(e) => e.stopPropagation()}
+          onDoubleClick={(e) => e.stopPropagation()}
+          onWheel={(e) => e.stopPropagation()}
+        >
+          {canDirectSend ? (
+            isPlatformLoggedIn ? (
+              <form className="direct-dm-composer-form" onSubmit={(e) => void submitFloatingComposer(e)}>
+                <input
+                  ref={composerInputRef}
+                  className="direct-dm-composer-input"
+                  value={composerText}
+                  maxLength={40}
+                  onChange={(e) => setComposerText(e.target.value)}
+                  onKeyDown={(e) => {
+                    e.stopPropagation();
+                    if (e.key === 'Escape') {
+                      setComposerOpen(false);
+                      containerRef.current?.focus();
+                    }
+                  }}
+                  placeholder={composerCooldown ? '发送成功，稍候片刻...' : '直连发送 B站弹幕 (Enter)...'}
+                  disabled={composerSending}
+                />
+                <button
+                  type="submit"
+                  className="direct-dm-composer-send"
+                  disabled={composerSending || composerCooldown || !composerText.trim()}
+                  title="发送弹幕 (Enter)"
+                >
+                  <Send size={12} />
+                  <span>{composerSending ? '发送中' : '发送'}</span>
+                </button>
+                <button
+                  type="button"
+                  className="direct-dm-composer-close"
+                  onClick={() => setComposerOpen(false)}
+                  title="关闭输入框 (Esc)"
+                >
+                  <X size={13} />
+                </button>
+              </form>
+            ) : (
+              <div className="direct-dm-composer-notice">
+                <span>登录 B站后可在直连模式直接发弹幕</span>
+                <div className="direct-dm-composer-actions">
+                  <button
+                    type="button"
+                    className="direct-dm-composer-action-btn primary"
+                    onClick={() => {
+                      setComposerOpen(false);
+                      onLoginPlatform?.('bilibili');
+                    }}
+                  >
+                    <KeyRound size={12} />
+                    <span>扫码登录 B站</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="direct-dm-composer-close"
+                    onClick={() => setComposerOpen(false)}
+                    title="关闭"
+                  >
+                    <X size={13} />
+                  </button>
+                </div>
+              </div>
+            )
+          ) : (
+            <div className="direct-dm-composer-notice">
+              <span>直连发弹幕暂仅支持 B站，当前平台可切网页发送</span>
+              <div className="direct-dm-composer-actions">
+                {onSwitchToWebMode && (
+                  <button
+                    type="button"
+                    className="direct-dm-composer-action-btn primary"
+                    onClick={() => {
+                      setComposerOpen(false);
+                      onSwitchToWebMode();
+                    }}
+                  >
+                    <Globe size={12} />
+                    <span>切网页发弹幕</span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="direct-dm-composer-close"
+                  onClick={() => setComposerOpen(false)}
+                  title="关闭"
+                >
+                  <X size={13} />
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {hudToast && <div className="direct-hud-toast">{hudToast}</div>}
 
@@ -915,6 +1198,27 @@ export function DirectPlayer({
           >
             <Camera size={13} />
           </button>
+
+          {platform && (
+            <button
+              type="button"
+              data-dm-composer-toggle="1"
+              className={`direct-ctrl-btn ${composerOpen ? 'dm-active' : ''}`}
+              onClick={() => {
+                setDmPanelOpen(false);
+                setComposerOpen((v) => !v);
+              }}
+              title={
+                canDirectSend
+                  ? isPlatformLoggedIn
+                    ? '直连发送 B站弹幕 (Enter)'
+                    : '登录 B站后可在直连模式发弹幕'
+                  : '发弹幕（当前平台可一键切网页发送）'
+              }
+            >
+              <Send size={13} />
+            </button>
+          )}
 
           {onToggleDanmaku && (
             <button

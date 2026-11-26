@@ -472,12 +472,30 @@ function labelBilibiliUrl(url: string, idx: number): string {
   return `主线 ${idx + 1}`;
 }
 
+let cachedFastBiliHost: { host: string; expiresAt: number } | null = null;
+
 async function raceFastestBilibiliUrl(
   urls: string[],
   headers: Record<string, string>
 ): Promise<{ index: number; finalUrl: string; ms: number } | null> {
   if (urls.length <= 1) return null;
-  const maxProbe = Math.min(urls.length, 4);
+
+  // Reuse recently-verified fast CDN host (5 min TTL) to avoid redundant 4-way GET首包 bandwidth
+  const now = Date.now();
+  if (cachedFastBiliHost && now < cachedFastBiliHost.expiresAt) {
+    const cachedIdx = urls.findIndex((u) => {
+      try {
+        return new URL(u).hostname.toLowerCase() === cachedFastBiliHost!.host;
+      } catch {
+        return false;
+      }
+    });
+    if (cachedIdx >= 0) {
+      return { index: cachedIdx, finalUrl: urls[cachedIdx], ms: 0 };
+    }
+  }
+
+  const maxProbe = Math.min(urls.length, 3);
   const controllers: AbortController[] = [];
   const startedAt = Date.now();
   const hardTimeout = setTimeout(() => {
@@ -504,6 +522,16 @@ async function raceFastestBilibiliUrl(
 
   try {
     const winner = await Promise.any(probes);
+    if (winner.ms <= 800) {
+      try {
+        const winHost = new URL(urls[winner.index]).hostname.toLowerCase();
+        if (winHost) {
+          cachedFastBiliHost = { host: winHost, expiresAt: Date.now() + 5 * 60 * 1000 };
+        }
+      } catch {
+        // Ignore malformed host
+      }
+    }
     return winner;
   } catch {
     return null;
@@ -936,6 +964,10 @@ async function extractBilibili(
   );
   let fastestActiveUrl: string | undefined;
 
+  // If user/failover explicitly selected another line, invalidate cached CDN preference
+  if (req.lineId) {
+    cachedFastBiliHost = null;
+  }
   // Run anchor-name lookup in parallel with CDN racing so metadata adds 0ms to startup!
   const shouldRace = !req.lineId && Boolean(activeCodec && activeCodec.urls.length > 1);
   const [anchorName, raced] = await Promise.all([
@@ -1083,7 +1115,7 @@ function touchDouyuSignerIdle(): void {
       }
       douyuSignerWin = null;
     }
-  }, 90_000);
+  }, 20_000);
 }
 
 export function cleanupStreamExtractor(): void {
@@ -1851,31 +1883,135 @@ async function checkSingleLiveStatus(item: LiveStatusCheckItem): Promise<LiveRoo
   }
 }
 
+async function checkBilibiliStatusesBatch(
+  items: LiveStatusCheckItem[],
+  results: Record<string, LiveRoomStatus>
+): Promise<LiveStatusCheckItem[]> {
+  if (items.length <= 1) return items;
+  const fallback: LiveStatusCheckItem[] = [];
+  const checkedAt = Date.now();
+
+  for (let start = 0; start < items.length; start += 30) {
+    const chunk = items.slice(start, start + 30);
+    const validChunk = chunk.filter((i) => /^\d+$/.test(i.roomId.trim()));
+    const invalidChunk = chunk.filter((i) => !/^\d+$/.test(i.roomId.trim()));
+    fallback.push(...invalidChunk);
+    if (validChunk.length === 0) continue;
+
+    try {
+      const qs = validChunk
+        .map((i) => `room_ids=${encodeURIComponent(i.roomId.trim())}`)
+        .join('&');
+      const resp = await fetchWithTimeout(
+        `https://api.live.bilibili.com/xlive/web-room/v1/index/getRoomBaseInfo?req_biz=web_room_componet&${qs}`,
+        {
+          headers: {
+            'User-Agent': DESKTOP_UA,
+            Referer: 'https://live.bilibili.com/',
+          },
+        },
+        7000
+      );
+      const json = (await resp.json()) as {
+        code?: number;
+        data?: {
+          by_room_ids?: Record<
+            string,
+            {
+              room_id?: number;
+              short_id?: number;
+              uid?: number;
+              live_status?: number;
+              title?: string;
+              uname?: string;
+              area_name?: string;
+              parent_area_name?: string;
+              tags?: string;
+            }
+          >;
+        };
+      };
+      const byRoomIds = json?.code === 0 ? json?.data?.by_room_ids : undefined;
+      if (!byRoomIds || typeof byRoomIds !== 'object') {
+        fallback.push(...validChunk);
+        continue;
+      }
+
+      const byShortId = new Map<string, (typeof byRoomIds)[string]>();
+      for (const info of Object.values(byRoomIds)) {
+        if (info?.short_id) byShortId.set(String(info.short_id), info);
+        if (info?.room_id) byShortId.set(String(info.room_id), info);
+      }
+
+      for (const item of validChunk) {
+        const key = item.roomId.trim();
+        const info = byRoomIds[key] || byShortId.get(key);
+        if (!info) {
+          fallback.push(item);
+          continue;
+        }
+        if (info.uid && info.uname?.trim()) {
+          bilibiliAnchorCache.set(info.uid, info.uname.trim());
+        }
+        if (info.room_id) {
+          bilibiliRealRidCache.set(item.roomId, {
+            realRid: String(info.room_id),
+            uid: info.uid,
+          });
+        }
+        const status =
+          info.live_status === 1 ? 'live' : info.live_status === 2 ? 'replay' : 'offline';
+        results[item.id] = {
+          status,
+          anchorName: info.uname?.trim() || undefined,
+          title: info.title,
+          category: resolveBilibiliCategory(info),
+          checkedAt,
+        };
+      }
+    } catch {
+      fallback.push(...validChunk);
+    }
+  }
+
+  return fallback;
+}
+
 export async function checkLiveStatuses(
   items: LiveStatusCheckItem[]
 ): Promise<Record<string, LiveRoomStatus>> {
   const results: Record<string, LiveRoomStatus> = {};
   if (!Array.isArray(items) || items.length === 0) return results;
 
-  // Warm anonymous Douyin ttwid once upfront if any Douyin channels are queued
-  if (items.some((i) => i.platform === 'douyin')) {
-    await getDouyinCookieHeader(false).catch(() => '');
-  }
+  const biliItems = items.filter((i) => i.platform === 'bilibili');
+  const otherItems = items.filter((i) => i.platform !== 'bilibili');
+
+  // Batch-check Bilibili rooms in a single HTTP request (falls back per-room if any missed)
+  // while warming anonymous Douyin ttwid in parallel if needed
+  const [biliFallback] = await Promise.all([
+    biliItems.length > 1 ? checkBilibiliStatusesBatch(biliItems, results) : Promise.resolve(biliItems),
+    otherItems.some((i) => i.platform === 'douyin')
+      ? getDouyinCookieHeader(false).catch(() => '')
+      : Promise.resolve(''),
+  ]);
+
+  const remaining = [...otherItems, ...biliFallback];
+  if (remaining.length === 0) return results;
 
   const concurrency = 6;
   let cursor = 0;
 
   const worker = async () => {
-    while (cursor < items.length) {
+    while (cursor < remaining.length) {
       const idx = cursor++;
-      const item = items[idx];
+      const item = remaining[idx];
       if (!item) break;
       results[item.id] = await checkSingleLiveStatus(item);
     }
   };
 
   await Promise.all(
-    Array.from({ length: Math.min(concurrency, items.length) }, () => worker())
+    Array.from({ length: Math.min(concurrency, remaining.length) }, () => worker())
   );
   return results;
 }

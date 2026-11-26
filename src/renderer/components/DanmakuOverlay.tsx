@@ -1,5 +1,12 @@
 import { memo, useEffect, useMemo, useRef, useState } from 'react';
-import type { DanmakuArea, DanmakuMessage, DanmakuMode } from '../../shared/types';
+import { Globe, KeyRound, Send } from 'lucide-react';
+import type {
+  DanmakuArea,
+  DanmakuMessage,
+  DanmakuMode,
+  PlatformId,
+  SendDanmakuResult,
+} from '../../shared/types';
 
 interface CanvasBullet {
   id: string;
@@ -9,19 +16,30 @@ interface CanvasBullet {
   x: number;
   width: number;
   speedPxPerSec: number;
+  sprite: HTMLCanvasElement | null;
+  spriteW: number;
+  spriteH: number;
+  spriteFont: number;
+  spriteDpr: number;
 }
 
 interface DanmakuOverlayProps {
+  slotIndex: number;
+  platform?: PlatformId;
+  isPlatformLoggedIn?: boolean;
   streamKey?: string;
-  incomingBatch: DanmakuMessage[];
   enabled: boolean;
   paused: boolean;
+  isObscured?: boolean;
   area?: DanmakuArea;
   opacity?: number;
   fontSize?: number;
   speed?: number;
   mode?: DanmakuMode;
   blockKeywords?: string[];
+  onSendDanmaku?: (text: string) => Promise<SendDanmakuResult>;
+  onLoginPlatform?: (platform: PlatformId) => void;
+  onSwitchToWebMode?: () => void;
 }
 
 const AREA_RATIO: Record<DanmakuArea, number> = {
@@ -32,6 +50,8 @@ const AREA_RATIO: Record<DanmakuArea, number> = {
 
 const MAX_CANVAS_BULLETS = 90;
 const MAX_CHAT_MESSAGES = 45;
+const FONT_FAMILY =
+  '-apple-system, BlinkMacSystemFont, "Segoe UI Variable", "PingFang SC", "Microsoft YaHei UI", sans-serif';
 
 function compileMatchers(keywords: string[]): Array<(text: string) => boolean> {
   const matchers: Array<(text: string) => boolean> = [];
@@ -53,17 +73,55 @@ function compileMatchers(keywords: string[]): Array<(text: string) => boolean> {
   return matchers;
 }
 
+function buildBulletSprite(
+  text: string,
+  color: string,
+  textWidth: number,
+  effFont: number,
+  dpr: number
+): { canvas: HTMLCanvasElement; w: number; h: number } | null {
+  const lineWidth = Math.max(2.2, effFont * 0.14);
+  const padX = Math.ceil(lineWidth) + 2;
+  const padY = Math.ceil(lineWidth) + 2;
+  const logicalW = Math.max(4, Math.ceil(textWidth + padX * 2));
+  const logicalH = Math.max(4, Math.ceil(effFont * 1.35 + padY * 2));
+
+  const off = document.createElement('canvas');
+  off.width = Math.ceil(logicalW * dpr);
+  off.height = Math.ceil(logicalH * dpr);
+  const octx = off.getContext('2d');
+  if (!octx) return null;
+
+  octx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  octx.font = `600 ${effFont}px ${FONT_FAMILY}`;
+  octx.textBaseline = 'top';
+  octx.lineJoin = 'round';
+  octx.lineWidth = lineWidth;
+  octx.strokeStyle = 'rgba(0, 0, 0, 0.84)';
+  octx.strokeText(text, padX, padY);
+  octx.fillStyle = color;
+  octx.fillText(text, padX, padY);
+
+  return { canvas: off, w: logicalW, h: logicalH };
+}
+
 export const DanmakuOverlay = memo(function DanmakuOverlay({
+  slotIndex,
+  platform,
+  isPlatformLoggedIn = false,
   streamKey = '',
-  incomingBatch,
   enabled,
   paused,
+  isObscured = false,
   area = 'half',
   opacity = 0.85,
   fontSize = 18,
   speed = 1,
   mode = 'scroll',
   blockKeywords = [],
+  onSendDanmaku,
+  onLoginPlatform,
+  onSwitchToWebMode,
 }: DanmakuOverlayProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const bulletsRef = useRef<CanvasBullet[]>([]);
@@ -74,6 +132,11 @@ export const DanmakuOverlay = memo(function DanmakuOverlay({
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
   const [chatHovered, setChatHovered] = useState(false);
   const [chatMessages, setChatMessages] = useState<DanmakuMessage[]>([]);
+  const [chatInput, setChatInput] = useState('');
+  const [chatSending, setChatSending] = useState(false);
+  const [chatCooldown, setChatCooldown] = useState(false);
+  const chatCooldownRef = useRef<number | null>(null);
+  const chatInputRef = useRef<HTMLInputElement | null>(null);
 
   const safeOpacity = Math.max(0.15, Math.min(1, Number.isFinite(opacity) ? opacity : 0.85));
   const safeFontSize = Math.max(12, Math.min(28, Number.isFinite(fontSize) ? fontSize : 18));
@@ -84,8 +147,26 @@ export const DanmakuOverlay = memo(function DanmakuOverlay({
   const matchersRef = useRef(matchers);
   matchersRef.current = matchers;
 
-  const styleRef = useRef({ safeOpacity, safeFontSize, safeSpeed, areaRatio, paused });
-  styleRef.current = { safeOpacity, safeFontSize, safeSpeed, areaRatio, paused };
+  const styleRef = useRef({
+    safeOpacity,
+    safeFontSize,
+    safeSpeed,
+    areaRatio,
+    paused,
+    enabled,
+    mode,
+    isObscured,
+  });
+  styleRef.current = {
+    safeOpacity,
+    safeFontSize,
+    safeSpeed,
+    areaRatio,
+    paused,
+    enabled,
+    mode,
+    isObscured,
+  };
 
   const computeEffectiveFontSize = (width: number, baseFont: number) => {
     if (width <= 0) return baseFont;
@@ -98,12 +179,21 @@ export const DanmakuOverlay = memo(function DanmakuOverlay({
     bulletsRef.current = [];
     seenIdsRef.current.clear();
     setChatMessages([]);
+    setChatInput('');
     const canvas = canvasRef.current;
     if (canvas) {
       const ctx = canvas.getContext('2d');
       ctx?.clearRect(0, 0, canvas.width, canvas.height);
     }
   }, [streamKey]);
+
+  useEffect(() => {
+    return () => {
+      if (chatCooldownRef.current !== null) {
+        window.clearTimeout(chatCooldownRef.current);
+      }
+    };
+  }, []);
 
   // Clear visible bullets & mini-chat when danmaku is toggled off (without forgetting already-seen message IDs)
   useEffect(() => {
@@ -143,7 +233,7 @@ export const DanmakuOverlay = memo(function DanmakuOverlay({
         sizeRef.current = { w, h, dpr };
         canvas.width = targetW;
         canvas.height = targetH;
-        if (bulletsRef.current.length > 0) {
+        if (bulletsRef.current.length > 0 && !document.hidden && !styleRef.current.isObscured) {
           ensureLoop.current();
         }
       }
@@ -158,15 +248,17 @@ export const DanmakuOverlay = memo(function DanmakuOverlay({
     };
   }, [enabled, mode, area]);
 
-  // Start / drive requestAnimationFrame rendering loop for Canvas mode
+  // Start / drive requestAnimationFrame rendering loop for Canvas mode (using pre-rendered bullet sprites)
   const ensureLoop = useRef<() => void>(() => {});
   ensureLoop.current = () => {
     if (rafRef.current !== null) return;
+    if (document.hidden || styleRef.current.isObscured) return;
     lastFrameRef.current = performance.now();
 
     const tick = (now: number) => {
+      const cfg = styleRef.current;
       const canvas = canvasRef.current;
-      if (!canvas || !enabled || mode !== 'scroll') {
+      if (!canvas || !cfg.enabled || cfg.mode !== 'scroll' || document.hidden || cfg.isObscured) {
         rafRef.current = null;
         return;
       }
@@ -181,7 +273,6 @@ export const DanmakuOverlay = memo(function DanmakuOverlay({
         return;
       }
 
-      const cfg = styleRef.current;
       const effFont = computeEffectiveFontSize(w, cfg.safeFontSize);
       const lineHeight = Math.round(effFont * 1.42);
       const maxLanes = Math.max(2, Math.floor((h - 14) / lineHeight));
@@ -196,11 +287,7 @@ export const DanmakuOverlay = memo(function DanmakuOverlay({
       }
 
       ctx.globalAlpha = cfg.safeOpacity;
-      ctx.font = `600 ${effFont}px -apple-system, BlinkMacSystemFont, "Segoe UI Variable", "PingFang SC", "Microsoft YaHei UI", sans-serif`;
-      ctx.textBaseline = 'top';
-      ctx.lineJoin = 'round';
-      ctx.lineWidth = Math.max(2.2, effFont * 0.14);
-      ctx.strokeStyle = 'rgba(0, 0, 0, 0.84)';
+      const padOffset = Math.ceil(Math.max(2.2, effFont * 0.14)) + 2;
 
       const alive: CanvasBullet[] = [];
       for (let i = 0; i < list.length; i++) {
@@ -208,13 +295,41 @@ export const DanmakuOverlay = memo(function DanmakuOverlay({
         if (!cfg.paused) {
           b.x -= b.speedPxPerSec * cfg.safeSpeed * dt;
         }
-        if (b.x + b.width < -12) continue;
-        if (b.lane >= maxLanes) continue;
+        if (b.x + b.width < -12) {
+          b.sprite = null;
+          continue;
+        }
+        if (b.lane >= maxLanes) {
+          b.sprite = null;
+          continue;
+        }
+
+        // Rebuild cached sprite only if font size or DPR changed
+        if (!b.sprite || b.spriteFont !== effFont || b.spriteDpr !== dpr) {
+          const built = buildBulletSprite(b.text, b.color, b.width, effFont, dpr);
+          if (built) {
+            b.sprite = built.canvas;
+            b.spriteW = built.w;
+            b.spriteH = built.h;
+            b.spriteFont = effFont;
+            b.spriteDpr = dpr;
+          }
+        }
 
         const y = 8 + b.lane * lineHeight;
-        ctx.strokeText(b.text, b.x, y);
-        ctx.fillStyle = b.color;
-        ctx.fillText(b.text, b.x, y);
+        if (b.sprite) {
+          ctx.drawImage(
+            b.sprite,
+            0,
+            0,
+            b.sprite.width,
+            b.sprite.height,
+            Math.round(b.x - padOffset),
+            Math.round(y - padOffset),
+            b.spriteW,
+            b.spriteH
+          );
+        }
         alive.push(b);
       }
 
@@ -229,119 +344,156 @@ export const DanmakuOverlay = memo(function DanmakuOverlay({
     rafRef.current = window.requestAnimationFrame(tick);
   };
 
-  // Re-trigger render when unpaused or style changes
+  // Re-trigger render when unpaused, visibility restored, or style changes; stop rAF immediately when hidden
   useEffect(() => {
-    if (!enabled || mode !== 'scroll') return;
-    if (bulletsRef.current.length > 0) {
+    if (!enabled || mode !== 'scroll' || isObscured) {
+      if (rafRef.current !== null) {
+        window.cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      return;
+    }
+
+    const handleVisibility = () => {
+      if (document.hidden) {
+        if (rafRef.current !== null) {
+          window.cancelAnimationFrame(rafRef.current);
+          rafRef.current = null;
+        }
+      } else if (bulletsRef.current.length > 0 && !styleRef.current.paused && !styleRef.current.isObscured) {
+        ensureLoop.current();
+      }
+    };
+
+    if (!document.hidden && bulletsRef.current.length > 0) {
       ensureLoop.current();
     }
+    document.addEventListener('visibilitychange', handleVisibility);
     return () => {
+      document.removeEventListener('visibilitychange', handleVisibility);
       if (rafRef.current !== null) {
         window.cancelAnimationFrame(rafRef.current);
         rafRef.current = null;
       }
     };
-  }, [enabled, mode, paused, safeOpacity, safeFontSize, safeSpeed, area]);
+  }, [enabled, mode, paused, isObscured, safeOpacity, safeFontSize, safeSpeed, area]);
 
-  // Consume incoming batches for both Canvas scroll mode and Mini Chat mode
+  // Subscribe directly to main-process danmaku IPC batches so incoming bursts NEVER re-render LivePane/DirectPlayer
   useEffect(() => {
-    if (!enabled || incomingBatch.length === 0) return;
+    if (!enabled || typeof window.livehub?.onDanmakuBatch !== 'function') return;
 
-    const activeMatchers = matchersRef.current;
-    const filtered: DanmakuMessage[] = [];
-    for (const msg of incomingBatch) {
-      if (!msg.text || seenIdsRef.current.has(msg.id)) continue;
-      seenIdsRef.current.add(msg.id);
-      if (activeMatchers.length > 0 && activeMatchers.some((fn) => fn(msg.text))) {
-        continue;
+    const unsub = window.livehub.onDanmakuBatch((batch) => {
+      const cfg = styleRef.current;
+      if (!cfg.enabled || cfg.paused) return;
+
+      const activeMatchers = matchersRef.current;
+      const filtered: DanmakuMessage[] = [];
+      for (let i = 0; i < batch.length; i++) {
+        const msg = batch[i];
+        if (msg.slotIndex !== slotIndex || !msg.text || seenIdsRef.current.has(msg.id)) continue;
+        seenIdsRef.current.add(msg.id);
+        if (activeMatchers.length > 0 && activeMatchers.some((fn) => fn(msg.text))) {
+          continue;
+        }
+        filtered.push(msg);
       }
-      filtered.push(msg);
-    }
 
-    if (seenIdsRef.current.size > 500) {
-      seenIdsRef.current = new Set(Array.from(seenIdsRef.current).slice(-250));
-    }
-    if (filtered.length === 0) return;
+      if (seenIdsRef.current.size > 500) {
+        seenIdsRef.current = new Set(Array.from(seenIdsRef.current).slice(-250));
+      }
+      if (filtered.length === 0) return;
 
-    if (mode === 'chat') {
-      if (paused) return;
-      setChatMessages((prev) => {
-        const next = [...prev, ...filtered];
-        return next.length > MAX_CHAT_MESSAGES ? next.slice(next.length - MAX_CHAT_MESSAGES) : next;
-      });
-      return;
-    }
+      if (cfg.mode === 'chat') {
+        setChatMessages((prev) => {
+          const next = [...prev, ...filtered];
+          return next.length > MAX_CHAT_MESSAGES ? next.slice(next.length - MAX_CHAT_MESSAGES) : next;
+        });
+        return;
+      }
 
-    if (paused) return;
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const { w, h } = sizeRef.current;
-    if (w <= 10 || h <= 10) return;
+      // Skip building scroll sprites & running Canvas while pane or window is invisible
+      if (document.hidden || cfg.isObscured) return;
 
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const { w, h, dpr } = sizeRef.current;
+      if (w <= 10 || h <= 10) return;
 
-    const effFont = computeEffectiveFontSize(w, styleRef.current.safeFontSize);
-    const lineHeight = Math.round(effFont * 1.42);
-    const maxLanes = Math.max(2, Math.floor((h - 14) / lineHeight));
-    ctx.font = `600 ${effFont}px -apple-system, BlinkMacSystemFont, "Segoe UI Variable", "PingFang SC", "Microsoft YaHei UI", sans-serif`;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
 
-    const existing = bulletsRef.current;
-    let added = 0;
+      const effFont = computeEffectiveFontSize(w, cfg.safeFontSize);
+      const lineHeight = Math.round(effFont * 1.42);
+      const maxLanes = Math.max(2, Math.floor((h - 14) / lineHeight));
+      ctx.font = `600 ${effFont}px ${FONT_FAMILY}`;
 
-    for (const msg of filtered) {
-      if (added >= 10) break;
-      const textWidth = Math.ceil(ctx.measureText(msg.text).width);
-      // Base speed scales gently with viewport width & bullet length so bullets stay readable
-      const baseSpeed = Math.max(96, w * 0.14) + Math.min(42, textWidth * 0.12);
-      const spawnX = w + 12 + added * 16;
+      const existing = bulletsRef.current;
+      let added = 0;
 
-      // Find the first lane where the rightmost bullet has cleared the right edge AND won't be caught up mid-screen
-      let chosenLane = -1;
-      for (let lane = 0; lane < maxLanes; lane++) {
-        let rightmost: CanvasBullet | null = null;
-        let rightmostTail = -Infinity;
-        for (let i = 0; i < existing.length; i++) {
-          const b = existing[i];
-          if (b.lane === lane) {
-            const tail = b.x + b.width;
-            if (tail > rightmostTail) {
-              rightmostTail = tail;
-              rightmost = b;
+      for (const msg of filtered) {
+        if (added >= 10) break;
+        const textWidth = Math.ceil(ctx.measureText(msg.text).width);
+        const baseSpeed = Math.max(96, w * 0.14) + Math.min(42, textWidth * 0.12);
+        const spawnX = w + 12 + added * 16;
+
+        let chosenLane = -1;
+        for (let lane = 0; lane < maxLanes; lane++) {
+          let rightmost: CanvasBullet | null = null;
+          let rightmostTail = -Infinity;
+          for (let i = 0; i < existing.length; i++) {
+            const b = existing[i];
+            if (b.lane === lane) {
+              const tail = b.x + b.width;
+              if (tail > rightmostTail) {
+                rightmostTail = tail;
+                rightmost = b;
+              }
             }
           }
+          if (rightmostTail >= w - 28) continue;
+          if (rightmost && baseSpeed > rightmost.speedPxPerSec) {
+            const prevExitSec = Math.max(0, rightmostTail / rightmost.speedPxPerSec);
+            const newHeadAtExit = spawnX - baseSpeed * prevExitSec;
+            if (newHeadAtExit < 24) continue;
+          }
+          chosenLane = lane;
+          break;
         }
-        if (rightmostTail >= w - 28) continue;
-        if (rightmost && baseSpeed > rightmost.speedPxPerSec) {
-          const prevExitSec = Math.max(0, rightmostTail / rightmost.speedPxPerSec);
-          const newHeadAtExit = spawnX - baseSpeed * prevExitSec;
-          if (newHeadAtExit < 24) continue;
-        }
-        chosenLane = lane;
-        break;
+        if (chosenLane === -1) continue;
+
+        const color = msg.color || '#ffffff';
+        const built = buildBulletSprite(msg.text, color, textWidth, effFont, dpr);
+
+        existing.push({
+          id: msg.id,
+          text: msg.text,
+          color,
+          lane: chosenLane,
+          x: spawnX,
+          width: textWidth,
+          speedPxPerSec: baseSpeed,
+          sprite: built?.canvas ?? null,
+          spriteW: built?.w ?? textWidth,
+          spriteH: built?.h ?? lineHeight,
+          spriteFont: effFont,
+          spriteDpr: dpr,
+        });
+        added += 1;
       }
-      if (chosenLane === -1) continue;
 
-      existing.push({
-        id: msg.id,
-        text: msg.text,
-        color: msg.color || '#ffffff',
-        lane: chosenLane,
-        x: spawnX,
-        width: textWidth,
-        speedPxPerSec: baseSpeed,
-      });
-      added += 1;
-    }
+      if (existing.length > MAX_CANVAS_BULLETS) {
+        existing.splice(0, existing.length - MAX_CANVAS_BULLETS);
+      }
 
-    if (existing.length > MAX_CANVAS_BULLETS) {
-      existing.splice(0, existing.length - MAX_CANVAS_BULLETS);
-    }
+      if (added > 0) {
+        ensureLoop.current();
+      }
+    });
 
-    if (added > 0) {
-      ensureLoop.current();
-    }
-  }, [incomingBatch, enabled, paused, mode]);
+    return () => {
+      unsub();
+    };
+  }, [enabled, slotIndex]);
 
   // Auto-scroll mini chat stream unless hovered
   useEffect(() => {
@@ -352,9 +504,35 @@ export const DanmakuOverlay = memo(function DanmakuOverlay({
     }
   }, [chatMessages, mode, chatHovered]);
 
+  const handleSubmitChatInput = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!onSendDanmaku || chatSending || chatCooldown) return;
+    const clean = chatInput.replace(/\s+/g, ' ').trim();
+    if (!clean) return;
+    setChatSending(true);
+    try {
+      const res = await onSendDanmaku(clean);
+      if (res.ok) {
+        setChatInput('');
+        setChatCooldown(true);
+        if (chatCooldownRef.current !== null) {
+          window.clearTimeout(chatCooldownRef.current);
+        }
+        chatCooldownRef.current = window.setTimeout(() => {
+          chatCooldownRef.current = null;
+          setChatCooldown(false);
+        }, 1500);
+      }
+    } finally {
+      setChatSending(false);
+      window.setTimeout(() => chatInputRef.current?.focus(), 0);
+    }
+  };
+
   if (!enabled) return null;
 
   if (mode === 'chat') {
+    const canDirectSend = platform === 'bilibili';
     return (
       <div
         className="danmaku-chat-panel"
@@ -364,6 +542,7 @@ export const DanmakuOverlay = memo(function DanmakuOverlay({
         onClick={(e) => e.stopPropagation()}
         onDoubleClick={(e) => e.stopPropagation()}
         onWheel={(e) => e.stopPropagation()}
+        onKeyDown={(e) => e.stopPropagation()}
       >
         <div className="danmaku-chat-scroll" ref={chatScrollRef}>
           {chatMessages.length === 0 ? (
@@ -383,6 +562,60 @@ export const DanmakuOverlay = memo(function DanmakuOverlay({
             ))
           )}
         </div>
+
+        {platform && onSendDanmaku && (
+          <div className="danmaku-chat-composer">
+            {canDirectSend ? (
+              isPlatformLoggedIn ? (
+                <form
+                  className="danmaku-chat-composer-form"
+                  onSubmit={(e) => void handleSubmitChatInput(e)}
+                >
+                  <input
+                    ref={chatInputRef}
+                    className="danmaku-chat-input"
+                    value={chatInput}
+                    maxLength={40}
+                    onChange={(e) => setChatInput(e.target.value)}
+                    placeholder={chatCooldown ? '稍候片刻...' : '发条弹幕 (Enter)...'}
+                    disabled={chatSending}
+                  />
+                  <button
+                    type="submit"
+                    className="danmaku-chat-send-btn"
+                    disabled={chatSending || chatCooldown || !chatInput.trim()}
+                    title="直接发送 B站弹幕"
+                  >
+                    <Send size={12} />
+                  </button>
+                </form>
+              ) : (
+                <button
+                  type="button"
+                  className="danmaku-chat-helper-btn"
+                  onClick={() => onLoginPlatform?.('bilibili')}
+                >
+                  <KeyRound size={11} />
+                  <span>登录 B站后可直接发弹幕</span>
+                </button>
+              )
+            ) : (
+              <div className="danmaku-chat-helper-row">
+                <span>直连发弹幕暂仅支持 B站</span>
+                {onSwitchToWebMode && (
+                  <button
+                    type="button"
+                    className="danmaku-chat-switch-btn"
+                    onClick={onSwitchToWebMode}
+                  >
+                    <Globe size={10} />
+                    <span>切网页发</span>
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        )}
       </div>
     );
   }

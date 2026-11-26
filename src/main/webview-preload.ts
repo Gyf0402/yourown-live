@@ -1204,17 +1204,27 @@ function bootstrap(): void {
     void emitStreamOptions(false);
   }, 3000);
 
-  window.setInterval(() => {
-    runAdSkipper();
-  }, 1500);
+  let adTickCount = 0;
+  const runAdSkipperLoop = () => {
+    if (!document.hidden) {
+      runAdSkipper();
+    }
+    adTickCount += 1;
+    // Run briskly during the first ~20s after load for startup ad popups, then back off to 5s to save CPU
+    window.setTimeout(runAdSkipperLoop, adTickCount < 12 ? 1500 : 5000);
+  };
+  window.setTimeout(runAdSkipperLoop, 1500);
 
+  let steadyOptionTicks = 0;
   window.setInterval(() => {
+    if (document.hidden) return;
     if (needsPlayerRootRefresh()) {
       applyConfigAttributes(false);
     }
     sendMetaToHost();
     if (window.location.href !== lastProbedUrl) {
       lastProbedUrl = window.location.href;
+      steadyOptionTicks = 0;
       window.setTimeout(() => {
         applyConfigAttributes(true);
         void probeStreamOptions(false).then(() => {
@@ -1222,7 +1232,12 @@ function bootstrap(): void {
         });
       }, 1500);
     } else {
-      void emitStreamOptions(false);
+      // Once stream options are already discovered on this URL, only re-scan every ~30s instead of every 6s
+      steadyOptionTicks += 1;
+      const hasOptions = lastEmittedJson.length > 30;
+      if (!hasOptions || steadyOptionTicks % 5 === 0) {
+        void emitStreamOptions(false);
+      }
     }
   }, 6000);
 }

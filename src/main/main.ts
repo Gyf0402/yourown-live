@@ -1300,7 +1300,12 @@ function registerStreamHost(streamUrl: string | undefined, referer: string, base
   try {
     const u = baseUrl ? new URL(streamUrl, baseUrl) : new URL(streamUrl);
     if (u.hostname) {
-      streamHostReferers.set(u.hostname.toLowerCase(), referer);
+      const host = u.hostname.toLowerCase();
+      if (streamHostReferers.size > 160 && !streamHostReferers.has(host)) {
+        const firstKey = streamHostReferers.keys().next().value;
+        if (firstKey) streamHostReferers.delete(firstKey);
+      }
+      streamHostReferers.set(host, referer);
     }
   } catch {
     // Ignore malformed URLs
@@ -1308,19 +1313,27 @@ function registerStreamHost(streamUrl: string | undefined, referer: string, base
 }
 
 function matchStreamReferer(rawUrl: string): string | null {
-  try {
-    const u = new URL(rawUrl);
-    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
-    const host = u.hostname.toLowerCase();
-    const exact = streamHostReferers.get(host);
-    if (exact) return exact;
-    for (const [re, ref] of KNOWN_STREAM_REFERERS) {
-      if (re.test(host)) return ref;
-    }
-    return null;
-  } catch {
-    return null;
+  // Fast-path host extraction without allocating a full URL object on every request
+  let start = 0;
+  if (rawUrl.startsWith('https://')) start = 8;
+  else if (rawUrl.startsWith('http://')) start = 7;
+  else return null;
+
+  let end = rawUrl.indexOf('/', start);
+  if (end === -1) end = rawUrl.length;
+  const colonIdx = rawUrl.indexOf(':', start);
+  if (colonIdx !== -1 && colonIdx < end) end = colonIdx;
+  if (end <= start) return null;
+
+  const host = rawUrl.slice(start, end).toLowerCase();
+  if (host === 'localhost' || host === '127.0.0.1') return null;
+
+  const exact = streamHostReferers.get(host);
+  if (exact) return exact;
+  for (const [re, ref] of KNOWN_STREAM_REFERERS) {
+    if (re.test(host)) return ref;
   }
+  return null;
 }
 
 function configureDirectStreamNetworking(): void {
@@ -1770,6 +1783,13 @@ async function resolveShortLiveInput(
   ipcMain.handle('livehub:stop-danmaku', (_event, slotIndex: number) => {
     danmakuManager.stopSlot(slotIndex);
   });
+
+  ipcMain.handle(
+    'livehub:send-danmaku',
+    async (_event, platform: PlatformId, roomId: string, text: string) => {
+      return danmakuManager.sendDanmaku(platform, roomId, text);
+    }
+  );
 
   ipcMain.handle('livehub:set-window-theme', (_event, isDark: boolean) => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
