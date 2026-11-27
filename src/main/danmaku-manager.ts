@@ -603,20 +603,41 @@ export class DanmakuManager {
     }
   }
 
+  private safeTerminateWs(ws: WebSocket | null): void {
+    if (!ws) return;
+    try {
+      ws.removeAllListeners();
+      // Keep a no-op error listener: ws.terminate() on a CONNECTING socket asynchronously emits 'error'
+      ws.on('error', () => {});
+      ws.terminate();
+    } catch {
+      // Ignore
+    }
+  }
+
+  private safeSendWs(ws: WebSocket, payload: Buffer): void {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    try {
+      ws.send(payload);
+    } catch {
+      // Ignore send errors on closing/broken sockets
+    }
+  }
+
   public stopSlot(slotIndex: number): void {
     const existing = this.slots.get(slotIndex);
     if (!existing) return;
     existing.stopped = true;
-    if (existing.heartbeatTimer) clearInterval(existing.heartbeatTimer);
-    if (existing.reconnectTimer) clearTimeout(existing.reconnectTimer);
-    if (existing.ws) {
-      try {
-        existing.ws.removeAllListeners();
-        existing.ws.terminate();
-      } catch {
-        // Ignore
-      }
+    if (existing.heartbeatTimer) {
+      clearInterval(existing.heartbeatTimer);
+      existing.heartbeatTimer = null;
     }
+    if (existing.reconnectTimer) {
+      clearTimeout(existing.reconnectTimer);
+      existing.reconnectTimer = null;
+    }
+    this.safeTerminateWs(existing.ws);
+    existing.ws = null;
     this.slots.delete(slotIndex);
     this.notifyStatus(slotIndex, 'disconnected', existing.platform);
     // Reclaim Douyin signer window quickly if no Douyin slots remain
@@ -730,15 +751,8 @@ export class DanmakuManager {
       clearInterval(entry.heartbeatTimer);
       entry.heartbeatTimer = null;
     }
-    if (entry.ws) {
-      try {
-        entry.ws.removeAllListeners();
-        entry.ws.terminate();
-      } catch {
-        // Ignore
-      }
-      entry.ws = null;
-    }
+    this.safeTerminateWs(entry.ws);
+    entry.ws = null;
 
     switch (entry.platform) {
       case 'douyu':
@@ -779,11 +793,11 @@ export class DanmakuManager {
       entry.retries = 0;
       this.notifyStatus(entry.slotIndex, 'connected', 'douyu');
       recordDiagnostic('info', 'danmaku', `[槽位${entry.slotIndex + 1} douyu#${rid}] 弹幕已连接`);
-      ws.send(pack(`type@=loginreq/roomid@=${rid}/`));
-      ws.send(pack(`type@=joingroup/rid@=${rid}/gid@=-9999/`));
+      this.safeSendWs(ws, pack(`type@=loginreq/roomid@=${rid}/`));
+      this.safeSendWs(ws, pack(`type@=joingroup/rid@=${rid}/gid@=-9999/`));
       if (entry.heartbeatTimer) clearInterval(entry.heartbeatTimer);
       entry.heartbeatTimer = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) ws.send(pack('type@=mrkl/'));
+        this.safeSendWs(ws, pack('type@=mrkl/'));
       }, 45000);
     });
 
@@ -1031,11 +1045,11 @@ export class DanmakuManager {
           key: token,
         })
       );
-      ws.send(pack(7, auth));
-      ws.send(pack(2, Buffer.alloc(0)));
+      this.safeSendWs(ws, pack(7, auth));
+      this.safeSendWs(ws, pack(2, Buffer.alloc(0)));
       if (entry.heartbeatTimer) clearInterval(entry.heartbeatTimer);
       entry.heartbeatTimer = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) ws.send(pack(2, Buffer.alloc(0)));
+        this.safeSendWs(ws, pack(2, Buffer.alloc(0)));
       }, 30000);
     });
 
@@ -1083,12 +1097,10 @@ export class DanmakuManager {
         tarsWriteList(0, [tarsWriteString(0, `live:${ayyuid}`), tarsWriteString(0, `chat:${ayyuid}`)]),
         tarsWriteString(1, ''),
       ]);
-      ws.send(Buffer.concat([tarsWriteInt(0, 16), tarsWriteBytes(1, groupReq)]));
+      this.safeSendWs(ws, Buffer.concat([tarsWriteInt(0, 16), tarsWriteBytes(1, groupReq)]));
       if (entry.heartbeatTimer) clearInterval(entry.heartbeatTimer);
       entry.heartbeatTimer = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(Buffer.concat([tarsWriteInt(0, 1), tarsWriteBytes(1, Buffer.alloc(0))]));
-        }
+        this.safeSendWs(ws, Buffer.concat([tarsWriteInt(0, 1), tarsWriteBytes(1, Buffer.alloc(0))]));
       }, 55000);
     });
 

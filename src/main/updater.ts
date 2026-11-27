@@ -326,6 +326,8 @@ export async function downloadUpdateAsset(
       once: true,
     });
   });
+  // Prevent UnhandledPromiseRejection if abort fires after Promise.race settles
+  abortPromise.catch(() => {});
 
   try {
     const response = await Promise.race([
@@ -346,6 +348,11 @@ export async function downloadUpdateAsset(
 
     const totalBytes = Number(response.headers.get('content-length') || 0) || 0;
     const fileStream = createWriteStream(partPath);
+    let fileStreamError: Error | null = null;
+    // Always attach an error listener immediately so disk/permission/destroy errors never crash main process
+    fileStream.on('error', (err) => {
+      fileStreamError = err instanceof Error ? err : new Error(String(err));
+    });
     const reader = response.body.getReader();
     activeDownloadReader = reader;
 
@@ -368,14 +375,47 @@ export async function downloadUpdateAsset(
         if (controller.signal.aborted) {
           throw new Error('DOWNLOAD_ABORTED');
         }
+        if (fileStreamError) {
+          throw fileStreamError;
+        }
         const { done, value } = await Promise.race([reader.read(), abortPromise]);
         if (controller.signal.aborted) {
           throw new Error('DOWNLOAD_ABORTED');
         }
+        if (fileStreamError) {
+          throw fileStreamError;
+        }
         if (done) break;
         if (value && value.byteLength > 0) {
           if (!fileStream.write(value)) {
-            await new Promise<void>((resolve) => fileStream.once('drain', resolve));
+            await Promise.race([
+              new Promise<void>((resolve, reject) => {
+                const cleanup = () => {
+                  fileStream.off('drain', onDrain);
+                  fileStream.off('error', onErr);
+                  fileStream.off('close', onClose);
+                };
+                const onDrain = () => {
+                  cleanup();
+                  resolve();
+                };
+                const onErr = (err: Error) => {
+                  cleanup();
+                  reject(err);
+                };
+                const onClose = () => {
+                  cleanup();
+                  reject(fileStreamError || new Error('更新文件写入中断'));
+                };
+                fileStream.once('drain', onDrain);
+                fileStream.once('error', onErr);
+                fileStream.once('close', onClose);
+              }),
+              abortPromise,
+            ]);
+          }
+          if (fileStreamError) {
+            throw fileStreamError;
           }
           downloadedBytes += value.byteLength;
           const now = Date.now();
@@ -397,15 +437,27 @@ export async function downloadUpdateAsset(
           }
         }
       }
+      if (fileStreamError) {
+        throw fileStreamError;
+      }
       await new Promise<void>((resolve, reject) => {
-        fileStream.on('error', reject);
-        fileStream.end(() => resolve());
+        const onErr = (err: Error) => reject(err);
+        fileStream.once('error', onErr);
+        fileStream.end(() => {
+          fileStream.off('error', onErr);
+          if (fileStreamError) reject(fileStreamError);
+          else resolve();
+        });
       });
     } catch (streamErr) {
       await new Promise<void>((resolve) => {
-        fileStream.once('close', () => resolve());
+        const done = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+        const timer = setTimeout(done, 120);
+        fileStream.once('close', done);
         fileStream.destroy();
-        setTimeout(resolve, 120);
       });
       throw streamErr;
     } finally {

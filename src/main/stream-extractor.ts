@@ -1223,13 +1223,18 @@ async function runDouyuSignInSandbox(
     const win = await getDouyuSignerWindow();
     touchDouyuSignerIdle();
     const script = `${jsCode};\nString(ub98484234(${JSON.stringify(rid)}, ${JSON.stringify(did)}, ${tt}));`;
-    const result = await Promise.race<string>([
-      win.webContents.executeJavaScript(script) as Promise<string>,
-      new Promise<string>((_, reject) =>
-        setTimeout(() => reject(new Error('斗鱼签名执行超时')), 3000)
-      ),
-    ]);
-    return String(result || '');
+    let timeoutTimer: NodeJS.Timeout | null = null;
+    try {
+      const result = await Promise.race<string>([
+        win.webContents.executeJavaScript(script) as Promise<string>,
+        new Promise<string>((_, reject) => {
+          timeoutTimer = setTimeout(() => reject(new Error('斗鱼签名执行超时')), 3000);
+        }),
+      ]);
+      return String(result || '');
+    } finally {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+    }
   } catch (err) {
     recordDiagnostic(
       'warn',

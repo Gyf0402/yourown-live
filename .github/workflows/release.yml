@@ -48,17 +48,14 @@ jobs:
             >
             > 🔄 **如何无损升级**：用户收藏、分组、设置与登录状态均保存在系统 `%APPDATA%\yourown-live\` 目录，直接覆盖安装新版 `Setup.exe` 或解压新版 `Portable.zip` 替换旧目录即可保留全部数据。
 
-            ## ✨ v0.1.11 更新日志
+            ## ✨ v0.1.12 更新日志
 
-            - **彻底修复「看一段时间黑屏一下断流」问题**：
-              - **同房间续播零黑屏定格衔接**：CDN 周期断连或签名过期触发自动续播时，自动定格最后一帧画面保持显示（不再触发 `opacity: 0` 黑屏闪动），新流接上后无感恢复
-              - **修复 FLV 长播断流误切过期 HLS 的 Bug**：稳定播放后遇 FLV 断连不再回退到几十年前已过期的旧 `hlsUrl` 死循环，改为立刻拉取全新 FLV 签名续播
-              - **修复 HLS 签名过期（HTTP 401/403/404/410）白重试 4 次卡死**：命中过期状态码立刻刷新新地址；单段卡顿看门狗从 15 秒提速至 9 秒、缓冲断层 3 秒即自动跳过恢复
-            - **全平台画质解析与清晰度选择深度修复**：
-              - **抖音直连**：按官方 `options.qualities` 级别与真实帧率排序/命名（新增 `60帧` 清晰标注），自动过滤 `md` 360P 低清档，支持 **HEVC 自动避坑**（优先切 H.264 备线或转 HLS 硬解），新增 **极速 FLV 备线** 容灾并全量升级 **HTTPS** 防运营商劫持降质
-              - **虎牙直连**：对蓝光 4M/8M+ 游戏/PC 房间自动去除 `-imgplus` 移动端限流后缀，实测解锁 **真·原画（10~20 Mbps）**，同时保留户外/低码率房间的 60 帧增效流
-              - **斗鱼 & B站直连**：斗鱼未登录原画受限时改为多档位依次试探直至命中最高解锁画质；B站非 AVC 的 FLV 流自动切 HLS-fMP4 避免无法解码
-              - **网页模式 & 刷抖音自由网页**：修复 `webview-preload` 升序菜单误选标清/流畅的 Bug（全档位按清晰度打分择优）；修复刷抖音上下滑切视频后画质回退为「智能/540P」的问题
+            - **修复弹幕 WebSocket 切换/关闭时的主进程崩溃弹窗（Uncaught Exception）**：
+              - 修复 `DanmakuManager.stopSlot` / `connectEntry` 在弹幕连接尚处于 `CONNECTING` 握手阶段时强行 `terminate()` 触发未监听 `error` 事件（`WebSocket was closed before the connection was established`）导致弹窗报错的问题
+              - 为斗鱼 / B站 / 虎牙弹幕的建连发送与定时心跳 `ws.send()` 补全安全保护，防止断连瞬间抛未捕获异常
+            - **加固主进程文件流、定时器与窗口生命周期稳定性**：
+              - 修复更新包下载流（`updater.ts`）未提前监听 `error` 事件及取消下载时可能引发的未捕获异常 / `UnhandledPromiseRejection` / `drain` 阻塞隐患
+              - 清理斗鱼签名沙箱超时定时器残留，补齐老板键切换时对主窗口 `isDestroyed()` 的安全校验
           files: |
             release/YourOwn-Live-*-win-x64-Setup.exe
             release/YourOwn-Live-*-win-x64-Portable.zip

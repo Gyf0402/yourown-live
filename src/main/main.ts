@@ -910,7 +910,7 @@ async function shutdownAndExit(): Promise<void> {
 }
 
 function toggleBossMode(): boolean {
-  if (!mainWindow) return false;
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
   if (isBossHidden) {
     isBossHidden = false;
     mainWindow.show();
