@@ -210,10 +210,19 @@ export interface LiveRoomStatus {
   checkedAt: number;
 }
 
+export type UpdateDownloadChannel = 'direct' | 'mirror';
+
 export interface UpdateAssetInfo {
   name: string;
   url: string;
   size: number;
+  sha256?: string;
+}
+
+export interface UpdateDownloadOptions {
+  channel?: UpdateDownloadChannel;
+  expectedSha256?: string;
+  checksumsUrl?: string;
 }
 
 export interface AppUpdateCheckResult {
@@ -227,18 +236,22 @@ export interface AppUpdateCheckResult {
   releaseUrl: string;
   installerAsset?: UpdateAssetInfo;
   portableAsset?: UpdateAssetInfo;
+  checksumsUrl?: string;
   isPortableInstall?: boolean;
   error?: string;
 }
 
 export interface UpdateDownloadProgress {
-  phase: 'idle' | 'downloading' | 'completed' | 'cancelled' | 'error';
+  phase: 'idle' | 'downloading' | 'verifying' | 'completed' | 'cancelled' | 'error';
   percent: number;
   downloadedBytes: number;
   totalBytes: number;
   speedBytesPerSec: number;
   fileName?: string;
   filePath?: string;
+  channel?: UpdateDownloadChannel;
+  sourceLabel?: string;
+  verifiedSha256?: boolean;
   error?: string;
 }
 
@@ -280,8 +293,15 @@ export interface LiveHubAPI {
   checkForUpdates: () => Promise<AppUpdateCheckResult>;
   downloadUpdate: (
     url: string,
-    fileName: string
-  ) => Promise<{ ok: boolean; filePath?: string; cancelled?: boolean; error?: string }>;
+    fileName: string,
+    options?: UpdateDownloadOptions
+  ) => Promise<{
+    ok: boolean;
+    filePath?: string;
+    cancelled?: boolean;
+    verifiedSha256?: boolean;
+    error?: string;
+  }>;
   cancelUpdateDownload: () => Promise<void>;
   installDownloadedUpdate: (filePath: string) => Promise<{ ok: boolean; error?: string }>;
   openExternalUrl: (url: string) => Promise<boolean>;

@@ -10,6 +10,7 @@ import type {
   LiveStatusCheckItem,
   PersistedState,
   PlatformId,
+  UpdateDownloadOptions,
   UpdateDownloadProgress,
 } from '../shared/types';
 
@@ -53,8 +54,8 @@ const api: LiveHubAPI = {
   clearDiagnostics: () => ipcRenderer.invoke('livehub:clear-diagnostics'),
   getAppInfo: () => ipcRenderer.invoke('livehub:get-app-info'),
   checkForUpdates: () => ipcRenderer.invoke('livehub:check-updates'),
-  downloadUpdate: (url: string, fileName: string) =>
-    ipcRenderer.invoke('livehub:download-update', url, fileName),
+  downloadUpdate: (url: string, fileName: string, options?: UpdateDownloadOptions) =>
+    ipcRenderer.invoke('livehub:download-update', url, fileName, options),
   cancelUpdateDownload: () => ipcRenderer.invoke('livehub:cancel-update-download'),
   installDownloadedUpdate: (filePath: string) =>
     ipcRenderer.invoke('livehub:install-downloaded-update', filePath),

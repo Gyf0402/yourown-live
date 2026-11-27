@@ -33,6 +33,17 @@ jobs:
       - name: Build & Package Windows Release (NSIS + Portable ZIP)
         run: pnpm dist:win
 
+      - name: Generate SHA256SUMS.txt
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem -Path release -File | Where-Object { $_.Name -like 'YourOwn-Live-*-win-x64-*.exe' -or $_.Name -like 'YourOwn-Live-*-win-x64-*.zip' } | Sort-Object Name
+          $lines = foreach ($f in $files) {
+            $hash = (Get-FileHash -Path $f.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($f.Name)"
+          }
+          $lines | Set-Content -Path release/SHA256SUMS.txt -Encoding ascii
+          Get-Content release/SHA256SUMS.txt
+
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
@@ -50,12 +61,17 @@ jobs:
 
             ## ✨ v0.1.12 更新日志
 
+            - **软件内更新下载全面提速（6 线程分片 + 可选国内加速通道 + 官方 SHA-256 校验）**：
+              - **6 线程 HTTP `Range` 并发分片下载**：自动解析真实 CDN 地址并拆分为 6 段并发拉取，`fs.open` 1 MB 批量定位落盘（彻底消除旧版 16 KB 默认写缓冲导致的网络/磁盘串行互卡瓶颈），不支持分片时自动回退 4 MB 高速单流
+              - **可选「加速通道 / 官方直连」切换**：加速通道自动竞速优选国内可用 GitHub 镜像节点（EdgeOne / 香港 / GHFast / GHProxy），异常时自动无缝回退官方直连
+              - **官方 SHA-256 完整性防篡改校验**：校验和仅从官方 GitHub Release API `digest` 或官方 `SHA256SUMS.txt` 获取，下载完成后自动流式核验，若不一致立即删除并阻断安装
             - **修复弹幕 WebSocket 切换/关闭时的主进程崩溃弹窗（Uncaught Exception）**：
               - 修复 `DanmakuManager.stopSlot` / `connectEntry` 在弹幕连接尚处于 `CONNECTING` 握手阶段时强行 `terminate()` 触发未监听 `error` 事件（`WebSocket was closed before the connection was established`）导致弹窗报错的问题
               - 为斗鱼 / B站 / 虎牙弹幕的建连发送与定时心跳 `ws.send()` 补全安全保护，防止断连瞬间抛未捕获异常
             - **加固主进程文件流、定时器与窗口生命周期稳定性**：
-              - 修复更新包下载流（`updater.ts`）未提前监听 `error` 事件及取消下载时可能引发的未捕获异常 / `UnhandledPromiseRejection` / `drain` 阻塞隐患
+              - 修复更新包下载流未提前监听 `error` 事件及取消下载时可能引发的未捕获异常 / `UnhandledPromiseRejection` / `drain` 阻塞隐患
               - 清理斗鱼签名沙箱超时定时器残留，补齐老板键切换时对主窗口 `isDestroyed()` 的安全校验
           files: |
             release/YourOwn-Live-*-win-x64-Setup.exe
             release/YourOwn-Live-*-win-x64-Portable.zip
+            release/SHA256SUMS.txt

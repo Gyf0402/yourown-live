@@ -6,16 +6,31 @@ import {
   Download,
   ExternalLink,
   FolderOpen,
+  Globe,
   Package,
   RefreshCw,
   ShieldCheck,
   X,
+  Zap,
 } from 'lucide-react';
 import type {
   AppUpdateCheckResult,
   UpdateAssetInfo,
+  UpdateDownloadChannel,
   UpdateDownloadProgress,
 } from '../../shared/types';
+
+const UPDATE_CHANNEL_STORAGE_KEY = 'yourownlive:update-channel';
+
+function readStoredChannel(): UpdateDownloadChannel {
+  try {
+    const raw = window.localStorage.getItem(UPDATE_CHANNEL_STORAGE_KEY);
+    if (raw === 'direct' || raw === 'mirror') return raw;
+  } catch {
+    // Ignore storage errors
+  }
+  return 'mirror';
+}
 
 interface UpdateModalProps {
   updateInfo: AppUpdateCheckResult;
@@ -127,6 +142,9 @@ export function UpdateModal({
   onRecheck,
   onIgnoreVersion,
 }: UpdateModalProps) {
+  const [downloadChannel, setDownloadChannel] = useState<UpdateDownloadChannel>(() =>
+    readStoredChannel()
+  );
   const [downloadState, setDownloadState] = useState<UpdateDownloadProgress>({
     phase: 'idle',
     percent: 0,
@@ -136,6 +154,15 @@ export function UpdateModal({
   });
   const [actionHint, setActionHint] = useState<string | null>(null);
 
+  const handleChangeChannel = (next: UpdateDownloadChannel) => {
+    setDownloadChannel(next);
+    try {
+      window.localStorage.setItem(UPDATE_CHANNEL_STORAGE_KEY, next);
+    } catch {
+      // Ignore storage errors
+    }
+  };
+
   useEffect(() => {
     if (typeof window.livehub?.onUpdateDownloadProgress !== 'function') return;
     return window.livehub.onUpdateDownloadProgress((progress) => {
@@ -144,6 +171,8 @@ export function UpdateModal({
   }, []);
 
   const isDownloading = downloadState.phase === 'downloading';
+  const isVerifying = downloadState.phase === 'verifying';
+  const isBusy = isDownloading || isVerifying;
   const isCompleted = downloadState.phase === 'completed' && Boolean(downloadState.filePath);
   const completedIsExe = Boolean(downloadState.filePath?.toLowerCase().endsWith('.exe'));
 
@@ -155,11 +184,15 @@ export function UpdateModal({
     : updateInfo.portableAsset;
 
   const startDownload = async (asset: UpdateAssetInfo) => {
-    if (isDownloading) return;
+    if (isBusy) return;
     setActionHint(null);
-    const res = await window.livehub.downloadUpdate(asset.url, asset.name);
+    const res = await window.livehub.downloadUpdate(asset.url, asset.name, {
+      channel: downloadChannel,
+      expectedSha256: asset.sha256,
+      checksumsUrl: updateInfo.checksumsUrl,
+    });
     if (!res.ok && !res.cancelled) {
-      setActionHint(res.error || '下载失败，请尝试前往 GitHub Release 页面手动下载');
+      setActionHint(res.error || '下载失败，请切换下载通道或前往 GitHub Release 页面手动下载');
     }
   };
 
@@ -186,7 +219,7 @@ export function UpdateModal({
   };
 
   const handleCloseSafely = () => {
-    if (isDownloading) {
+    if (isBusy) {
       void window.livehub.cancelUpdateDownload();
     }
     onClose();
@@ -254,18 +287,56 @@ export function UpdateModal({
                 覆盖安装或解压替换均会完整保留你的收藏主播、自定义分组、偏好设置与四平台登录状态。
               </span>
             </div>
+
+            {!isCompleted && (
+              <div className="update-channel-row">
+                <div className="update-channel-switch" role="radiogroup" aria-label="下载通道">
+                  <button
+                    type="button"
+                    className={`update-channel-btn ${downloadChannel === 'mirror' ? 'active' : ''}`}
+                    disabled={isBusy}
+                    onClick={() => handleChangeChannel('mirror')}
+                    title="多镜像自动竞速 + 6 线程分片下载，下载完成后严格比对官方 SHA-256 校验和防篡改"
+                  >
+                    <Zap size={12} />
+                    <span>加速通道</span>
+                  </button>
+                  <button
+                    type="button"
+                    className={`update-channel-btn ${downloadChannel === 'direct' ? 'active' : ''}`}
+                    disabled={isBusy}
+                    onClick={() => handleChangeChannel('direct')}
+                    title="直接连接 GitHub 官方 CDN 并启用 6 线程分片下载（自动遵循系统代理）"
+                  >
+                    <Globe size={12} />
+                    <span>官方直连</span>
+                  </button>
+                </div>
+                <span className="update-channel-hint">
+                  {downloadChannel === 'mirror'
+                    ? '多节点竞速 · 6 线程分片 · 官方 SHA-256 校验防篡改'
+                    : '直连 GitHub CDN · 6 线程分片 · 自动校验 SHA-256'}
+                </span>
+              </div>
+            )}
           </>
         )}
 
-        {(isDownloading || isCompleted || downloadState.phase === 'error') && (
+        {(isBusy || isCompleted || downloadState.phase === 'error') && (
           <div className="update-progress-box">
             <div className="update-progress-meta">
               <span className="update-progress-name">
                 {isDownloading
-                  ? `正在下载 ${downloadState.fileName || '更新包'}...`
-                  : isCompleted
-                    ? `下载完成：${downloadState.fileName || '更新包'}`
-                    : `下载中断：${downloadState.error || '请重试或前往 GitHub 页面下载'}`}
+                  ? `正在下载 ${downloadState.fileName || '更新包'}${
+                      downloadState.sourceLabel ? ` · ${downloadState.sourceLabel}` : ''
+                    }`
+                  : isVerifying
+                    ? `正在校验官方 SHA-256 完整性...`
+                    : isCompleted
+                      ? `下载完成：${downloadState.fileName || '更新包'}${
+                          downloadState.verifiedSha256 ? ' · SHA-256 校验通过' : ''
+                        }`
+                      : `下载中断：${downloadState.error || '请切换通道重试或前往 GitHub 页面下载'}`}
               </span>
               {isDownloading && (
                 <span className="update-progress-stats">
@@ -281,6 +352,7 @@ export function UpdateModal({
                     : ''}
                 </span>
               )}
+              {isVerifying && <span className="update-progress-stats">100% · 安全校验中</span>}
             </div>
             <div className="update-progress-track">
               <div
@@ -289,12 +361,12 @@ export function UpdateModal({
                 }`}
                 style={{
                   width: `${
-                    isCompleted
+                    isCompleted || isVerifying
                       ? 100
                       : downloadState.totalBytes > 0
                         ? Math.max(4, downloadState.percent)
                         : isDownloading
-                          ? 35
+                          ? 20
                           : 0
                   }%`,
                 }}
@@ -317,7 +389,7 @@ export function UpdateModal({
 
         <div className="update-modal-actions">
           <div className="update-modal-actions-left">
-            {updateInfo.hasUpdate && updateInfo.latestVersion && !isDownloading && (
+            {updateInfo.hasUpdate && updateInfo.latestVersion && !isBusy && (
               <button
                 type="button"
                 className="icon-btn"
@@ -353,9 +425,14 @@ export function UpdateModal({
           </div>
 
           <div className="update-modal-actions-right">
-            {isDownloading ? (
-              <button type="button" className="icon-btn danger" onClick={() => void handleCancelDownload()}>
-                <span>取消下载</span>
+            {isBusy ? (
+              <button
+                type="button"
+                className="icon-btn danger"
+                disabled={isVerifying}
+                onClick={() => void handleCancelDownload()}
+              >
+                <span>{isVerifying ? '校验中...' : '取消下载'}</span>
               </button>
             ) : isCompleted ? (
               <button type="button" className="primary-btn" onClick={() => void handleInstall()}>

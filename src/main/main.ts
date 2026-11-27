@@ -37,6 +37,7 @@ import type {
   PersistedState,
   PlatformId,
   ResolvedLiveInput,
+  UpdateDownloadOptions,
   WindowBounds,
 } from '../shared/types';
 import {
@@ -1834,13 +1835,21 @@ async function resolveShortLiveInput(
     return checkForAppUpdates();
   });
 
-  ipcMain.handle('livehub:download-update', async (_event, url: string, fileName: string) => {
-    return downloadUpdateAsset(url, fileName, (progress) => {
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('livehub:update-download-progress', progress);
-      }
-    });
-  });
+  ipcMain.handle(
+    'livehub:download-update',
+    async (_event, url: string, fileName: string, options?: UpdateDownloadOptions) => {
+      return downloadUpdateAsset(
+        url,
+        fileName,
+        (progress) => {
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('livehub:update-download-progress', progress);
+          }
+        },
+        options
+      );
+    }
+  );
 
   ipcMain.handle('livehub:cancel-update-download', async () => {
     await cancelActiveUpdateDownload();

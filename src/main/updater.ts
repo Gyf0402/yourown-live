@@ -1,10 +1,13 @@
+import crypto from 'node:crypto';
 import { app, session, shell } from 'electron';
-import { createWriteStream, existsSync } from 'node:fs';
+import { createReadStream, createWriteStream, existsSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import type {
   AppUpdateCheckResult,
   UpdateAssetInfo,
+  UpdateDownloadChannel,
+  UpdateDownloadOptions,
   UpdateDownloadProgress,
 } from '../shared/types';
 import { recordDiagnostic } from './diagnostics';
@@ -22,8 +25,21 @@ const ALLOWED_DOWNLOAD_HOSTS = new Set([
   'github-releases.githubusercontent.com',
 ]);
 
+// Curated China-friendly GitHub release proxy nodes (always paired with official SHA-256 verification)
+const GITHUB_MIRRORS: Array<{ id: string; label: string; prefix: string }> = [
+  { id: 'edgeone', label: 'EdgeOne 加速', prefix: 'https://edgeone.gh-proxy.org/' },
+  { id: 'hk', label: '香港加速', prefix: 'https://hk.gh-proxy.org/' },
+  { id: 'ghfast', label: 'GHFast 加速', prefix: 'https://ghfast.top/' },
+  { id: 'ghproxy', label: 'GHProxy 加速', prefix: 'https://gh-proxy.org/' },
+];
+
+const PARALLEL_SEGMENTS = 6;
+const MIN_PARALLEL_BYTES = 4 * 1024 * 1024; // 4 MB
+const SEGMENT_FLUSH_BYTES = 1024 * 1024; // 1 MB positioned write batch per worker
+const SINGLE_STREAM_HIGH_WATER_MARK = 4 * 1024 * 1024; // 4 MB write buffer
+
 let activeDownloadController: AbortController | null = null;
-let activeDownloadReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+const activeDownloadReaders = new Set<ReadableStreamDefaultReader<Uint8Array>>();
 let activeDownloadPartPath: string | null = null;
 
 function normalizeVersion(raw: string): string {
@@ -31,6 +47,15 @@ function normalizeVersion(raw: string): string {
     .trim()
     .replace(/^v/i, '')
     .split('+')[0];
+}
+
+function parseSha256Hex(raw?: string | null): string | undefined {
+  if (!raw) return undefined;
+  const cleaned = String(raw)
+    .trim()
+    .replace(/^sha256:/i, '')
+    .toLowerCase();
+  return /^[0-9a-f]{64}$/.test(cleaned) ? cleaned : undefined;
 }
 
 export function compareSemver(a: string, b: string): number {
@@ -88,7 +113,9 @@ function isAllowedUpdateUrl(rawUrl: string): boolean {
     const u = new URL(rawUrl);
     if (u.protocol !== 'https:') return false;
     if (u.hostname === 'github.com') {
-      return u.pathname.toLowerCase().startsWith(`/${GITHUB_OWNER.toLowerCase()}/${GITHUB_REPO.toLowerCase()}/`);
+      return u.pathname
+        .toLowerCase()
+        .startsWith(`/${GITHUB_OWNER.toLowerCase()}/${GITHUB_REPO.toLowerCase()}/`);
     }
     return ALLOWED_DOWNLOAD_HOSTS.has(u.hostname);
   } catch {
@@ -100,6 +127,7 @@ interface GithubAssetPayload {
   name?: string;
   browser_download_url?: string;
   size?: number;
+  digest?: string;
 }
 
 interface GithubReleasePayload {
@@ -116,36 +144,113 @@ interface GithubReleasePayload {
 function pickAssets(assets: GithubAssetPayload[] = []): {
   installerAsset?: UpdateAssetInfo;
   portableAsset?: UpdateAssetInfo;
+  checksumsUrl?: string;
 } {
   let installerAsset: UpdateAssetInfo | undefined;
   let portableAsset: UpdateAssetInfo | undefined;
+  let checksumsUrl: string | undefined;
   for (const a of assets) {
     const name = typeof a?.name === 'string' ? a.name : '';
     const url = typeof a?.browser_download_url === 'string' ? a.browser_download_url : '';
     const size = typeof a?.size === 'number' && Number.isFinite(a.size) ? a.size : 0;
+    const sha256 = parseSha256Hex(a?.digest);
     if (!name || !url) continue;
     const lower = name.toLowerCase();
-    if (!installerAsset && lower.endsWith('.exe')) {
-      installerAsset = { name, url, size };
+    if (!checksumsUrl && lower === 'sha256sums.txt') {
+      checksumsUrl = url;
+    } else if (!installerAsset && lower.endsWith('.exe')) {
+      installerAsset = { name, url, size, ...(sha256 ? { sha256 } : {}) };
     } else if (!portableAsset && lower.endsWith('.zip')) {
-      portableAsset = { name, url, size };
+      portableAsset = { name, url, size, ...(sha256 ? { sha256 } : {}) };
     }
   }
-  return { installerAsset, portableAsset };
+  return { installerAsset, portableAsset, checksumsUrl };
 }
 
 function getUpdaterSession() {
   return session.fromPartition('updater');
 }
 
-async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+  parentSignal?: AbortSignal
+): Promise<Response> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let timedOut = false;
+  const onParentAbort = () => controller.abort();
+  if (parentSignal) {
+    if (parentSignal.aborted) {
+      controller.abort();
+    } else {
+      parentSignal.addEventListener('abort', onParentAbort, { once: true });
+    }
+  }
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
   try {
     return await getUpdaterSession().fetch(url, { ...init, signal: controller.signal });
+  } catch (err) {
+    if (timedOut) {
+      const timeoutErr = new Error('REQUEST_TIMEOUT');
+      timeoutErr.name = 'AbortError';
+      throw timeoutErr;
+    }
+    throw err;
   } finally {
     clearTimeout(timer);
+    if (parentSignal) {
+      parentSignal.removeEventListener('abort', onParentAbort);
+    }
   }
+}
+
+async function fetchOfficialSha256FromChecksums(
+  checksumsUrl: string,
+  fileName: string,
+  parentSignal?: AbortSignal
+): Promise<string | undefined> {
+  if (!isAllowedUpdateUrl(checksumsUrl)) return undefined;
+  try {
+    const res = await fetchWithTimeout(
+      checksumsUrl,
+      {
+        redirect: 'follow',
+        headers: { 'User-Agent': `YourOwn-Live/${app.getVersion()}` },
+      },
+      8000,
+      parentSignal
+    );
+    if (!res.ok) return undefined;
+    const text = await res.text();
+    const targetLower = path.basename(fileName).toLowerCase();
+    for (const rawLine of text.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      const m = line.match(/^([0-9a-fA-F]{64})\s+\*?(.+)$/);
+      if (!m) continue;
+      const entryName = path.basename(m[2].trim()).toLowerCase();
+      if (entryName === targetLower) {
+        return m[1].toLowerCase();
+      }
+    }
+  } catch {
+    // Ignore checksums fetch errors; caller decides fallback policy
+  }
+  return undefined;
+}
+
+async function computeFileSha256(filePath: string): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    const stream = createReadStream(filePath, { highWaterMark: 4 * 1024 * 1024 });
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('error', reject);
+    stream.on('end', () => resolve(hash.digest('hex').toLowerCase()));
+  });
 }
 
 export async function checkForAppUpdates(overrideCurrentVersion?: string): Promise<AppUpdateCheckResult> {
@@ -171,7 +276,7 @@ export async function checkForAppUpdates(overrideCurrentVersion?: string): Promi
       const latestVersion = normalizeVersion(data.tag_name || data.name || '');
       if (latestVersion) {
         const hasUpdate = compareSemver(latestVersion, currentVersion) > 0;
-        const { installerAsset, portableAsset } = pickAssets(data.assets);
+        const { installerAsset, portableAsset, checksumsUrl } = pickAssets(data.assets);
         const releaseUrl = data.html_url || `${RELEASES_PAGE_URL}/tag/v${latestVersion}`;
         recordDiagnostic(
           'info',
@@ -191,6 +296,7 @@ export async function checkForAppUpdates(overrideCurrentVersion?: string): Promi
           releaseUrl,
           installerAsset,
           portableAsset,
+          checksumsUrl,
           isPortableInstall: portable,
         };
       }
@@ -232,6 +338,7 @@ export async function checkForAppUpdates(overrideCurrentVersion?: string): Promi
         releaseUrl: finalUrl,
         installerAsset: { name: installerName, url: `${baseDl}/${installerName}`, size: 0 },
         portableAsset: { name: portableName, url: `${baseDl}/${portableName}`, size: 0 },
+        checksumsUrl: `${baseDl}/SHA256SUMS.txt`,
         isPortableInstall: portable,
       };
     }
@@ -265,10 +372,10 @@ export async function cancelActiveUpdateDownload(): Promise<void> {
     }
     activeDownloadController = null;
   }
-  if (activeDownloadReader) {
-    const reader = activeDownloadReader;
-    activeDownloadReader = null;
-    await reader.cancel().catch(() => {});
+  if (activeDownloadReaders.size > 0) {
+    const readers = Array.from(activeDownloadReaders);
+    activeDownloadReaders.clear();
+    await Promise.all(readers.map((r) => r.cancel().catch(() => {})));
   }
   if (activeDownloadPartPath) {
     const partPath = activeDownloadPartPath;
@@ -277,11 +384,467 @@ export async function cancelActiveUpdateDownload(): Promise<void> {
   }
 }
 
+interface ResolvedEndpoint {
+  resolvedUrl: string;
+  totalBytes: number;
+  supportsRange: boolean;
+  channel: UpdateDownloadChannel;
+  nodeLabel: string;
+}
+
+function parseContentRangeTotal(header: string | null): number {
+  if (!header) return 0;
+  const m = header.match(/bytes\s+\d+-\d+\/(\d+)/i);
+  if (!m) return 0;
+  const total = Number(m[1]);
+  return Number.isFinite(total) && total > 0 ? total : 0;
+}
+
+async function probeDownloadEndpoint(
+  probeUrl: string,
+  channel: UpdateDownloadChannel,
+  nodeLabel: string,
+  timeoutMs: number,
+  parentSignal: AbortSignal
+): Promise<ResolvedEndpoint> {
+  const resp = await fetchWithTimeout(
+    probeUrl,
+    {
+      method: 'GET',
+      redirect: 'follow',
+      headers: {
+        Range: 'bytes=0-0',
+        'User-Agent': `YourOwn-Live/${app.getVersion()}`,
+      },
+    },
+    timeoutMs,
+    parentSignal
+  );
+
+  try {
+    const contentType = (resp.headers.get('content-type') || '').toLowerCase();
+    if (!resp.ok || contentType.includes('text/html')) {
+      throw new Error(`HTTP ${resp.status}`);
+    }
+
+    const resolvedUrl = resp.url || probeUrl;
+    if (resp.status === 206) {
+      const totalBytes = parseContentRangeTotal(resp.headers.get('content-range'));
+      if (totalBytes <= 0) {
+        throw new Error('无效的 Content-Range');
+      }
+      return {
+        resolvedUrl,
+        totalBytes,
+        supportsRange: true,
+        channel,
+        nodeLabel,
+      };
+    }
+
+    const totalBytes = Number(resp.headers.get('content-length') || 0) || 0;
+    return {
+      resolvedUrl,
+      totalBytes,
+      supportsRange: false,
+      channel,
+      nodeLabel,
+    };
+  } finally {
+    await resp.body?.cancel().catch(() => {});
+  }
+}
+
+async function resolveDownloadEndpoint(
+  officialUrl: string,
+  preferredChannel: UpdateDownloadChannel,
+  parentSignal: AbortSignal
+): Promise<ResolvedEndpoint> {
+  if (preferredChannel === 'mirror') {
+    const probeController = new AbortController();
+    const onParentAbort = () => probeController.abort();
+    if (parentSignal.aborted) {
+      probeController.abort();
+    } else {
+      parentSignal.addEventListener('abort', onParentAbort, { once: true });
+    }
+
+    try {
+      const mirrorPromises = GITHUB_MIRRORS.map((m) =>
+        probeDownloadEndpoint(
+          `${m.prefix}${officialUrl}`,
+          'mirror',
+          m.label,
+          6500,
+          probeController.signal
+        ).then((res) => {
+          if (res.totalBytes > 0 && res.totalBytes < 512 * 1024) {
+            throw new Error('镜像返回文件异常过小');
+          }
+          return res;
+        })
+      );
+
+      // Race all mirror nodes and pick the fastest healthy responder immediately
+      const fastest = await Promise.any(mirrorPromises);
+      probeController.abort(); // Cancel slower mirror probes
+      return fastest;
+    } catch {
+      if (parentSignal.aborted) {
+        throw new Error('DOWNLOAD_ABORTED');
+      }
+      recordDiagnostic('warn', 'system', '加速镜像暂不可用，自动回退官方直连下载');
+    } finally {
+      parentSignal.removeEventListener('abort', onParentAbort);
+    }
+  }
+
+  return probeDownloadEndpoint(officialUrl, 'direct', '官方直连', 18000, parentSignal);
+}
+
+interface ProgressTracker {
+  addBytes: (delta: number) => void;
+  setTotalBytes: (total: number) => void;
+  getDownloaded: () => number;
+  emitNow: () => void;
+}
+
+function createProgressTracker(
+  initialTotal: number,
+  fileName: string,
+  channel: UpdateDownloadChannel,
+  sourceLabel: string,
+  signal: AbortSignal,
+  emitProgress: (progress: UpdateDownloadProgress) => void
+): ProgressTracker {
+  let downloadedBytes = 0;
+  let totalBytes = initialTotal;
+  const speedWindow: Array<{ ts: number; bytes: number }> = [{ ts: Date.now(), bytes: 0 }];
+  let lastEmitTs = 0;
+
+  const computeSpeed = (now: number): number => {
+    speedWindow.push({ ts: now, bytes: downloadedBytes });
+    while (speedWindow.length > 2 && now - speedWindow[0].ts > 1600) {
+      speedWindow.shift();
+    }
+    const oldest = speedWindow[0];
+    const elapsedSec = Math.max(0.15, (now - oldest.ts) / 1000);
+    return Math.max(0, Math.round((downloadedBytes - oldest.bytes) / elapsedSec));
+  };
+
+  const emitNow = () => {
+    if (signal.aborted) return;
+    const now = Date.now();
+    const speedBytesPerSec = computeSpeed(now);
+    const percent =
+      totalBytes > 0 ? Math.min(99, Math.round((downloadedBytes / totalBytes) * 100)) : 0;
+    emitProgress({
+      phase: 'downloading',
+      percent,
+      downloadedBytes,
+      totalBytes,
+      speedBytesPerSec,
+      fileName,
+      channel,
+      sourceLabel,
+    });
+    lastEmitTs = now;
+  };
+
+  return {
+    addBytes(delta: number) {
+      if (delta <= 0) return;
+      downloadedBytes += delta;
+      const now = Date.now();
+      if (now - lastEmitTs >= 180) {
+        emitNow();
+      }
+    },
+    setTotalBytes(total: number) {
+      if (total > 0) totalBytes = total;
+    },
+    getDownloaded() {
+      return downloadedBytes;
+    },
+    emitNow,
+  };
+}
+
+async function downloadInParallelRanges(
+  targetUrl: string,
+  partPath: string,
+  totalBytes: number,
+  channel: UpdateDownloadChannel,
+  nodeLabel: string,
+  fileName: string,
+  controller: AbortController,
+  abortPromise: Promise<never>,
+  emitProgress: (progress: UpdateDownloadProgress) => void
+): Promise<number> {
+  const segmentCount = Math.min(
+    PARALLEL_SEGMENTS,
+    Math.max(2, Math.ceil(totalBytes / MIN_PARALLEL_BYTES))
+  );
+  const sourceLabel = `${nodeLabel} (${segmentCount} 线程)`;
+  const tracker = createProgressTracker(
+    totalBytes,
+    fileName,
+    channel,
+    sourceLabel,
+    controller.signal,
+    emitProgress
+  );
+  tracker.emitNow();
+
+  const fh = await fs.open(partPath, 'w');
+  try {
+    await fh.truncate(totalBytes);
+
+    const segmentSize = Math.ceil(totalBytes / segmentCount);
+    const segments: Array<{ index: number; start: number; end: number }> = [];
+    for (let i = 0; i < segmentCount; i++) {
+      const start = i * segmentSize;
+      if (start >= totalBytes) break;
+      const end = Math.min(totalBytes - 1, start + segmentSize - 1);
+      segments.push({ index: i, start, end });
+    }
+
+    const downloadSegment = async (seg: { index: number; start: number; end: number }) => {
+      const expectedLen = seg.end - seg.start + 1;
+      let segWritten = 0;
+
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (controller.signal.aborted) throw new Error('DOWNLOAD_ABORTED');
+        const rangeStart = seg.start + segWritten;
+        if (rangeStart > seg.end) return;
+
+        let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+        try {
+          const resp = await fetchWithTimeout(
+            targetUrl,
+            {
+              method: 'GET',
+              redirect: 'follow',
+              headers: {
+                Range: `bytes=${rangeStart}-${seg.end}`,
+                'User-Agent': `YourOwn-Live/${app.getVersion()}`,
+              },
+            },
+            20000,
+            controller.signal
+          );
+
+          if (resp.status !== 206 || !resp.body) {
+            await resp.body?.cancel().catch(() => {});
+            throw new Error(`分片 #${seg.index + 1} 未返回 206 (HTTP ${resp.status})`);
+          }
+
+          reader = resp.body.getReader();
+          activeDownloadReaders.add(reader);
+
+          const pendingChunks: Uint8Array[] = [];
+          let pendingLen = 0;
+          let flushOffset = rangeStart;
+
+          const flushBuffer = async () => {
+            if (pendingLen <= 0) return;
+            const merged =
+              pendingChunks.length === 1
+                ? pendingChunks[0]
+                : Buffer.concat(pendingChunks, pendingLen);
+            pendingChunks.length = 0;
+            pendingLen = 0;
+            await fh.write(merged, 0, merged.byteLength, flushOffset);
+            flushOffset += merged.byteLength;
+          };
+
+          while (true) {
+            if (controller.signal.aborted) throw new Error('DOWNLOAD_ABORTED');
+            const { done, value } = await Promise.race([reader.read(), abortPromise]);
+            if (controller.signal.aborted) throw new Error('DOWNLOAD_ABORTED');
+            if (done) break;
+            if (!value || value.byteLength === 0) continue;
+
+            const remaining = expectedLen - segWritten;
+            const slice = value.byteLength > remaining ? value.subarray(0, remaining) : value;
+            if (slice.byteLength === 0) break;
+
+            pendingChunks.push(slice);
+            pendingLen += slice.byteLength;
+            segWritten += slice.byteLength;
+            tracker.addBytes(slice.byteLength);
+
+            if (pendingLen >= SEGMENT_FLUSH_BYTES) {
+              await flushBuffer();
+            }
+            if (segWritten >= expectedLen) break;
+          }
+
+          await flushBuffer();
+
+          if (segWritten >= expectedLen) {
+            return;
+          }
+          throw new Error(`分片 #${seg.index + 1} 提前结束 (${segWritten}/${expectedLen})`);
+        } catch (err) {
+          if (controller.signal.aborted || attempt === 2) {
+            throw err;
+          }
+          await new Promise<void>((r) => setTimeout(r, 400 * (attempt + 1)));
+        } finally {
+          if (reader) {
+            activeDownloadReaders.delete(reader);
+            await reader.cancel().catch(() => {});
+          }
+        }
+      }
+    };
+
+    await Promise.all(segments.map((seg) => downloadSegment(seg)));
+    const finalBytes = tracker.getDownloaded();
+    if (finalBytes !== totalBytes) {
+      throw new Error(`文件体积不完整 (${finalBytes}/${totalBytes})`);
+    }
+    return finalBytes;
+  } finally {
+    await fh.close().catch(() => {});
+  }
+}
+
+async function downloadSingleStream(
+  targetUrl: string,
+  partPath: string,
+  expectedTotalBytes: number,
+  channel: UpdateDownloadChannel,
+  nodeLabel: string,
+  fileName: string,
+  controller: AbortController,
+  abortPromise: Promise<never>,
+  emitProgress: (progress: UpdateDownloadProgress) => void
+): Promise<number> {
+  const response = await fetchWithTimeout(
+    targetUrl,
+    {
+      method: 'GET',
+      redirect: 'follow',
+      headers: {
+        'User-Agent': `YourOwn-Live/${app.getVersion()}`,
+      },
+    },
+    20000,
+    controller.signal
+  );
+
+  const contentType = (response.headers.get('content-type') || '').toLowerCase();
+  if (!response.ok || !response.body || contentType.includes('text/html')) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error(`下载失败（HTTP ${response.status}）`);
+  }
+
+  const totalBytes = Number(response.headers.get('content-length') || 0) || expectedTotalBytes;
+  const sourceLabel = `${nodeLabel} (单流高速缓冲)`;
+  const tracker = createProgressTracker(
+    totalBytes,
+    fileName,
+    channel,
+    sourceLabel,
+    controller.signal,
+    emitProgress
+  );
+  tracker.setTotalBytes(totalBytes);
+  tracker.emitNow();
+
+  const fileStream = createWriteStream(partPath, {
+    highWaterMark: SINGLE_STREAM_HIGH_WATER_MARK,
+  });
+  let fileStreamError: Error | null = null;
+  fileStream.on('error', (err) => {
+    fileStreamError = err instanceof Error ? err : new Error(String(err));
+  });
+
+  const reader = response.body.getReader();
+  activeDownloadReaders.add(reader);
+
+  try {
+    while (true) {
+      if (controller.signal.aborted) throw new Error('DOWNLOAD_ABORTED');
+      if (fileStreamError) throw fileStreamError;
+      const { done, value } = await Promise.race([reader.read(), abortPromise]);
+      if (controller.signal.aborted) throw new Error('DOWNLOAD_ABORTED');
+      if (fileStreamError) throw fileStreamError;
+      if (done) break;
+      if (value && value.byteLength > 0) {
+        if (!fileStream.write(value)) {
+          await Promise.race([
+            new Promise<void>((resolve, reject) => {
+              const cleanup = () => {
+                fileStream.off('drain', onDrain);
+                fileStream.off('error', onErr);
+                fileStream.off('close', onClose);
+              };
+              const onDrain = () => {
+                cleanup();
+                resolve();
+              };
+              const onErr = (err: Error) => {
+                cleanup();
+                reject(err);
+              };
+              const onClose = () => {
+                cleanup();
+                reject(fileStreamError || new Error('更新文件写入中断'));
+              };
+              fileStream.once('drain', onDrain);
+              fileStream.once('error', onErr);
+              fileStream.once('close', onClose);
+            }),
+            abortPromise,
+          ]);
+        }
+        if (fileStreamError) throw fileStreamError;
+        tracker.addBytes(value.byteLength);
+      }
+    }
+    if (fileStreamError) throw fileStreamError;
+    await new Promise<void>((resolve, reject) => {
+      const onErr = (err: Error) => reject(err);
+      fileStream.once('error', onErr);
+      fileStream.end(() => {
+        fileStream.off('error', onErr);
+        if (fileStreamError) reject(fileStreamError);
+        else resolve();
+      });
+    });
+    return tracker.getDownloaded();
+  } catch (streamErr) {
+    await new Promise<void>((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(done, 120);
+      fileStream.once('close', done);
+      fileStream.destroy();
+    });
+    throw streamErr;
+  } finally {
+    activeDownloadReaders.delete(reader);
+    await reader.cancel().catch(() => {});
+  }
+}
+
 export async function downloadUpdateAsset(
   url: string,
   fileName: string,
-  emitProgress: (progress: UpdateDownloadProgress) => void
-): Promise<{ ok: boolean; filePath?: string; cancelled?: boolean; error?: string }> {
+  emitProgress: (progress: UpdateDownloadProgress) => void,
+  options?: UpdateDownloadOptions
+): Promise<{
+  ok: boolean;
+  filePath?: string;
+  cancelled?: boolean;
+  verifiedSha256?: boolean;
+  error?: string;
+}> {
   if (!isAllowedUpdateUrl(url)) {
     return { ok: false, error: '非法更新下载地址，仅允许从官方 GitHub Releases 下载' };
   }
@@ -298,6 +861,8 @@ export async function downloadUpdateAsset(
   activeDownloadController = controller;
   activeDownloadPartPath = partPath;
 
+  let channel: UpdateDownloadChannel = options?.channel === 'mirror' ? 'mirror' : 'direct';
+
   emitProgress({
     phase: 'downloading',
     percent: 0,
@@ -305,17 +870,9 @@ export async function downloadUpdateAsset(
     totalBytes: 0,
     speedBytesPerSec: 0,
     fileName: safeName,
+    channel,
+    sourceLabel: channel === 'mirror' ? '正在优选加速节点...' : '正在连接官方节点...',
   });
-
-  let connectTimedOut = false;
-  const connectTimer = setTimeout(() => {
-    connectTimedOut = true;
-    try {
-      controller.abort();
-    } catch {
-      // Ignore
-    }
-  }, 18000);
 
   const abortPromise = new Promise<never>((_, reject) => {
     if (controller.signal.aborted) {
@@ -330,140 +887,129 @@ export async function downloadUpdateAsset(
   abortPromise.catch(() => {});
 
   try {
-    const response = await Promise.race([
-      getUpdaterSession().fetch(url, {
-        redirect: 'follow',
-        signal: controller.signal,
-        headers: {
-          'User-Agent': `YourOwn-Live/${app.getVersion()}`,
-        },
-      }),
-      abortPromise,
-    ]);
-    clearTimeout(connectTimer);
-
-    if (!response.ok || !response.body) {
-      throw new Error(`下载失败（HTTP ${response.status}）`);
+    // Resolve official SHA-256 checksum (ONLY from official GitHub API digest or official SHA256SUMS.txt)
+    let expectedSha256 = parseSha256Hex(options?.expectedSha256);
+    if (!expectedSha256 && options?.checksumsUrl) {
+      expectedSha256 = await fetchOfficialSha256FromChecksums(
+        options.checksumsUrl,
+        safeName,
+        controller.signal
+      );
     }
 
-    const totalBytes = Number(response.headers.get('content-length') || 0) || 0;
-    const fileStream = createWriteStream(partPath);
-    let fileStreamError: Error | null = null;
-    // Always attach an error listener immediately so disk/permission/destroy errors never crash main process
-    fileStream.on('error', (err) => {
-      fileStreamError = err instanceof Error ? err : new Error(String(err));
-    });
-    const reader = response.body.getReader();
-    activeDownloadReader = reader;
+    // Security guard: never trust an unverified binary from a third-party mirror
+    if (channel === 'mirror' && !expectedSha256) {
+      recordDiagnostic(
+        'warn',
+        'system',
+        '未获取到官方 SHA-256 校验值，为保证安全已自动切换为官方直连下载'
+      );
+      channel = 'direct';
+    }
 
-    let downloadedBytes = 0;
-    let lastEmitTs = Date.now();
-    let lastEmitBytes = 0;
+    const runAttempt = async (attemptChannel: UpdateDownloadChannel) => {
+      const endpoint = await resolveDownloadEndpoint(url, attemptChannel, controller.signal);
+      recordDiagnostic(
+        'info',
+        'system',
+        `更新包下载通道：${endpoint.nodeLabel} · ${
+          endpoint.supportsRange && endpoint.totalBytes >= MIN_PARALLEL_BYTES
+            ? `${PARALLEL_SEGMENTS} 线程分片`
+            : '单流高速缓冲'
+        } (${endpoint.totalBytes ? `${(endpoint.totalBytes / 1048576).toFixed(1)} MB` : '未知大小'})`
+      );
 
-    // Immediately inform UI once headers arrive so total size is visible right away
-    emitProgress({
-      phase: 'downloading',
-      percent: 0,
-      downloadedBytes: 0,
-      totalBytes,
-      speedBytesPerSec: 0,
-      fileName: safeName,
-    });
+      if (endpoint.supportsRange && endpoint.totalBytes >= MIN_PARALLEL_BYTES) {
+        try {
+          const bytes = await downloadInParallelRanges(
+            endpoint.resolvedUrl,
+            partPath,
+            endpoint.totalBytes,
+            endpoint.channel,
+            endpoint.nodeLabel,
+            safeName,
+            controller,
+            abortPromise,
+            emitProgress
+          );
+          return { bytes, endpoint, parallel: true };
+        } catch (rangeErr) {
+          if (controller.signal.aborted) throw rangeErr;
+          await fs.unlink(partPath).catch(() => {});
+          recordDiagnostic(
+            'warn',
+            'system',
+            `多线程分片下载失败（${
+              rangeErr instanceof Error ? rangeErr.message : String(rangeErr)
+            }），回退单流高速缓冲下载`
+          );
+        }
+      }
 
+      const bytes = await downloadSingleStream(
+        endpoint.resolvedUrl,
+        partPath,
+        endpoint.totalBytes,
+        endpoint.channel,
+        endpoint.nodeLabel,
+        safeName,
+        controller,
+        abortPromise,
+        emitProgress
+      );
+      return { bytes, endpoint, parallel: false };
+    };
+
+    let result: { bytes: number; endpoint: ResolvedEndpoint; parallel: boolean };
     try {
-      while (true) {
-        if (controller.signal.aborted) {
-          throw new Error('DOWNLOAD_ABORTED');
-        }
-        if (fileStreamError) {
-          throw fileStreamError;
-        }
-        const { done, value } = await Promise.race([reader.read(), abortPromise]);
-        if (controller.signal.aborted) {
-          throw new Error('DOWNLOAD_ABORTED');
-        }
-        if (fileStreamError) {
-          throw fileStreamError;
-        }
-        if (done) break;
-        if (value && value.byteLength > 0) {
-          if (!fileStream.write(value)) {
-            await Promise.race([
-              new Promise<void>((resolve, reject) => {
-                const cleanup = () => {
-                  fileStream.off('drain', onDrain);
-                  fileStream.off('error', onErr);
-                  fileStream.off('close', onClose);
-                };
-                const onDrain = () => {
-                  cleanup();
-                  resolve();
-                };
-                const onErr = (err: Error) => {
-                  cleanup();
-                  reject(err);
-                };
-                const onClose = () => {
-                  cleanup();
-                  reject(fileStreamError || new Error('更新文件写入中断'));
-                };
-                fileStream.once('drain', onDrain);
-                fileStream.once('error', onErr);
-                fileStream.once('close', onClose);
-              }),
-              abortPromise,
-            ]);
-          }
-          if (fileStreamError) {
-            throw fileStreamError;
-          }
-          downloadedBytes += value.byteLength;
-          const now = Date.now();
-          if (now - lastEmitTs >= 180 && !controller.signal.aborted) {
-            const elapsedSec = Math.max(0.05, (now - lastEmitTs) / 1000);
-            const speedBytesPerSec = Math.round((downloadedBytes - lastEmitBytes) / elapsedSec);
-            const percent =
-              totalBytes > 0 ? Math.min(99, Math.round((downloadedBytes / totalBytes) * 100)) : 0;
-            emitProgress({
-              phase: 'downloading',
-              percent,
-              downloadedBytes,
-              totalBytes,
-              speedBytesPerSec,
-              fileName: safeName,
-            });
-            lastEmitTs = now;
-            lastEmitBytes = downloadedBytes;
-          }
-        }
+      result = await runAttempt(channel);
+    } catch (firstErr) {
+      if (controller.signal.aborted || channel !== 'mirror') {
+        throw firstErr;
       }
-      if (fileStreamError) {
-        throw fileStreamError;
-      }
-      await new Promise<void>((resolve, reject) => {
-        const onErr = (err: Error) => reject(err);
-        fileStream.once('error', onErr);
-        fileStream.end(() => {
-          fileStream.off('error', onErr);
-          if (fileStreamError) reject(fileStreamError);
-          else resolve();
-        });
+      await fs.unlink(partPath).catch(() => {});
+      recordDiagnostic(
+        'warn',
+        'system',
+        `加速通道下载异常（${
+          firstErr instanceof Error ? firstErr.message : String(firstErr)
+        }），自动回退官方直连重试`
+      );
+      result = await runAttempt('direct');
+    }
+
+    if (controller.signal.aborted) {
+      throw new Error('DOWNLOAD_ABORTED');
+    }
+
+    const totalBytes = result.endpoint.totalBytes || result.bytes;
+    const finalSourceLabel = `${result.endpoint.nodeLabel} (${
+      result.parallel ? `${PARALLEL_SEGMENTS} 线程` : '单流'
+    })`;
+
+    let verifiedSha256 = false;
+    if (expectedSha256) {
+      emitProgress({
+        phase: 'verifying',
+        percent: 100,
+        downloadedBytes: result.bytes,
+        totalBytes,
+        speedBytesPerSec: 0,
+        fileName: safeName,
+        channel: result.endpoint.channel,
+        sourceLabel: finalSourceLabel,
       });
-    } catch (streamErr) {
-      await new Promise<void>((resolve) => {
-        const done = () => {
-          clearTimeout(timer);
-          resolve();
-        };
-        const timer = setTimeout(done, 120);
-        fileStream.once('close', done);
-        fileStream.destroy();
-      });
-      throw streamErr;
-    } finally {
-      if (activeDownloadReader === reader) {
-        activeDownloadReader = null;
+      const actualSha256 = await computeFileSha256(partPath);
+      if (actualSha256 !== expectedSha256) {
+        await fs.unlink(partPath).catch(() => {});
+        recordDiagnostic(
+          'error',
+          'system',
+          `更新包 SHA-256 校验不匹配！期望 ${expectedSha256.slice(0, 12)}...，实际 ${actualSha256.slice(0, 12)}...`
+        );
+        throw new Error('SHA-256 校验失败，文件可能已损坏或被篡改，已自动删除，请切换「官方直连」重试');
       }
+      verifiedSha256 = true;
     }
 
     await fs.unlink(finalPath).catch(() => {});
@@ -474,18 +1020,24 @@ export async function downloadUpdateAsset(
     emitProgress({
       phase: 'completed',
       percent: 100,
-      downloadedBytes,
-      totalBytes: totalBytes || downloadedBytes,
+      downloadedBytes: result.bytes,
+      totalBytes,
       speedBytesPerSec: 0,
       fileName: safeName,
       filePath: finalPath,
+      channel: result.endpoint.channel,
+      sourceLabel: finalSourceLabel,
+      verifiedSha256,
     });
-    recordDiagnostic('info', 'system', `更新包下载完成：${safeName}`);
-    return { ok: true, filePath: finalPath };
+    recordDiagnostic(
+      'info',
+      'system',
+      `更新包下载完成：${safeName}（${finalSourceLabel}${verifiedSha256 ? ' · SHA-256 校验通过' : ''}）`
+    );
+    return { ok: true, filePath: finalPath, verifiedSha256 };
   } catch (err) {
-    clearTimeout(connectTimer);
     await fs.unlink(partPath).catch(() => {});
-    const wasAborted = controller.signal.aborted && !connectTimedOut;
+    const wasAborted = controller.signal.aborted;
     if (activeDownloadController === controller) {
       activeDownloadController = null;
       activeDownloadPartPath = null;
@@ -498,13 +1050,15 @@ export async function downloadUpdateAsset(
         totalBytes: 0,
         speedBytesPerSec: 0,
         fileName: safeName,
+        channel,
       });
       return { ok: false, cancelled: true };
     }
-    const msg = connectTimedOut
-      ? '连接 GitHub 下载节点超时，请重试或点「GitHub 页面」通过浏览器下载'
-      : err instanceof Error
-        ? err.message
+    const msg =
+      err instanceof Error
+        ? err.name === 'AbortError' || err.message === 'REQUEST_TIMEOUT'
+          ? '连接下载节点超时，请切换通道重试或点「GitHub 页面」通过浏览器下载'
+          : err.message
         : '下载更新失败';
     emitProgress({
       phase: 'error',
@@ -513,6 +1067,7 @@ export async function downloadUpdateAsset(
       totalBytes: 0,
       speedBytesPerSec: 0,
       fileName: safeName,
+      channel,
       error: msg,
     });
     recordDiagnostic('warn', 'system', `更新包下载失败：${msg}`);
@@ -540,7 +1095,11 @@ export async function installDownloadedUpdate(
       if (openErr) {
         return { ok: false, error: `启动安装程序失败：${openErr}` };
       }
-      recordDiagnostic('info', 'system', `已启动安装程序并准备退出当前版本：${path.basename(resolvedTarget)}`);
+      recordDiagnostic(
+        'info',
+        'system',
+        `已启动安装程序并准备退出当前版本：${path.basename(resolvedTarget)}`
+      );
       setTimeout(() => {
         onQuitForInstaller();
       }, 650);
